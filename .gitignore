@@ -31,8 +31,19 @@
 .vscode/
 .idea/
 __pycache__/
-Gifs/
+*.py[cod]
+*$py.class
 Gifs/Raw/
+
+# Environments #
+################
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
 # OS generated files #
 ######################

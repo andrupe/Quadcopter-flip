@@ -1,0 +1,12 @@
+# Core numerical and scientific computing
+numpy
+scipy
+matplotlib
+
+# Symbolic multibody dynamics (PyDy scripts)
+pydy
+sympy
+
+# Reinforcement learning & Gymnasium environment
+gymnasium
+stable-baselines3

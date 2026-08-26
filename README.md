@@ -10,6 +10,62 @@ The second purpose is to provide a simple working simulation of the quadcopter's
   <img src="https://media.giphy.com/media/jRw4yeaglqVfyCauar/giphy.gif" width="65%" />
 </p>
 
+## Installation & Setup
+
+It is recommended to use a Python virtual environment (`venv`) to run this project.
+
+### 1. Create a Virtual Environment
+
+Open your terminal in the root directory of the project and run:
+
+**On macOS / Linux:**
+```bash
+python3 -m venv .venv
+```
+
+**On Windows:**
+```bash
+python -m venv .venv
+```
+
+### 2. Activate the Virtual Environment
+
+**On macOS / Linux:**
+```bash
+source .venv/bin/activate
+```
+
+**On Windows (PowerShell):**
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+**On Windows (Command Prompt):**
+```cmd
+.venv\Scripts\activate.bat
+```
+
+### 3. Install Dependencies
+
+Install all required packages (including NumPy, SciPy, Matplotlib, PyDy, SymPy, and Gymnasium) via `requirements.txt`:
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 4. Running the Simulation
+
+You can run the 3D trajectory simulation:
+```bash
+python Simulation/run_3D_simulation.py
+```
+
+Or test the Gymnasium velocity-tracking environment:
+```bash
+python Simulation/test_env.py
+```
+
 ## PyDy Quadcopter
 
 [PyDy](https://pypi.org/project/pydy/), short for Python Dynamics, is a tool kit made to enable the study of multibody dynamics. At it's core is the SymPy [mechanics package](https://docs.sympy.org/latest/modules/physics/mechanics/index.html#vector), which provides an API for building models and generating the symbolic equations of motion for complex multibody systems. 
@@ -40,20 +96,22 @@ Currently, I have seperated the PyDy scripts into 3 folders. The first is just a
 **NOTE**: In my scripts, Motor 1 is the front left motor, and the rest are numbered clockwise. This is not really conventional, but is simple enough.  
 
 ### PyDy Installation
-To be able to run the PyDy scripts of this project, you need to first install PyDy and its dependancies.
+PyDy and SymPy are included in `requirements.txt`. If you wish to install PyDy individually, you can run:
 
-If you have the pip package manager installed you can simply type:
+```bash
+pip install pydy
+```
 
-`$ pip install pydy` 
+Or with conda:
 
-Or if you have conda you can type:
-
-`$ conda install -c conda-forge pydy`
+```bash
+conda install -c conda-forge pydy
+```
 
 ## Simulation and Control
 First off, the world and body orientation can be switch between a NED or ENU frame in the `config.py` file. The other scripts then handle which equations to use, depending on the chosen orientation. It also has to be mentioned that both the PyDy scripts and the simulation aim to simulate the behaviour of a **X configuration** quadcopter (not a **+ configuration**).
 
-The only packages needed for the simulation part of this project are Numpy and Matplotlib. 
+The required packages for the simulation and reinforcement learning environment (NumPy, SciPy, Matplotlib, and Gymnasium) are installed via `requirements.txt`. 
 
 ### Simulation
 In `quad.py`, I've defined a Quadcopter Class and its methods are relatively simple : initialize the quadcopter with various parameters and initial conditions, update the states, calculate the state derivatives, and calculate other useful information. The simulation uses a quaternion in the state vector to express the drone's rotation, and the state derivative vector is copied from the corresponding PyDy script. However, 8 other states were added to simulate each motors dynamics ([2nd Order System](https://apmonitor.com/pdc/index.php/Main/SecondOrderSystems)) :
