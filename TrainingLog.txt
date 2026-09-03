@@ -1,0 +1,9 @@
+random reward shaping: keep stable/ dont drop down too much, dont go too fast etc etc. 
+i got a pretty good result but i think i will switch to mujoco to make it train faster.
+
+i tried curriculum learning and didnt get very good results. the problem is mainly in the flip. its not a very easy maneuver.
+my first attempt was my best but then i promptly deleted it and adjsuted it like 50 times and forgot what it was. maybe i will
+land on the same solution again.
+
+i think im going to back to the basics and do a q learning approach to get a "nominal" baseline as the
+execrise suggests, then i wil

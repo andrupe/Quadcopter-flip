@@ -1,0 +1,82 @@
+<mujoco model="crazyflie_2x">
+  <compiler angle="radian" coordinate="local" inertiafromgeom="false" balanceinertia="true"/>
+
+  <default>
+    <joint damping="0.001"/>
+    <geom contype="1" conaffinity="1" density="0" rgba="0.2 0.2 0.2 1" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+    <site size="0.005" rgba="1 0 0 1"/>
+  </default>
+
+  <asset>
+    <material name="chassis_mat" rgba="0.12 0.12 0.15 1.0" shininess="0.6" reflectance="0.2"/>
+    <material name="battery_mat" rgba="0.25 0.28 0.32 1.0" shininess="0.3"/>
+    <material name="arm_mat" rgba="0.18 0.20 0.22 1.0"/>
+    <material name="prop_front" rgba="1.0 0.38 0.12 0.7"/>
+    <material name="prop_rear" rgba="0.15 0.60 1.0 0.7"/>
+    <material name="led_front" rgba="0.0 1.0 0.75 1.0"/>
+    <material name="led_rear" rgba="1.0 0.15 0.25 1.0"/>
+    <material name="motor_metal" rgba="0.75 0.75 0.80 1.0" shininess="0.9"/>
+  </asset>
+
+  <worldbody>
+    <!-- 6-DoF Floating Base Drone Body -->
+    <body name="quadcopter" pos="0 0 0">
+      <freejoint name="root"/>
+
+      <!-- Inertial Properties (Crazyflie: 28 grams) -->
+      <inertial pos="0 0 0" mass="0.028" diaginertia="1.43e-5 1.43e-5 2.89e-5"/>
+
+      <!-- Central Body Geometry -->
+      <geom name="chassis" type="box" size="0.02 0.02 0.005" material="chassis_mat"/>
+      <geom name="battery" type="box" size="0.015 0.01 0.005" pos="0 0 -0.006" material="battery_mat"/>
+
+      <!-- Visual Direction Indicators (Green = Front/Heading, Red = Tail) -->
+      <geom name="heading_led" type="sphere" pos="0.023 0 0.003" size="0.0035" material="led_front" contype="0" conaffinity="0"/>
+      <geom name="tail_led" type="sphere" pos="-0.023 0 0.003" size="0.003" material="led_rear" contype="0" conaffinity="0"/>
+
+      <!-- Arms (Visual only - collision disabled to optimize broadphase) -->
+      <geom name="arm_fl" type="capsule" fromto="0 0 0 0.0325 0.0325 0.005" size="0.002" material="arm_mat" contype="0" conaffinity="0"/>
+      <geom name="arm_fr" type="capsule" fromto="0 0 0 0.0325 -0.0325 0.005" size="0.002" material="arm_mat" contype="0" conaffinity="0"/>
+      <geom name="arm_rr" type="capsule" fromto="0 0 0 -0.0325 -0.0325 0.005" size="0.002" material="arm_mat" contype="0" conaffinity="0"/>
+      <geom name="arm_rl" type="capsule" fromto="0 0 0 -0.0325 0.0325 0.005" size="0.002" material="arm_mat" contype="0" conaffinity="0"/>
+
+      <!-- Motor Cans (Visual only) -->
+      <geom name="motor_can_fl" type="cylinder" pos="0.0325 0.0325 0.006" size="0.0045 0.003" material="motor_metal" contype="0" conaffinity="0"/>
+      <geom name="motor_can_fr" type="cylinder" pos="0.0325 -0.0325 0.006" size="0.0045 0.003" material="motor_metal" contype="0" conaffinity="0"/>
+      <geom name="motor_can_rr" type="cylinder" pos="-0.0325 -0.0325 0.006" size="0.0045 0.003" material="motor_metal" contype="0" conaffinity="0"/>
+      <geom name="motor_can_rl" type="cylinder" pos="-0.0325 0.0325 0.006" size="0.0045 0.003" material="motor_metal" contype="0" conaffinity="0"/>
+
+      <!-- Landing Pegs (Ground Contact Colliders) -->
+      <geom name="leg_fl" type="sphere" pos="0.0325 0.0325 -0.01" size="0.003" rgba="0.1 0.1 0.1 1"/>
+      <geom name="leg_fr" type="sphere" pos="0.0325 -0.0325 -0.01" size="0.003" rgba="0.1 0.1 0.1 1"/>
+      <geom name="leg_rr" type="sphere" pos="-0.0325 -0.0325 -0.01" size="0.003" rgba="0.1 0.1 0.1 1"/>
+      <geom name="leg_rl" type="sphere" pos="-0.0325 0.0325 -0.01" size="0.003" rgba="0.1 0.1 0.1 1"/>
+
+      <!-- Rotor Application Sites (Translucent Prop Discs) -->
+      <site name="rotor_fl" pos="0.0325 0.0325 0.01" size="0.023 0.0015" type="cylinder" material="prop_front"/>
+      <site name="rotor_fr" pos="0.0325 -0.0325 0.01" size="0.023 0.0015" type="cylinder" material="prop_front"/>
+      <site name="rotor_rr" pos="-0.0325 -0.0325 0.01" size="0.023 0.0015" type="cylinder" material="prop_rear"/>
+      <site name="rotor_rl" pos="-0.0325 0.0325 0.01" size="0.023 0.0015" type="cylinder" material="prop_rear"/>
+
+      <!-- Onboard IMU Sensor Site -->
+      <site name="imu" pos="0 0 0" size="0.002"/>
+    </body>
+  </worldbody>
+
+  <!-- Actuator Definitions: Rotor Thrust (N) and Reactive Drag Torque -->
+  <actuator>
+    <motor name="motor_fl" site="rotor_fl" gear="0 0 1 0 0 -0.0361" ctrlrange="0 0.20"/>
+    <motor name="motor_fr" site="rotor_fr" gear="0 0 1 0 0 0.0361" ctrlrange="0 0.20"/>
+    <motor name="motor_rr" site="rotor_rr" gear="0 0 1 0 0 -0.0361" ctrlrange="0 0.20"/>
+    <motor name="motor_rl" site="rotor_rl" gear="0 0 1 0 0 0.0361" ctrlrange="0 0.20"/>
+  </actuator>
+
+  <!-- Built-in Realistic Sensors -->
+  <sensor>
+    <accelerometer name="accelerometer" site="imu"/>
+    <gyro name="gyro" site="imu"/>
+    <framequat name="orientation" objtype="site" objname="imu"/>
+    <framelinvel name="linear_velocity" objtype="site" objname="imu"/>
+    <framepos name="position" objtype="site" objname="imu"/>
+  </sensor>
+</mujoco>

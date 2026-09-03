@@ -3,10 +3,14 @@ numpy
 scipy
 matplotlib
 
-# Symbolic multibody dynamics (PyDy scripts)
-pydy
-sympy
-
 # Reinforcement learning & Gymnasium environment
 gymnasium
 stable-baselines3
+
+# Physics Simulation Backend
+mujoco>=3.0.0
+imageio[ffmpeg]
+
+# Symbolic multibody dynamics (PyDy reference scripts, optional)
+# pydy
+# sympy

@@ -14,15 +14,22 @@ import config
 
 
 def sys_params():
-    mB  = 1.2       # mass (kg)
+    # --------------------------------------------------------------------------
+    # Bitcraze Crazyflie 2.0 / 2.1 Physical Parameters
+    # --------------------------------------------------------------------------
+    mB  = 0.028     # mass (kg) (~28g with battery)
     g   = 9.81      # gravity (m/s/s)
-    dxm = 0.16      # arm length (m)
-    dym = 0.16      # arm length (m)
-    dzm = 0.05      # motor height (m)
-    IB  = np.array([[0.0123, 0,      0     ],
-                    [0,      0.0123, 0     ],
-                    [0,      0,      0.0224]]) # Inertial tensor (kg*m^2)
-    IRzz = 2.7e-5   # Rotor moment of inertia (kg*m^2)
+    # Rotor-to-rotor diagonal is 92mm (arm length ~46mm). In 'X' configuration:
+    # dxm = dym = 0.046 / sqrt(2) ≈ 0.0325 m
+    dxm = 0.0325    # arm length x (m)
+    dym = 0.0325    # arm length y (m)
+    dzm = 0.01      # motor height (m)
+
+    # Inertia tensor (kg*m^2) [Forster 2015 / Landry 2016 System Identification]
+    IB  = np.array([[1.43e-5, 0,       0      ],
+                    [0,      1.43e-5, 0      ],
+                    [0,      0,       2.89e-5]]) # Inertial tensor (kg*m^2)
+    IRzz = 1.0e-6   # Rotor moment of inertia (kg*m^2)
 
 
     params = {}
@@ -37,21 +44,23 @@ def sys_params():
     params["useIntergral"] = bool(False)    # Include integral gains in linear velocity control
     # params["interpYaw"] = bool(False)       # Interpolate Yaw setpoints in waypoint trajectory
 
-    params["Cd"]         = 0.1
-    params["kTh"]        = 1.076e-5 # thrust coeff (N/(rad/s)^2)  (1.18e-7 N/RPM^2)
-    params["kTo"]        = 1.632e-7 # torque coeff (Nm/(rad/s)^2)  (1.79e-9 Nm/RPM^2)
-    params["mixerFM"]    = makeMixerFM(params) # Make mixer that calculated Thrust (F) and moments (M) as a function on motor speeds
+    params["Cd"]         = 0.01     # Aerodynamic drag coefficient
+    # Thrust coeff: max ~0.15 N thrust per motor at ~2600 rad/s (~25,000 RPM)
+    params["kTh"]        = 2.2e-8   # thrust coeff (N/(rad/s)^2)
+    # Torque coeff (Nm/(rad/s)^2)
+    params["kTo"]        = 7.94e-10 # torque coeff (Nm/(rad/s)^2)
+    params["mixerFM"]    = makeMixerFM(params) # Make mixer matrix (F, M -> motor speeds)
     params["mixerFMinv"] = inv(params["mixerFM"])
-    params["minThr"]     = 0.1*4    # Minimum total thrust
-    params["maxThr"]     = 9.18*4   # Maximum total thrust
-    params["minWmotor"]  = 75       # Minimum motor rotation speed (rad/s)
-    params["maxWmotor"]  = 925      # Maximum motor rotation speed (rad/s)
-    params["tau"]        = 0.015    # Value for second order system for Motor dynamics
-    params["kp"]         = 1.0      # Value for second order system for Motor dynamics
-    params["damp"]       = 1.0      # Value for second order system for Motor dynamics
+    params["minThr"]     = 0.0      # Minimum total thrust (N)
+    params["maxThr"]     = 0.60     # Maximum total thrust (N) (~0.15N * 4)
+    params["minWmotor"]  = 0.0      # Minimum motor rotation speed (rad/s)
+    params["maxWmotor"]  = 2600.0   # Maximum motor rotation speed (rad/s)
+    params["tau"]        = 0.005    # Time constant for coreless DC motor dynamics (s)
+    params["kp"]         = 1.0      # DC gain for motor dynamics
+    params["damp"]       = 1.0      # Damping ratio for motor dynamics
     
-    params["motorc1"]    = 8.49     # w (rad/s) = cmd*c1 + c0 (cmd in %)
-    params["motorc0"]    = 74.7
+    params["motorc1"]    = 26.0     # w (rad/s) = cmd*c1 + c0 (cmd in 0-100%) -> 100% = 2600 rad/s
+    params["motorc0"]    = 0.0
     params["motordeadband"] = 1   
     # params["ifexpo"] = bool(False)
     # if params["ifexpo"]:
