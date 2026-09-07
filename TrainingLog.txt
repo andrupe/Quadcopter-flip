@@ -7,3 +7,5 @@ land on the same solution again.
 
 i think im going to back to the basics and do a q learning approach to get a "nominal" baseline as the
 execrise suggests, then i wil
+
+write more for last few

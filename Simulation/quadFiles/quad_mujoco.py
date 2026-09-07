@@ -33,7 +33,7 @@ class QuadcopterMuJoCo:
     state and API compatibility with downstream flight controllers.
     """
 
-    def __init__(self, Ti: float = 0.0, xml_path: Optional[str] = None):
+    def __init__(self, Ti: float = 0.0, xml_path: Optional[str] = None, motor_tau: float = 0.025):
         if xml_path is None:
             xml_path = os.path.join(_SIM_DIR, "assets", "scene.xml")
 
@@ -43,6 +43,7 @@ class QuadcopterMuJoCo:
         self.xml_path = xml_path
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
+        self.motor_tau: float = float(motor_tau)
 
         # Standardize coordinate frame to ENU for MuJoCo (+Z is Up)
         config.orient = "ENU"
@@ -85,7 +86,7 @@ class QuadcopterMuJoCo:
             "w_hover": w_hover,
             "thr_hover": thr_hover,
             "FF": 0.0,
-            "tau": 0.005,
+            "tau": motor_tau,
             "kp": 1.0,
             "damp": 1.0,
             "motorc1": 26.0,
@@ -95,6 +96,8 @@ class QuadcopterMuJoCo:
 
         self.params["mixerFM"] = makeMixerFM(self.params)
         self.params["mixerFMinv"] = np.linalg.inv(self.params["mixerFM"])
+        self.kTh_effective: float = kTh
+        self.kTo_effective: float = kTo
 
         # Cache mocap body ID if target_marker exists
         try:
@@ -122,6 +125,7 @@ class QuadcopterMuJoCo:
         self,
         pos: Optional[Union[np.ndarray, list]] = None,
         quat: Optional[Union[np.ndarray, list]] = None,
+        thrust_scale: float = 1.0,
     ) -> "QuadcopterMuJoCo":
         """
         Reset dynamic simulation state in MuJoCo C structure.
@@ -133,17 +137,20 @@ class QuadcopterMuJoCo:
 
         mujoco.mj_resetData(self.model, self.data)
 
+        self.kTh_effective = self.params["kTh"] * float(thrust_scale)
+        self.kTo_effective = self.params["kTo"] * float(thrust_scale)
+
         self.data.qpos[0:3] = np.asarray(pos, dtype=np.float64)
         self.data.qpos[3:7] = np.asarray(quat, dtype=np.float64)
         self.data.qvel[:] = 0.0
-        self.data.ctrl[:] = self.params["thr_hover"]
+        self.data.ctrl[:] = self.kTh_effective * (self.params["w_hover"] ** 2)
 
         # Run forward kinematics to populate state views and sensors
         mujoco.mj_forward(self.model, self.data)
 
         self.wMotor = np.ones(4) * self.params["w_hover"]
-        self.thr = np.ones(4) * self.params["thr_hover"]
-        self.tor = np.ones(4) * (self.params["kTo"] * (self.params["w_hover"]**2))
+        self.thr = self.kTh_effective * (self.wMotor ** 2)
+        self.tor = self.kTo_effective * (self.wMotor ** 2)
         self.vel_dot = np.zeros(3)
         self.omega_dot = np.zeros(3)
         self.acc = np.zeros(3)
@@ -208,14 +215,24 @@ class QuadcopterMuJoCo:
         prev_vel = self.vel.copy()
         prev_omega = self.omega.copy()
 
-        w_motor = np.clip(
+        w_motor_target = np.clip(
             np.asarray(motor_cmd, dtype=np.float64),
             self.params["minWmotor"],
             self.params["maxWmotor"],
         )
 
-        # Aerodynamic rotor thrust: F = kTh * w^2
-        thrusts = self.params["kTh"] * (w_motor ** 2)
+        # 1st-order motor dynamics low-pass filter (electrical/mechanical time constant tau)
+        if self.motor_tau > 0.0:
+            alpha = float(dt / (self.motor_tau + dt))
+            self.wMotor += alpha * (w_motor_target - self.wMotor)
+        else:
+            self.wMotor = w_motor_target.copy()
+
+        w_motor = self.wMotor.copy()
+
+        # Aerodynamic rotor thrust & reactive torque with effective battery scaling: F = kTh * w^2
+        thrusts = self.kTh_effective * (w_motor ** 2)
+        torques = self.kTo_effective * (w_motor ** 2)
 
         # Direct assignment to MuJoCo control array
         self.data.ctrl[:] = thrusts
@@ -237,7 +254,7 @@ class QuadcopterMuJoCo:
         self.t = t + dt
         self.wMotor = w_motor
         self.thr = thrusts
-        self.tor = self.params["kTo"] * (w_motor ** 2)
+        self.tor = torques
 
         self.vel_dot = (self.data.qvel[0:3] - prev_vel) / dt
         self.omega_dot = (self.data.qvel[3:6] - prev_omega) / dt

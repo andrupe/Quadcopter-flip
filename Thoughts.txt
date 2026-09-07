@@ -28,3 +28,4 @@ I had ai draft a porting guide which is called mujocoport.pdf which vaguely expl
 
 After porting i will go back to try to find the reward function again.
 
+write rest
