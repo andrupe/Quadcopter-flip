@@ -37,15 +37,18 @@ import utils
 # ======================================================================================
 # EVALUATION CONFIGURATION (Edit parameters directly here, then click Run in VS Code)
 # ======================================================================================
-MODEL_NAME: str = "quad_flip_model"  # Model name to evaluate (e.g. "quad_flip_model" or checkpoint)
+MODEL_NAME: str = "quad_flip_model"   # Model name to evaluate (e.g. "quad_flip_model" or checkpoint)
 EPISODE_SECONDS: float = 50.0         # Duration of each flight test (seconds)
-SHOW_VIEWER: bool = True             # Launch interactive 3D MuJoCo viewer window
-SHOW_PLOTS: bool = True             # Display 2D telemetry matplotlib plots after run
-LOOP: bool = True                    # Loop replay continuously (set False for a single episode)
-RANDOM_INITIAL_STATE: bool = True   # Set True to test policy robustness against random initial offsets
-PLAYBACK_SPEED: float = 1.0         # Playback speed (0.25 = 4x slow-motion, 0.5 = 2x slow-mo, 1.0 = real-time)
-DR_LEVEL: float = 1            # Domain Randomization intensity: 0.0 = nominal clean sim, 1.0 = full sim-to-real stress
-HOVER_GAIN: float = 1.0          # 1.0 = zero attenuation (100% full authority), 0.55 = previous 45% attenuation
+SHOW_VIEWER: bool = True              # Launch interactive 3D MuJoCo viewer window
+SHOW_PLOTS: bool = True              # Display 2D telemetry matplotlib plots after run
+LOOP: bool = True                     # Loop replay continuously (set False for a single episode)
+RANDOM_INITIAL_POS: bool = False      # False = ALWAYS spawn at fixed [0.0, 0.0, 1.2] meters
+RANDOM_INITIAL_VEL: bool = True       # True = randomize initial linear and angular velocities
+RANDOM_INITIAL_ATT: bool = True       # True = slight random orientation tilt (roll/pitch/yaw)
+RANDOM_INITIAL_STATE: bool = True     # Master flag (used for compatibility)
+PLAYBACK_SPEED: float = 2         # Playback speed (0.25 = 4x slow-motion, 0.5 = 2x slow-mo, 1.0 = real-time)
+DR_LEVEL: float = 0.8                # Domain Randomization intensity: 0.0 = nominal clean sim, 1.0 = full sim-to-real stress
+HOVER_GAIN: float = 1               # 1.0 = zero attenuation (100% full authority), 0.55 = previous 45% attenuation
 # ======================================================================================
 
 
@@ -57,6 +60,9 @@ def evaluate(
     show_viewer: bool = SHOW_VIEWER,
     show_plots: bool = SHOW_PLOTS,
     loop: bool = LOOP,
+    random_initial_pos: bool = RANDOM_INITIAL_POS,
+    random_initial_vel: bool = RANDOM_INITIAL_VEL,
+    random_initial_att: bool = RANDOM_INITIAL_ATT,
     random_initial_state: bool = RANDOM_INITIAL_STATE,
     playback_speed: float = PLAYBACK_SPEED,
 ):
@@ -70,19 +76,41 @@ def evaluate(
     print(f"\nLoading model: {model_path}")
     print(f"Evaluation DR Level: {dr_level:.2f} ({'Nominal clean sim' if dr_level == 0.0 else 'Sim-to-Real Hardened' if dr_level == 1.0 else 'Partial Randomization'})")
     print(f"Hover Gain Scale   : {hover_gain:.2f} ({'Unattenuated (100% authority)' if hover_gain >= 1.0 else f'{int((1.0 - hover_gain)*100)}% attenuated'})")
+    print(f"Initial State      : Pos={'[0.0, 0.0, 1.2] (fixed)' if not random_initial_pos else 'Randomized'} | Vel={'Randomized' if random_initial_vel else 'Zero'}")
     model = PPO.load(model_path)
-    env = QuadFlipEnv(episode_seconds=episode_seconds, random_initial_state=random_initial_state, hover_gain=hover_gain)
+    env = QuadFlipEnv(
+        episode_seconds=episode_seconds,
+        random_initial_state=random_initial_state,
+        random_initial_pos=random_initial_pos,
+        random_initial_vel=random_initial_vel,
+        random_initial_att=random_initial_att,
+        hover_gain=hover_gain,
+    )
     env.set_dr_level(dr_level)
     obs, info = env.reset()
 
     # Load observation normalization statistics if available
-    stats_path = os.path.join(_PROJECT_ROOT, f"{model_name}_vecnormalize.pkl")
+    stats_candidates = [
+        os.path.join(_PROJECT_ROOT, f"{model_name}_vecnormalize.pkl"),
+        os.path.join(_PROJECT_ROOT, model_name.replace(".zip", "_vecnormalize.pkl")),
+        os.path.join(os.path.dirname(model_path), f"{os.path.splitext(os.path.basename(model_path))[0]}_vecnormalize.pkl"),
+        os.path.join(_PROJECT_ROOT, "quad_flip_model_vecnormalize.pkl"),
+    ]
     vec_norm = None
-    if os.path.isfile(stats_path):
-        print(f"Loaded VecNormalize statistics from: {stats_path}")
-        dummy_vec = DummyVecEnv([lambda: env])
-        vec_norm = VecNormalize.load(stats_path, dummy_vec)
-        vec_norm.training = False
+    for sp in stats_candidates:
+        if os.path.isfile(sp):
+            print(f"Loaded VecNormalize statistics from: {sp}")
+            dummy_vec = DummyVecEnv([lambda: env])
+            vec_norm = VecNormalize.load(sp, dummy_vec)
+            vec_norm.training = False
+            break
+
+    if vec_norm is None:
+        print("\n" + "!" * 70)
+        print("⚠️  CRITICAL WARNING: No VecNormalize statistics found!")
+        print("   The policy was trained with observation normalization.")
+        print("   Running with raw observations will cause erratic behavior and crashes!")
+        print("!" * 70 + "\n")
 
     viewer = None
     if show_viewer:
@@ -147,6 +175,9 @@ def evaluate(
                 flip_deg = np.rad2deg(getattr(env, "accumulated_pitch", getattr(env, "accumulated_roll", 0.0)))
                 wind_spd = getattr(env.wind, "velW_max", 0.0) if env.random_wind else 0.0
                 print(f"[Episode {episode_idx}] Steps: {env.steps:4d} ({info['t']:.2f}s) | Rew: {total_reward:7.1f} | Flip: {str(env.flip_completed):5s} ({flip_deg:3.0f}°) | {status}")
+                sp = getattr(env, "spawn_pos", env.quad.pos)
+                sv = getattr(env, "spawn_vel", env.quad.vel)
+                print(f"             Spawn State : pos=[{sp[0]:+.2f}, {sp[1]:+.2f}, {sp[2]:+.2f}]m | vel=[{sv[0]:+.2f}, {sv[1]:+.2f}, {sv[2]:+.2f}]m/s")
                 if dist:
                     com = dist.get("com_offset", [0, 0, 0])
                     eff = dist.get("motor_efficiencies", [1, 1, 1, 1])

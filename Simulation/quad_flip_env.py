@@ -35,7 +35,7 @@ EPISODE_SECONDS: float = 8.0         # Episode duration in seconds
 ACTION_MODE: str = "motor"           # "motor" (direct rotor rad/s) or "thrust_moment"
 OBS_NOISE: bool = True              # Add Gaussian sensor noise (sim-to-real domain randomization)
 RANDOM_WIND: bool = True            # Add dynamic wind disturbances
-MAX_WIND_SPEED: float = 5.0          # Maximum wind speed in m/s (Crazyflie realistic limit)
+MAX_WIND_SPEED: float = 1.0          # Maximum wind speed in m/s (Crazyflie realistic limit)
 RANDOM_INITIAL_STATE: bool = True    # Randomize spawn position, attitude tilt, and velocity for robustness
 MOTOR_TAU: float = 0.025             # 1st-order motor time constant (seconds: 25ms for Crazyflie coreless DC)
 MOTOR_TAU_RANGE: tuple = (0.020, 0.035) # Per-episode motor tau randomization range (real Crazyflie: 20-30ms + margin)
@@ -43,14 +43,16 @@ RANDOM_BATTERY: bool = True          # Randomize battery voltage sag / thrust sc
 OBS_LATENCY_MAX_STEPS: int = 2       # Max observation delay in steps (models sensor->compute->actuator pipeline)
 PITCH_DIRECTION: float = 1.0         # +1.0 for front-flip (nose down, +omega_y), -1.0 for back-flip (nose up, -omega_y)
 FLIP_THRESHOLD: float = 2.0 * np.pi  # Rotation angle required for a full 360° pitch flip
+OBS_HISTORY_LEN: int = 3             # Number of stacked observation frames (30ms temporal context for implicit system ID)
+SINGLE_OBS_DIM: int = 18             # Single-frame observation dimension
 
 # Real-world Hardware Distortions & Physical Asymmetries (Domain Randomization)
 COM_OFFSET_MAX_XY: float = 0.0025      # ±2.5 mm off-center Center of Mass (battery clamp / board misalignment)
 COM_OFFSET_MAX_Z: float = 0.0030       # ±3.0 mm vertical CoM offset
-PAYLOAD_MASS_MAX: float = 0.0070       # +0 to 7g variable payload (battery clip, camera deck, LED ring)
+PAYLOAD_MASS_MAX: float = 0.0045       # +0 to 4.5g calibrated payload (Crazyflie AI-deck is ~4.4g; maintains TWR margin)
 ARM_LENGTH_JITTER_MAX: float = 0.0015  # ±1.5 mm independent rotor arm length variation (manufacturing tolerances)
 MOTOR_MISMATCH_MAX: float = 0.08       # Up to 8% independent motor efficiency degradation
-DYNAMIC_SAG_COEF_MAX: float = 0.12     # Up to 12% dynamic battery voltage sag under 100% burst throttle
+DYNAMIC_SAG_COEF_MAX: float = 0.07     # Up to 7% realistic 1S LiPo dynamic voltage sag under 100% burst throttle
 MOTOR_TAU_DOWN_FACTOR: float = 0.50    # tau_down can be up to 50% slower than tau_up (aerodynamic drag spool-down)
 GYRO_BIAS_MAX: float = 0.035          # ±0.035 rad/s (~2.0 deg/s) static IMU turn-on gyro bias
 
@@ -64,17 +66,19 @@ OBS_NOISE_ATT_DEG_RANGE: tuple = (0.5, 2.0)       # Attitude orientation jitter 
 # Tune these directly in real physical units (meters, m/s, rad/s)
 TOL_PITCH_RATE: float = 14.0         # rad/s (pitch rate tracking bandwidth around 20 rad/s target)
 TOL_FLIP_ANGLE: float = 1.4          # rad (remaining angle tolerance for rotation completion progress)
-TOL_ALT_DOWN: float = 0.20         # meters (tight tolerance: steep penalty for dropping below target)
-TOL_ALT_UP: float = 0.60           # meters (increased tolerance: lenient upward ceiling penalty)
+TOL_ALT_DOWN: float = 0.30         # meters (calibrated to 0.30m: allows natural flip dip without conflicting gradient)
+TOL_ALT_UP: float = 0.70           # meters (increased tolerance: lenient upward ceiling penalty)
 ALT_PRE_CLIMB_BUFFER: float = 0.15 # meters (free upward altitude buffer above 1.45m: zero penalty up to 1.60m)
 TOL_PARASITIC: float = 5.0           # rad/s (off-axis roll/yaw rate tolerance)
-TOL_XY_DRIFT: float = 0.4           # meters (horizontal drift tolerance)
-TOL_POS_HOVER: float = 0.3          # meters (3D position error tolerance during hover)
+TOL_XY_DRIFT: float = 0.4           # meters (horizontal drift tolerance during flip)
+TOL_XY_HOVER: float = 0.25          # meters (planar XY drift tolerance during hover)
+TOL_Z_HOVER: float = 0.10           # meters (vertical altitude error tolerance during hover to eliminate droop)
+TOL_POS_HOVER: float = 0.3          # meters (legacy 3D position error tolerance)
 TOL_SO3_ATTITUDE: float = 0.70       # SO(3) attitude error (1 - R33) tolerance (~50° tilt)
 TOL_HEADING: float = 0.8         # rad (~20° heading alignment tolerance during hover)
-TOL_VEL_HOVER: float = 0.8       # m/s (linear velocity tolerance during hover)
+TOL_VEL_HOVER: float = 0.30       # m/s (tight linear velocity tolerance: strong derivative damping)
 TOL_Z_VEL_FLIP: float = 0.6          # m/s (target climb velocity during flip initiation in ENU frame: +Z is up)
-TOL_OMEGA_HOVER: float = 9        # rad/s (angular body rate tolerance during hover)
+TOL_OMEGA_HOVER: float = 3.0        # rad/s (tightened from 9.0: strongly penalizes residual angular rates in hover)
 TOL_ACTION_SMOOTH: float = 0.33      # action delta norm tolerance (~1,300 RPM change per 10ms step) 1389 is the max from crazyflie
 ACTION_EMA_ALPHA_FLIP: float = 0.9   # EMA during flip: 90% new + 10% prev (fast response for acrobatic maneuver)
 ACTION_EMA_ALPHA_HOVER: float = 0.7  # EMA during hover: 70% new + 30% prev (smooth, calm motor commands)
@@ -101,6 +105,9 @@ class QuadFlipEnv(gym.Env):
         obs_noise: bool = OBS_NOISE,
         random_wind: bool = RANDOM_WIND,
         random_initial_state: bool = RANDOM_INITIAL_STATE,
+        random_initial_pos: Optional[bool] = None,
+        random_initial_vel: Optional[bool] = None,
+        random_initial_att: Optional[bool] = None,
         random_battery: bool = RANDOM_BATTERY,
         motor_tau: float = MOTOR_TAU,
         pitch_direction: float = PITCH_DIRECTION,
@@ -118,6 +125,9 @@ class QuadFlipEnv(gym.Env):
         self.spawn_altitude = float(spawn_altitude)
         self.obs_noise = bool(obs_noise)
         self.random_initial_state = bool(random_initial_state)
+        self.random_initial_pos = bool(random_initial_state if random_initial_pos is None else random_initial_pos)
+        self.random_initial_vel = bool(random_initial_state if random_initial_vel is None else random_initial_vel)
+        self.random_initial_att = bool(random_initial_state if random_initial_att is None else random_initial_att)
         self.random_battery = bool(random_battery)
         self.motor_tau = float(motor_tau)
         self.pitch_direction = float(pitch_direction)
@@ -136,7 +146,11 @@ class QuadFlipEnv(gym.Env):
 
         # Observation latency buffer (sim-to-real: models sensor->compute->actuator delay)
         self.obs_latency: int = 0  # Current episode's latency in steps (randomized per reset)
-        self.obs_buffer: list = []  # Ring buffer of recent observations
+        self.obs_buffer: list[np.ndarray] = []  # Ring buffer of recent observations
+
+        # Observation temporal history buffer (Item 1: 3-step historical context for implicit system ID)
+        self.obs_history_len: int = OBS_HISTORY_LEN
+        self.obs_history_buffer: list[np.ndarray] = []
 
         # Domain randomization level: 0.0 = easy (learn the flip), 1.0 = full DR (sim-to-real hardened)
         self.dr_level: float = 0.0
@@ -166,9 +180,10 @@ class QuadFlipEnv(gym.Env):
         # Action: 4 normalized motor commands in [-1.0, 1.0]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
 
-        # Observation: 18 dimensions (Purely coordinate-independent & ego-centric)
-        # rel_pos_body (3) + quat (4) + vel_body (3) + omega (3) + prev_action (4) + flip_progress (1)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(18,), dtype=np.float32)
+        # Observation: 18 x 3 = 54 dimensions (Historical temporal context for implicit system ID)
+        # 3 stacked frames of [rel_pos_body (3) + quat (4) + vel_body (3) + omega (3) + prev_action (4) + flip_progress (1)]
+        total_obs_dim = SINGLE_OBS_DIM * self.obs_history_len
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(total_obs_dim,), dtype=np.float32)
 
     @property
     def target_state(self) -> np.ndarray:
@@ -242,6 +257,13 @@ class QuadFlipEnv(gym.Env):
 
         return obs
 
+    def _get_stacked_obs(self) -> np.ndarray:
+        """
+        Concatenates historical observation frames chronologically:
+        [obs_{t - (K-1)}, ..., obs_{t-1}, obs_t] with total shape (SINGLE_OBS_DIM * OBS_HISTORY_LEN,).
+        """
+        return np.concatenate(self.obs_history_buffer, dtype=np.float32)
+
     def _compute_reward(self, action: np.ndarray, delta_pitch: float) -> float:
         """
         - Phase 1 (Flip): Exponential pitch rate tracking, rotation progress, altitude lock, parasitic rate damping.
@@ -300,34 +322,39 @@ class QuadFlipEnv(gym.Env):
             # --- PHASE 2: RECOVER & PRECISION HOVER ---
             r_alive = 1.0
 
-            # 1. 3D Position lock to target setpoint
-            pos_error = float(np.linalg.norm(pos - self.target_state))
-            r_pos = float(np.exp(-((pos_error / TOL_POS_HOVER) ** 2)))
+            # 1. Planar XY Position Lock
+            xy_error = float(np.linalg.norm(pos[:2] - self.target_state[:2]))
+            r_xy = float(np.exp(-((xy_error / TOL_XY_HOVER) ** 2)))
 
-            # 2. Upright attitude on SO(3): (1 - R33) is 0 when upright, 2 when upside down
+            # 2. Vertical Altitude Lock (tight tolerance to eliminate 5-7cm payload sag)
+            z_error = float(np.abs(pos[2] - self.target_state[2]))
+            r_z = float(np.exp(-((z_error / TOL_Z_HOVER) ** 2)))
+
+            # 3. Upright attitude on SO(3): relaxed so the quad can tilt 5-8 deg to brake
             so3_error = float(1.0 - max(0.0, dcm[2, 2]))
             r_upright = float(np.exp(-(so3_error / TOL_SO3_ATTITUDE)))
 
-            # 3. Heading lock (yaw alignment): x_body projected onto world forward x-axis
+            # 4. Heading lock (yaw alignment): x_body projected onto world forward x-axis
             heading_error = float(np.abs(np.arctan2(dcm[1, 0], dcm[0, 0])))
             r_heading = float(np.exp(-((heading_error / TOL_HEADING) ** 2)))
 
-            # 4. Linear velocity damping (peaks at zero velocity)
+            # 5. Linear velocity damping (Strong D-gain: tight 0.30 m/s tolerance)
             vel_norm = float(np.linalg.norm(vel))
             r_vel = float(np.exp(-((vel_norm / TOL_VEL_HOVER) ** 2)))
 
-            # 5. Angular velocity damping (peaks at zero body rates)
+            # 6. Angular velocity damping (peaks at zero body rates)
             omega_norm = float(np.linalg.norm(omega))
             r_omega = float(np.exp(-((omega_norm / TOL_OMEGA_HOVER) ** 2)))
 
             reward = (
-                r_alive
-                + 2.5 * r_pos 
-                + 1.0 * r_upright
-                + 1.3 * r_heading
-                + 1.5 * r_vel
-                + 1.5 * r_omega
-                + 0.6 * r_action
+                r_alive             # 1.0
+                + 1.8 * r_xy        # Planar XY lock
+                + 1.5 * r_z         # Vertical altitude lock
+                + 0.8 * r_upright   # Attitude constraint (relaxed to allow braking tilt)
+                + 1.0 * r_heading   # Yaw heading alignment
+                + 1.6 * r_vel       # Strong derivative braking (kills hunting oscillation)
+                + 1.2 * r_omega     # Body rate damping
+                + 0.35 * r_action   # Balanced smoothness (prevents chatter without lazy drift)
             )
 
         return float(reward)
@@ -382,6 +409,7 @@ class QuadFlipEnv(gym.Env):
         max_lat = int(round(dr * OBS_LATENCY_MAX_STEPS))
         self.obs_latency = int(self.np_random.integers(0, max_lat + 1)) if max_lat > 0 else 0
         self.obs_buffer = []
+        self.obs_history_buffer = []
 
         # 2. Wind: scale max wind speed with dr_level (gentle breeze → full gusts)
         if self.random_wind:
@@ -404,7 +432,7 @@ class QuadFlipEnv(gym.Env):
             com_dz = float(self.np_random.uniform(-dr * COM_OFFSET_MAX_Z, dr * COM_OFFSET_MAX_Z))
             com_offset = np.array([com_dx, com_dy, com_dz], dtype=np.float64)
 
-            # 1.b Variable Payload (0 to 7g, scaling inertia proportionally)
+            # 1.b Variable Payload (0 to 4.5g, scaling inertia proportionally)
             m_payload = float(self.np_random.uniform(0.0, dr * PAYLOAD_MASS_MAX))
             total_mass = self.quad.base_mass + m_payload
             inertia_scale = total_mass / self.quad.base_mass
@@ -486,8 +514,8 @@ class QuadFlipEnv(gym.Env):
                 "latency_steps": int(self.obs_latency),
             }
 
-        if self.random_initial_state:
-            # 5. Position jitter: scale with dr_level (±5cm → ±20cm horizontal, ±3cm → ±12cm vertical)
+        # 5. Spawn Position: fixed at self.initial_pos ([0, 0, 1.2]) if random_initial_pos=False
+        if self.random_initial_pos:
             xy_jitter = 0.05 + dr * 0.15   # 5cm → 20cm
             z_jitter = 0.03 + dr * 0.09    # 3cm → 12cm
             pos_jitter = self.np_random.uniform(
@@ -496,31 +524,54 @@ class QuadFlipEnv(gym.Env):
                 size=3,
             ).astype(np.float64)
             spawn_pos = self.initial_pos + pos_jitter
+        else:
+            spawn_pos = self.initial_pos.copy()
 
-            # 6. Attitude jitter: scale with dr_level (±3° → ±10° roll/pitch, ±2° → ±8° yaw)
+        # 6. Attitude jitter: scale with dr_level (±3° → ±10° roll/pitch, ±2° → ±8° yaw)
+        if self.random_initial_att:
             att_rp = 0.05 + dr * 0.12   # ~3° → ~10°
             att_y = 0.035 + dr * 0.10   # ~2° → ~8°
             r_init = float(self.np_random.uniform(-att_rp, att_rp))
             p_init = float(self.np_random.uniform(-att_rp, att_rp))
             y_init = float(self.np_random.uniform(-att_y, att_y))
             spawn_quat = self._euler_to_quat(r_init, p_init, y_init)
+        else:
+            spawn_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
-            self.quad.reset(pos=spawn_pos, quat=spawn_quat, thrust_scale=thrust_scale)
+        self.quad.reset(pos=spawn_pos, quat=spawn_quat, thrust_scale=thrust_scale)
 
-            # 7. Velocity jitter: scale with dr_level
-            vel_lin = 0.05 + dr * 0.15   # ±0.05 → ±0.20 m/s
-            vel_ang = 0.10 + dr * 0.35   # ±0.10 → ±0.45 rad/s
+        # 7. Velocity jitter: randomize initial linear and angular velocities
+        if self.random_initial_vel:
+            vel_lin = max(0.08, 0.05 + dr * 0.15)   # ±0.08 → ±0.20 m/s
+            vel_ang = max(0.12, 0.10 + dr * 0.35)   # ±0.12 → ±0.45 rad/s
             self.quad.data.qvel[0:3] = self.np_random.uniform(-vel_lin, vel_lin, size=3)
             self.quad.data.qvel[3:6] = self.np_random.uniform(-vel_ang, vel_ang, size=3)
             mujoco.mj_forward(self.quad.model, self.quad.data)
-        else:
-            self.quad.reset(pos=self.initial_pos, thrust_scale=thrust_scale)
+            self.quad._update_state_properties()
+
+        self.spawn_pos = spawn_pos.copy()
+        self.spawn_vel = self.quad.vel.copy()
 
         self.quad.set_target_marker(self.target_state)
 
-        return self._compute_observation(), {
+        initial_obs = self._compute_observation()
+        # Seed latency ring buffer with initial observation
+        self.obs_buffer = [initial_obs.copy() for _ in range(self.obs_latency + 1)]
+        delayed_obs = self.obs_buffer[0]
+        # Seed history buffer with K copies of initial delayed observation
+        self.obs_history_buffer = [delayed_obs.copy() for _ in range(self.obs_history_len)]
+
+        stacked_obs = self._get_stacked_obs()
+        return stacked_obs, {
             "target_state": self.target_state.copy(),
+            "position": self.quad.pos.copy(),
+            "velocity": self.quad.vel.copy(),
+            "quat": self.quad.quat.copy(),
+            "omega": self.quad.omega.copy(),
+            "spawn_pos": self.spawn_pos.copy(),
+            "spawn_vel": self.spawn_vel.copy(),
             "stock_obs": self._compute_stock_obs(),
+            "single_obs": delayed_obs.copy(),
             "active_disturbances": self.active_disturbances,
         }
 
@@ -602,7 +653,13 @@ class QuadFlipEnv(gym.Env):
         self.obs_buffer.append(obs_current)
         if len(self.obs_buffer) > self.obs_latency + 1:
             self.obs_buffer.pop(0)
-        obs = self.obs_buffer[0]  # Oldest buffered obs (delayed by self.obs_latency steps)
+        delayed_obs = self.obs_buffer[0]  # Oldest buffered obs (delayed by self.obs_latency steps)
+
+        # Observation temporal history: append newest delayed observation and maintain K frames
+        self.obs_history_buffer.append(delayed_obs)
+        if len(self.obs_history_buffer) > self.obs_history_len:
+            self.obs_history_buffer.pop(0)
+        stacked_obs = self._get_stacked_obs()
 
         reward = self._compute_reward(action, delta_pitch)
         terminated = self._check_termination()
@@ -623,11 +680,12 @@ class QuadFlipEnv(gym.Env):
             "has_inverted": self.has_inverted,
             "flip_completed": self.flip_completed,
             "stock_obs": self._compute_stock_obs(),
+            "single_obs": delayed_obs.copy(),
             "active_disturbances": self.active_disturbances,
         }
 
         self.prev_action = action.copy()
-        return obs, reward, terminated, truncated, info
+        return stacked_obs, reward, terminated, truncated, info
 
 
 # Backwards compatibility alias
