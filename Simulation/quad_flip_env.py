@@ -20,6 +20,7 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
 from quadFiles.quad_mujoco import QuadcopterMuJoCo
 from utils.windModel import Wind
 from utils.mixer import mixerFM
+import utils
 import config
 
 # ======================================================================================
@@ -43,6 +44,22 @@ OBS_LATENCY_MAX_STEPS: int = 2       # Max observation delay in steps (models se
 PITCH_DIRECTION: float = 1.0         # +1.0 for front-flip (nose down, +omega_y), -1.0 for back-flip (nose up, -omega_y)
 FLIP_THRESHOLD: float = 2.0 * np.pi  # Rotation angle required for a full 360° pitch flip
 
+# Real-world Hardware Distortions & Physical Asymmetries (Domain Randomization)
+COM_OFFSET_MAX_XY: float = 0.0025      # ±2.5 mm off-center Center of Mass (battery clamp / board misalignment)
+COM_OFFSET_MAX_Z: float = 0.0030       # ±3.0 mm vertical CoM offset
+PAYLOAD_MASS_MAX: float = 0.0070       # +0 to 7g variable payload (battery clip, camera deck, LED ring)
+ARM_LENGTH_JITTER_MAX: float = 0.0015  # ±1.5 mm independent rotor arm length variation (manufacturing tolerances)
+MOTOR_MISMATCH_MAX: float = 0.08       # Up to 8% independent motor efficiency degradation
+DYNAMIC_SAG_COEF_MAX: float = 0.12     # Up to 12% dynamic battery voltage sag under 100% burst throttle
+MOTOR_TAU_DOWN_FACTOR: float = 0.50    # tau_down can be up to 50% slower than tau_up (aerodynamic drag spool-down)
+GYRO_BIAS_MAX: float = 0.035          # ±0.035 rad/s (~2.0 deg/s) static IMU turn-on gyro bias
+
+# Realistic Sensor Observation Noise (1-sigma bounds: [nominal_clean, sim_to_real_hardened])
+OBS_NOISE_POS_RANGE: tuple = (0.005, 0.015)       # Position tracking noise in meters (±5mm to ±15mm)
+OBS_NOISE_VEL_RANGE: tuple = (0.020, 0.060)       # Linear velocity estimation noise in m/s (±2cm/s to ±6cm/s)
+OBS_NOISE_OMEGA_RANGE: tuple = (0.030, 0.150)     # Angular velocity noise in rad/s (±1.7°/s to ±8.6°/s, motor vibration)
+OBS_NOISE_ATT_DEG_RANGE: tuple = (0.5, 2.0)       # Attitude orientation jitter in degrees (±0.5° to ±2.0°)
+
 # Physical tolerances for reward exponentials (error scale where reward drops to exp(-1) ~ 0.37)
 # Tune these directly in real physical units (meters, m/s, rad/s)
 TOL_PITCH_RATE: float = 14.0         # rad/s (pitch rate tracking bandwidth around 20 rad/s target)
@@ -61,7 +78,7 @@ TOL_OMEGA_HOVER: float = 9        # rad/s (angular body rate tolerance during ho
 TOL_ACTION_SMOOTH: float = 0.33      # action delta norm tolerance (~1,300 RPM change per 10ms step) 1389 is the max from crazyflie
 ACTION_EMA_ALPHA_FLIP: float = 0.9   # EMA during flip: 90% new + 10% prev (fast response for acrobatic maneuver)
 ACTION_EMA_ALPHA_HOVER: float = 0.7  # EMA during hover: 70% new + 30% prev (smooth, calm motor commands)
-ACTION_HOVER_GAIN: float = 0.55       # Control authority scale in steady hover (eliminates motor chatter/wobble)
+ACTION_HOVER_GAIN: float = 1.0       # Control authority scale in steady hover (1.0 = zero attenuation / full authority)
 HOVER_BLEND_DURATION: float = 0.6     # Duration (seconds) to transition from full flip recovery to calm hover
 # ======================================================================================
 
@@ -88,6 +105,7 @@ class QuadFlipEnv(gym.Env):
         motor_tau: float = MOTOR_TAU,
         pitch_direction: float = PITCH_DIRECTION,
         arena_radius: float = 1.5,
+        hover_gain: float = ACTION_HOVER_GAIN,
     ):
         super().__init__()
 
@@ -104,12 +122,17 @@ class QuadFlipEnv(gym.Env):
         self.motor_tau = float(motor_tau)
         self.pitch_direction = float(pitch_direction)
         self.arena_radius = float(arena_radius)
+        self.hover_gain = float(hover_gain)
 
         # MuJoCo quadcopter simulation model with 1st-order motor dynamics
         self.quad = QuadcopterMuJoCo(motor_tau=self.motor_tau)
         self.t: float = 0.0
         self.steps: int = 0
         self.prev_action: np.ndarray = np.zeros(4, dtype=np.float32)
+
+        # Gyroscope static turn-on bias (rad/s) and active domain randomization tracking
+        self.gyro_bias: np.ndarray = np.zeros(3, dtype=np.float32)
+        self.active_disturbances: Dict[str, Any] = {}
 
         # Observation latency buffer (sim-to-real: models sensor->compute->actuator delay)
         self.obs_latency: int = 0  # Current episode's latency in steps (randomized per reset)
@@ -175,19 +198,47 @@ class QuadFlipEnv(gym.Env):
         if quat[0] < 0.0:
             quat = -quat
 
-        obs = np.concatenate([
-            rel_pos_body,               # 3: Target position relative to quad in body frame
-            quat,                       # 4: Canonicalized attitude quaternion [w, x, y, z] with w >= 0
-            vel_body,                   # 3: Linear velocity in body frame
-            self.quad.omega,            # 3: Angular velocity [p, q, r] in rad/s
-            self.prev_action,           # 4: Action from previous step
-            np.array([flip_progress]),  # 1: Flip completion ratio [0.0, 1.0]
-        ], dtype=np.float32)
+        # Injected IMU gyro bias with Nyquist anti-aliasing (models BMI088 on-chip LPF over sub-steps)
+        raw_omega = getattr(self.quad, "omega_filtered", self.quad.omega)
+        measured_omega = (raw_omega + self.gyro_bias).astype(np.float32)
 
         if self.obs_noise:
-            noise_std = np.full(18, 0.02, dtype=np.float32)
-            noise_std[13:] = 0.0  # Keep action and progress deterministic
-            obs += np.random.normal(0.0, noise_std, size=18).astype(np.float32)
+            dr = float(np.clip(self.dr_level, 0.0, 1.0))
+
+            # Interpolate 1-sigma sensor noise levels according to domain randomization level
+            sigma_pos = OBS_NOISE_POS_RANGE[0] + dr * (OBS_NOISE_POS_RANGE[1] - OBS_NOISE_POS_RANGE[0])
+            sigma_vel = OBS_NOISE_VEL_RANGE[0] + dr * (OBS_NOISE_VEL_RANGE[1] - OBS_NOISE_VEL_RANGE[0])
+            sigma_omega = OBS_NOISE_OMEGA_RANGE[0] + dr * (OBS_NOISE_OMEGA_RANGE[1] - OBS_NOISE_OMEGA_RANGE[0])
+            sigma_att_rad = np.radians(
+                OBS_NOISE_ATT_DEG_RANGE[0] + dr * (OBS_NOISE_ATT_DEG_RANGE[1] - OBS_NOISE_ATT_DEG_RANGE[0])
+            )
+
+            # 1. Position error in body frame (~5mm to ~15mm)
+            rel_pos_body = rel_pos_body + self.np_random.normal(0.0, sigma_pos, size=3)
+
+            # 2. Attitude error (physically valid SO(3) perturbation, unit norm preserved)
+            if sigma_att_rad > 1e-6:
+                angle_jitter = self.np_random.normal(0.0, sigma_att_rad, size=3)
+                dq = np.array([1.0, 0.5 * angle_jitter[0], 0.5 * angle_jitter[1], 0.5 * angle_jitter[2]], dtype=np.float64)
+                dq = utils.vectNormalize(dq)
+                quat = utils.quatMultiply(quat, dq)
+                if quat[0] < 0.0:
+                    quat = -quat
+
+            # 3. Linear velocity error in body frame (~2cm/s to ~6cm/s)
+            vel_body = vel_body + self.np_random.normal(0.0, sigma_vel, size=3)
+
+            # 4. Angular velocity error (IMU gyro noise + motor vibration, ~0.03 to ~0.15 rad/s)
+            measured_omega = measured_omega + self.np_random.normal(0.0, sigma_omega, size=3).astype(np.float32)
+
+        obs = np.concatenate([
+            rel_pos_body.astype(np.float32),               # 3: Target position relative to quad in body frame
+            quat.astype(np.float32),                       # 4: Canonicalized attitude quaternion [w, x, y, z] with w >= 0
+            vel_body.astype(np.float32),                   # 3: Linear velocity in body frame
+            measured_omega.astype(np.float32),             # 3: Angular velocity [p, q, r] in rad/s with gyro bias & noise
+            self.prev_action.astype(np.float32),           # 4: Action from previous step
+            np.array([flip_progress], dtype=np.float32),   # 1: Flip completion ratio [0.0, 1.0]
+        ], dtype=np.float32)
 
         return obs
 
@@ -247,7 +298,6 @@ class QuadFlipEnv(gym.Env):
             )
         else:
             # --- PHASE 2: RECOVER & PRECISION HOVER ---
-            # Post-flip living bonus: reduced to 1.0 to balance Phase 2 vs Phase 1 economics
             r_alive = 1.0
 
             # 1. 3D Position lock to target setpoint
@@ -273,10 +323,10 @@ class QuadFlipEnv(gym.Env):
             reward = (
                 r_alive
                 + 2.5 * r_pos 
-                + 2.0 * r_upright
+                + 1.0 * r_upright
                 + 1.3 * r_heading
-                + 0.5 * r_vel
-                + 1.2 * r_omega
+                + 1.5 * r_vel
+                + 1.5 * r_omega
                 + 0.6 * r_action
             )
 
@@ -328,31 +378,113 @@ class QuadFlipEnv(gym.Env):
         # Per-episode domain randomization scaled by dr_level (0.0=easy, 1.0=full)
         dr = self.dr_level
 
-        # 1. Motor tau: fixed at nominal when dr=0, randomized 20-35ms when dr=1
-        if self.random_initial_state and dr > 0.0:
-            tau_lo = MOTOR_TAU - dr * (MOTOR_TAU - MOTOR_TAU_RANGE[0])  # 0.025 → 0.020
-            tau_hi = MOTOR_TAU + dr * (MOTOR_TAU_RANGE[1] - MOTOR_TAU)  # 0.025 → 0.035
-            self.quad.motor_tau = float(self.np_random.uniform(tau_lo, tau_hi))
-        else:
-            self.quad.motor_tau = MOTOR_TAU
-
-        # 2. Observation latency: 0 steps when dr=0, up to OBS_LATENCY_MAX_STEPS when dr=1
+        # 1. Observation latency: 0 steps when dr=0, up to OBS_LATENCY_MAX_STEPS when dr=1
         max_lat = int(round(dr * OBS_LATENCY_MAX_STEPS))
         self.obs_latency = int(self.np_random.integers(0, max_lat + 1)) if max_lat > 0 else 0
         self.obs_buffer = []
 
-        # 3. Wind: scale max wind speed with dr_level (gentle breeze → full gusts)
+        # 2. Wind: scale max wind speed with dr_level (gentle breeze → full gusts)
         if self.random_wind:
             self.wind.velW_max = MAX_WIND_SPEED * max(0.1, dr)  # Always some minimal wind
             self.wind.reseed()
 
-        # 4. Battery / thrust variation: narrow range at dr=0, wide at dr=1
-        if self.random_battery:
+        # 3. Static battery / thrust variation: narrow range at dr=0, wide at dr=1
+        if self.random_battery and dr > 0.0:
             batt_lo = 1.0 - dr * 0.15   # 1.0 → 0.85
             batt_hi = 1.0 + dr * 0.10   # 1.0 → 1.10
             thrust_scale = float(self.np_random.uniform(batt_lo, batt_hi))
         else:
             thrust_scale = 1.0
+
+        # 4. Hardware Distortions & Physical Asymmetries (1.a, 1.b, 1.c, 2.1, 2.2, 2.3, 2.4)
+        if dr > 0.0:
+            # 1.a Off-center Center of Mass (XY ±2.5mm, Z ±3.0mm)
+            com_dx = float(self.np_random.uniform(-dr * COM_OFFSET_MAX_XY, dr * COM_OFFSET_MAX_XY))
+            com_dy = float(self.np_random.uniform(-dr * COM_OFFSET_MAX_XY, dr * COM_OFFSET_MAX_XY))
+            com_dz = float(self.np_random.uniform(-dr * COM_OFFSET_MAX_Z, dr * COM_OFFSET_MAX_Z))
+            com_offset = np.array([com_dx, com_dy, com_dz], dtype=np.float64)
+
+            # 1.b Variable Payload (0 to 7g, scaling inertia proportionally)
+            m_payload = float(self.np_random.uniform(0.0, dr * PAYLOAD_MASS_MAX))
+            total_mass = self.quad.base_mass + m_payload
+            inertia_scale = total_mass / self.quad.base_mass
+            total_inertia = self.quad.base_inertia * inertia_scale
+
+            # 1.c Asymmetric Arm Lengths (independent site offsets ±1.5mm)
+            site_offsets = [
+                np.array([
+                    float(self.np_random.uniform(-dr * ARM_LENGTH_JITTER_MAX, dr * ARM_LENGTH_JITTER_MAX)),
+                    float(self.np_random.uniform(-dr * ARM_LENGTH_JITTER_MAX, dr * ARM_LENGTH_JITTER_MAX)),
+                    0.0,
+                ], dtype=np.float64)
+                for _ in range(4)
+            ]
+
+            # 2.1 Independent Motor Thrust Mismatch (up to 8% degradation)
+            motor_efficiencies = np.array([
+                1.0 - float(self.np_random.uniform(0.0, dr * MOTOR_MISMATCH_MAX))
+                for _ in range(4)
+            ], dtype=np.float64)
+
+            # 2.2 Dynamic Battery Sag under high throttle bursts
+            dynamic_sag_coef = float(self.np_random.uniform(0.0, dr * DYNAMIC_SAG_COEF_MAX))
+
+            # 2.3 Directional Motor Dynamics (tau_up vs slower tau_down)
+            tau_lo = MOTOR_TAU - dr * (MOTOR_TAU - MOTOR_TAU_RANGE[0])
+            tau_hi = MOTOR_TAU + dr * (MOTOR_TAU_RANGE[1] - MOTOR_TAU)
+            tau_up = float(self.np_random.uniform(tau_lo, tau_hi))
+            tau_down_mult = 1.0 + float(self.np_random.uniform(0.0, dr * MOTOR_TAU_DOWN_FACTOR))
+            tau_down = float(tau_up * tau_down_mult)
+            self.quad.motor_tau = tau_up
+
+            # 2.4 Gyroscope Zero-Rate Bias
+            self.gyro_bias = self.np_random.uniform(
+                -dr * GYRO_BIAS_MAX, dr * GYRO_BIAS_MAX, size=3
+            ).astype(np.float32)
+
+            self.quad.apply_hardware_distortions(
+                mass=total_mass,
+                com_offset=com_offset,
+                inertia=total_inertia,
+                site_offsets=site_offsets,
+                motor_efficiencies=motor_efficiencies,
+                tau_up=tau_up,
+                tau_down=tau_down,
+                dynamic_sag_coef=dynamic_sag_coef,
+            )
+
+            self.active_disturbances = {
+                "dr_level": dr,
+                "com_offset": com_offset.tolist(),
+                "payload_mass_g": float(m_payload * 1000.0),
+                "total_mass_g": float(total_mass * 1000.0),
+                "site_offsets_mm": (np.array(site_offsets) * 1000.0).tolist(),
+                "motor_efficiencies": motor_efficiencies.tolist(),
+                "tau_up_ms": float(tau_up * 1000.0),
+                "tau_down_ms": float(tau_down * 1000.0),
+                "dynamic_sag_coef": dynamic_sag_coef,
+                "gyro_bias_rads": self.gyro_bias.tolist(),
+                "thrust_scale": float(thrust_scale),
+                "latency_steps": int(self.obs_latency),
+            }
+        else:
+            self.quad.motor_tau = MOTOR_TAU
+            self.gyro_bias = np.zeros(3, dtype=np.float32)
+            self.quad.apply_hardware_distortions()
+            self.active_disturbances = {
+                "dr_level": 0.0,
+                "com_offset": [0.0, 0.0, 0.0],
+                "payload_mass_g": 0.0,
+                "total_mass_g": float(self.quad.base_mass * 1000.0),
+                "site_offsets_mm": [[0.0, 0.0, 0.0]] * 4,
+                "motor_efficiencies": [1.0, 1.0, 1.0, 1.0],
+                "tau_up_ms": float(MOTOR_TAU * 1000.0),
+                "tau_down_ms": float(MOTOR_TAU * 1000.0),
+                "dynamic_sag_coef": 0.0,
+                "gyro_bias_rads": [0.0, 0.0, 0.0],
+                "thrust_scale": float(thrust_scale),
+                "latency_steps": int(self.obs_latency),
+            }
 
         if self.random_initial_state:
             # 5. Position jitter: scale with dr_level (±5cm → ±20cm horizontal, ±3cm → ±12cm vertical)
@@ -389,6 +521,7 @@ class QuadFlipEnv(gym.Env):
         return self._compute_observation(), {
             "target_state": self.target_state.copy(),
             "stock_obs": self._compute_stock_obs(),
+            "active_disturbances": self.active_disturbances,
         }
 
     def _compute_stock_obs(self) -> np.ndarray:
@@ -399,7 +532,8 @@ class QuadFlipEnv(gym.Env):
         rel_z = float(self.target_state[2] - self.quad.pos[2])
         vel_z = float(self.quad.vel[2])
         quat = np.asarray(self.quad.quat, dtype=np.float32)
-        omega = np.asarray(self.quad.omega, dtype=np.float32)
+        raw_omega = getattr(self.quad, "omega_filtered", self.quad.omega)
+        omega = (raw_omega + self.gyro_bias).astype(np.float32)
         prev_act = np.asarray(self.prev_action, dtype=np.float32)
         progress = float(self.accumulated_pitch)
         return np.concatenate([
@@ -413,11 +547,11 @@ class QuadFlipEnv(gym.Env):
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
 
-        # Smooth hover gain attenuation: transition from full authority (1.0x) during flip recovery to calm hover (0.55x)
-        if self.flip_completed and self.flip_completed_time is not None:
+        # Smooth hover gain attenuation: transition from full authority (1.0x) during flip recovery to calm hover
+        if self.hover_gain < 1.0 and self.flip_completed and self.flip_completed_time is not None:
             t_since_flip = self.t - self.flip_completed_time
             blend = float(np.clip(t_since_flip / HOVER_BLEND_DURATION, 0.0, 1.0))
-            hover_scale = 1.0 - (1.0 - ACTION_HOVER_GAIN) * blend
+            hover_scale = 1.0 - (1.0 - self.hover_gain) * blend
             action = hover_scale * action
 
         # Phase-dependent EMA: light smoothing during flip (fast response), strong during hover (calm)
@@ -489,6 +623,7 @@ class QuadFlipEnv(gym.Env):
             "has_inverted": self.has_inverted,
             "flip_completed": self.flip_completed,
             "stock_obs": self._compute_stock_obs(),
+            "active_disturbances": self.active_disturbances,
         }
 
         self.prev_action = action.copy()

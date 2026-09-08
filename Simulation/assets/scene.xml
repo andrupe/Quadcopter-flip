@@ -1,7 +1,7 @@
 <mujoco model="quadcopter_scene">
   <include file="quadcopter.xml"/>
 
-  <option timestep="0.005" gravity="0 0 -9.81" integrator="Euler" density="1.225" viscosity="1.8e-5"/>
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="Euler" density="1.225" viscosity="1.8e-5"/>
 
   <visual>
     <headlight ambient="0.35 0.35 0.35" diffuse="0.75 0.75 0.75" specular="0.2 0.2 0.2"/>

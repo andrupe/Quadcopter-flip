@@ -55,7 +55,7 @@ def sys_params():
     params["maxThr"]     = 0.60     # Maximum total thrust (N) (~0.15N * 4)
     params["minWmotor"]  = 0.0      # Minimum motor rotation speed (rad/s)
     params["maxWmotor"]  = 2600.0   # Maximum motor rotation speed (rad/s)
-    params["tau"]        = 0.005    # Time constant for coreless DC motor dynamics (s)
+    params["tau"]        = 0.025    # Time constant for coreless DC motor dynamics (s)
     params["kp"]         = 1.0      # DC gain for motor dynamics
     params["damp"]       = 1.0      # Damping ratio for motor dynamics
     

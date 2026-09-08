@@ -44,7 +44,8 @@ SHOW_PLOTS: bool = True             # Display 2D telemetry matplotlib plots afte
 LOOP: bool = True                    # Loop replay continuously (set False for a single episode)
 RANDOM_INITIAL_STATE: bool = True   # Set True to test policy robustness against random initial offsets
 PLAYBACK_SPEED: float = 1.0         # Playback speed (0.25 = 4x slow-motion, 0.5 = 2x slow-mo, 1.0 = real-time)
-DR_LEVEL: float = 1             # Domain Randomization intensity: 0.0 = nominal clean sim, 1.0 = full sim-to-real stress
+DR_LEVEL: float = 1            # Domain Randomization intensity: 0.0 = nominal clean sim, 1.0 = full sim-to-real stress
+HOVER_GAIN: float = 1.0          # 1.0 = zero attenuation (100% full authority), 0.55 = previous 45% attenuation
 # ======================================================================================
 
 
@@ -52,6 +53,7 @@ def evaluate(
     model_name: str = MODEL_NAME,
     episode_seconds: float = EPISODE_SECONDS,
     dr_level: float = DR_LEVEL,
+    hover_gain: float = HOVER_GAIN,
     show_viewer: bool = SHOW_VIEWER,
     show_plots: bool = SHOW_PLOTS,
     loop: bool = LOOP,
@@ -67,8 +69,9 @@ def evaluate(
 
     print(f"\nLoading model: {model_path}")
     print(f"Evaluation DR Level: {dr_level:.2f} ({'Nominal clean sim' if dr_level == 0.0 else 'Sim-to-Real Hardened' if dr_level == 1.0 else 'Partial Randomization'})")
+    print(f"Hover Gain Scale   : {hover_gain:.2f} ({'Unattenuated (100% authority)' if hover_gain >= 1.0 else f'{int((1.0 - hover_gain)*100)}% attenuated'})")
     model = PPO.load(model_path)
-    env = QuadFlipEnv(episode_seconds=episode_seconds, random_initial_state=random_initial_state)
+    env = QuadFlipEnv(episode_seconds=episode_seconds, random_initial_state=random_initial_state, hover_gain=hover_gain)
     env.set_dr_level(dr_level)
     obs, info = env.reset()
 
@@ -140,14 +143,33 @@ def evaluate(
                 else:
                     status = "Completed (Stable Hover)"
 
+                dist = info.get("active_disturbances", {})
                 flip_deg = np.rad2deg(getattr(env, "accumulated_pitch", getattr(env, "accumulated_roll", 0.0)))
-                tau_ms = env.quad.motor_tau * 1000.0
-                lat = env.obs_latency
-                batt = getattr(env.quad, "thrust_scale", 1.0)
                 wind_spd = getattr(env.wind, "velW_max", 0.0) if env.random_wind else 0.0
-                dr_str = f"tau={tau_ms:.1f}ms | lat={lat}st ({lat*10}ms) | batt={batt:.2f}x | wind={wind_spd:.2f}m/s"
                 print(f"[Episode {episode_idx}] Steps: {env.steps:4d} ({info['t']:.2f}s) | Rew: {total_reward:7.1f} | Flip: {str(env.flip_completed):5s} ({flip_deg:3.0f}°) | {status}")
-                print(f"             Disturbances: {dr_str}")
+                if dist:
+                    com = dist.get("com_offset", [0, 0, 0])
+                    eff = dist.get("motor_efficiencies", [1, 1, 1, 1])
+                    gb = dist.get("gyro_bias_rads", [0, 0, 0])
+                    print(
+                        f"             Disturbances: tau={dist.get('tau_up_ms', 25.0):.1f}/{dist.get('tau_down_ms', 25.0):.1f}ms "
+                        f"| CoM=[{com[0]*1000:+.1f},{com[1]*1000:+.1f},{com[2]*1000:+.1f}]mm "
+                        f"| payload={dist.get('payload_mass_g', 0.0):+.1f}g "
+                        f"| sag={dist.get('dynamic_sag_coef', 0.0)*100:.0f}%"
+                    )
+                    print(
+                        f"                           motors=[{eff[0]:.2f},{eff[1]:.2f},{eff[2]:.2f},{eff[3]:.2f}] "
+                        f"| gyro_bias=[{gb[0]:+.3f},{gb[1]:+.3f},{gb[2]:+.3f}] "
+                        f"| batt={dist.get('thrust_scale', 1.0):.2f}x "
+                        f"| lat={dist.get('latency_steps', 0)}st ({dist.get('latency_steps', 0)*10}ms) "
+                        f"| wind={wind_spd:.2f}m/s"
+                    )
+                else:
+                    tau_ms = env.quad.motor_tau * 1000.0
+                    lat = env.obs_latency
+                    batt = getattr(env.quad, "thrust_scale", 1.0)
+                    dr_str = f"tau={tau_ms:.1f}ms | lat={lat}st ({lat*10}ms) | batt={batt:.2f}x | wind={wind_spd:.2f}m/s"
+                    print(f"             Disturbances: {dr_str}")
 
                 if viewer is None or not loop:
                     break

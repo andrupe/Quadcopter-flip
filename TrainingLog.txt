@@ -8,4 +8,19 @@ land on the same solution again.
 i think im going to back to the basics and do a q learning approach to get a "nominal" baseline as the
 execrise suggests, then i wil
 
-write more for last few
+i did currciulum learning for domain raandomization and then ran it up to 50million steps.
+works kind of but prof said its probably overfitted
+
+there is a training phase  where during training the episode length and the reward during domain randomization
+crash. this makes sense. after the domain randomization during the so called consolidation
+phase of training it improves marginally. however during evaluation with and without domain
+randomization it seems like it's performing excellently.
+
+this probably comes down to the fact there's a difference between the evaluation
+environment conditions but i cant pinpoint
+
+i also had to increase learning rate. the intial phase is over by steps about 3m as opposed to 4.2m
+idk if this is better or worse. i also dk if after that it makes sense to train longer.
+
+i asked friend and he says it still learns despite ep len/rew being stable so ill keep it that way
+

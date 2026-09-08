@@ -28,4 +28,10 @@ I had ai draft a porting guide which is called mujocoport.pdf which vaguely expl
 
 After porting i will go back to try to find the reward function again.
 
-write rest
+i ported to mujoco and it runs significantly faster
+
+after many iterations i found the current reward function and performs excellently
+
+i noticed there is an oscillation similar to a badly tuned pid controller at the very end of the trajectory 
+
+

@@ -111,15 +111,81 @@ class QuadcopterMuJoCo:
         except Exception:
             self.floor_geom_id = -1
 
+        # Cache body and rotor site properties for dynamic hardware distortion
+        self.body_id = self.model.body("quadcopter").id
+        self.base_mass = float(self.model.body_mass[self.body_id])
+        self.base_ipos = self.model.body_ipos[self.body_id].copy()
+        self.base_inertia = self.model.body_inertia[self.body_id].copy()
+
+        self.rotor_site_names = ["rotor_fl", "rotor_fr", "rotor_rr", "rotor_rl"]
+        self.rotor_site_ids = [self.model.site(name).id for name in self.rotor_site_names]
+        self.base_site_pos = [self.model.site_pos[sid].copy() for sid in self.rotor_site_ids]
+
+        # Actuator parameters
+        self.motor_efficiencies = np.ones(4, dtype=np.float64)
+        self.tau_up: float = float(motor_tau)
+        self.tau_down: float = float(motor_tau)
+        self.dynamic_sag_coef: float = 0.0
+
         self.t: float = float(Ti)
         self.wMotor: np.ndarray = np.ones(4) * w_hover
         self.thr: np.ndarray = np.ones(4) * thr_hover
         self.tor: np.ndarray = np.ones(4) * (kTo * (w_hover**2))
         self.vel_dot: np.ndarray = np.zeros(3)
         self.omega_dot: np.ndarray = np.zeros(3)
+        self.omega_filtered: np.ndarray = np.zeros(3)
         self.acc: np.ndarray = np.zeros(3)
 
         self.reset()
+
+    def apply_hardware_distortions(
+        self,
+        mass: Optional[float] = None,
+        com_offset: Optional[Union[np.ndarray, list]] = None,
+        inertia: Optional[Union[np.ndarray, list]] = None,
+        site_offsets: Optional[Union[np.ndarray, list]] = None,
+        motor_efficiencies: Optional[Union[np.ndarray, list]] = None,
+        tau_up: Optional[float] = None,
+        tau_down: Optional[float] = None,
+        dynamic_sag_coef: float = 0.0,
+    ):
+        """
+        Apply physically realistic hardware distortions and domain randomizations
+        directly into the in-memory MuJoCo model and actuator dynamics.
+        """
+        # 1. Mass & Inertia
+        if mass is not None:
+            self.model.body_mass[self.body_id] = float(mass)
+        else:
+            self.model.body_mass[self.body_id] = self.base_mass
+
+        if com_offset is not None:
+            self.model.body_ipos[self.body_id] = self.base_ipos + np.asarray(com_offset, dtype=np.float64)
+        else:
+            self.model.body_ipos[self.body_id] = self.base_ipos.copy()
+
+        if inertia is not None:
+            self.model.body_inertia[self.body_id] = np.asarray(inertia, dtype=np.float64)
+        else:
+            self.model.body_inertia[self.body_id] = self.base_inertia.copy()
+
+        # 2. Asymmetric Arm Lengths (Rotor Site Positions)
+        if site_offsets is not None:
+            for idx, sid in enumerate(self.rotor_site_ids):
+                self.model.site_pos[sid] = self.base_site_pos[idx] + np.asarray(site_offsets[idx], dtype=np.float64)
+        else:
+            for idx, sid in enumerate(self.rotor_site_ids):
+                self.model.site_pos[sid] = self.base_site_pos[idx].copy()
+
+        # 3. Actuator Properties
+        if motor_efficiencies is not None:
+            self.motor_efficiencies = np.asarray(motor_efficiencies, dtype=np.float64)
+        else:
+            self.motor_efficiencies = np.ones(4, dtype=np.float64)
+
+        self.tau_up = float(tau_up) if tau_up is not None else self.motor_tau
+        self.tau_down = float(tau_down) if tau_down is not None else self.tau_up
+        self.dynamic_sag_coef = float(dynamic_sag_coef)
 
     def reset(
         self,
@@ -153,6 +219,7 @@ class QuadcopterMuJoCo:
         self.tor = self.kTo_effective * (self.wMotor ** 2)
         self.vel_dot = np.zeros(3)
         self.omega_dot = np.zeros(3)
+        self.omega_filtered = np.zeros(3)
         self.acc = np.zeros(3)
 
         self._update_state_properties()
@@ -221,22 +288,6 @@ class QuadcopterMuJoCo:
             self.params["maxWmotor"],
         )
 
-        # 1st-order motor dynamics low-pass filter (electrical/mechanical time constant tau)
-        if self.motor_tau > 0.0:
-            alpha = float(dt / (self.motor_tau + dt))
-            self.wMotor += alpha * (w_motor_target - self.wMotor)
-        else:
-            self.wMotor = w_motor_target.copy()
-
-        w_motor = self.wMotor.copy()
-
-        # Aerodynamic rotor thrust & reactive torque with effective battery scaling: F = kTh * w^2
-        thrusts = self.kTh_effective * (w_motor ** 2)
-        torques = self.kTo_effective * (w_motor ** 2)
-
-        # Direct assignment to MuJoCo control array
-        self.data.ctrl[:] = thrusts
-
         # Dynamic wind injection
         if wind is not None and hasattr(wind, "randomWind"):
             velW, qW1, qW2 = wind.randomWind(t)
@@ -248,13 +299,48 @@ class QuadcopterMuJoCo:
         # Step physics solver using exact sub-stepping
         sim_dt = self.model.opt.timestep
         n_substeps = max(1, int(round(dt / sim_dt)))
+        sub_dt = float(dt / n_substeps)
+
+        omega_sum = np.zeros(3, dtype=np.float64)
+        thrusts = np.zeros(4, dtype=np.float64)
+        torques = np.zeros(4, dtype=np.float64)
+
         for _ in range(n_substeps):
+            # 1. Evolve directional 1st-order motor dynamics low-pass filter at physical timestep
+            for i in range(4):
+                tau_i = self.tau_up if w_motor_target[i] >= self.wMotor[i] else self.tau_down
+                if tau_i > 0.0:
+                    alpha_i = float(sub_dt / (tau_i + sub_dt))
+                    self.wMotor[i] += alpha_i * (w_motor_target[i] - self.wMotor[i])
+                else:
+                    self.wMotor[i] = w_motor_target[i]
+
+            # 2. Dynamic battery voltage sag during high-throttle bursts
+            if self.dynamic_sag_coef > 0.0:
+                burst_ratio = float(np.mean((self.wMotor / self.params["maxWmotor"]) ** 2))
+                dynamic_sag = max(0.0, 1.0 - self.dynamic_sag_coef * burst_ratio)
+            else:
+                dynamic_sag = 1.0
+
+            # 3. Aerodynamic rotor thrust & reactive torque
+            thrusts = (self.kTh_effective * dynamic_sag) * self.motor_efficiencies * (self.wMotor ** 2)
+            torques = (self.kTo_effective * dynamic_sag) * self.motor_efficiencies * (self.wMotor ** 2)
+
+            # 4. Direct assignment to MuJoCo control array
+            self.data.ctrl[:] = thrusts
+
+            # 5. Step physics solver
             mujoco.mj_step(self.model, self.data)
 
+            # 6. Accumulate physical angular velocity for Nyquist anti-aliasing filter
+            omega_sum += self.data.qvel[3:6]
+
         self.t = t + dt
-        self.wMotor = w_motor
         self.thr = thrusts
         self.tor = torques
+
+        # Nyquist anti-aliasing filter: average angular rate across sub-steps (models on-chip BMI088 LPF)
+        self.omega_filtered = omega_sum / n_substeps
 
         self.vel_dot = (self.data.qvel[0:3] - prev_vel) / dt
         self.omega_dot = (self.data.qvel[3:6] - prev_omega) / dt
