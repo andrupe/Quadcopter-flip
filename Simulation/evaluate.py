@@ -17,6 +17,7 @@ if sys.platform == "darwin":
     except Exception:
         pass
 import matplotlib.pyplot as plt
+import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import mujoco
@@ -30,36 +31,41 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from quad_flip_env import QuadFlipEnv
+from quad_flip_env import QuadFlipEnv, ACTOR_TOTAL_DIM, TOTAL_OBS_DIM
+from asymmetric_policy import AsymmetricActorCriticPolicy
 import utils
 
 
 # ======================================================================================
 # EVALUATION CONFIGURATION (Edit parameters directly here, then click Run in VS Code)
 # ======================================================================================
-MODEL_NAME: str = "quad_flip_model"   # Model name to evaluate (e.g. "quad_flip_model" or checkpoint)
-EPISODE_SECONDS: float = 50.0         # Duration of each flight test (seconds)
+MODEL_NAME: str = "logs/rl_model_11850000_steps"   # Model name to evaluate (e.g. "quad_flip_model" or path in logs/)
+EPISODE_SECONDS: float = 10.0         # Duration of each flight test (seconds)
+NUM_EPISODES: int = 5                 # Number of test episodes to run when LOOP = False
 SHOW_VIEWER: bool = True              # Launch interactive 3D MuJoCo viewer window
 SHOW_PLOTS: bool = True              # Display 2D telemetry matplotlib plots after run
-LOOP: bool = True                     # Loop replay continuously (set False for a single episode)
+LOOP: bool = True                     # Loop replay continuously (set False to evaluate NUM_EPISODES)
+EVAL_ACTOR_ONLY: bool = True          # True = pass ONLY the 51-dim onboard sensor observation to model.predict
 RANDOM_INITIAL_POS: bool = False      # False = ALWAYS spawn at fixed [0.0, 0.0, 1.2] meters
 RANDOM_INITIAL_VEL: bool = True       # True = randomize initial linear and angular velocities
 RANDOM_INITIAL_ATT: bool = True       # True = slight random orientation tilt (roll/pitch/yaw)
 RANDOM_INITIAL_STATE: bool = True     # Master flag (used for compatibility)
-PLAYBACK_SPEED: float = 2         # Playback speed (0.25 = 4x slow-motion, 0.5 = 2x slow-mo, 1.0 = real-time)
-DR_LEVEL: float = 0.8                # Domain Randomization intensity: 0.0 = nominal clean sim, 1.0 = full sim-to-real stress
-HOVER_GAIN: float = 1               # 1.0 = zero attenuation (100% full authority), 0.55 = previous 45% attenuation
+PLAYBACK_SPEED: float = 1.0           # Playback speed (0.25 = 4x slow-motion, 0.5 = 2x slow-mo, 1.0 = real-time)
+DR_LEVEL: float = 0.0               # Domain Randomization intensity: 0.0 = nominal clean sim, 1.0 = full sim-to-real stress
+HOVER_GAIN: float = 1             # Hover authority scale: 1.0 = unattenuated, 0.5 = 50% calm hover authority
 # ======================================================================================
 
 
 def evaluate(
     model_name: str = MODEL_NAME,
     episode_seconds: float = EPISODE_SECONDS,
+    num_episodes: int = NUM_EPISODES,
     dr_level: float = DR_LEVEL,
     hover_gain: float = HOVER_GAIN,
     show_viewer: bool = SHOW_VIEWER,
     show_plots: bool = SHOW_PLOTS,
     loop: bool = LOOP,
+    eval_actor_only: bool = EVAL_ACTOR_ONLY,
     random_initial_pos: bool = RANDOM_INITIAL_POS,
     random_initial_vel: bool = RANDOM_INITIAL_VEL,
     random_initial_att: bool = RANDOM_INITIAL_ATT,
@@ -67,7 +73,17 @@ def evaluate(
     playback_speed: float = PLAYBACK_SPEED,
 ):
     """Run policy in MuJoCo with real-time 3D visualization and telemetry plotting."""
-    model_path = os.path.join(_PROJECT_ROOT, f"{model_name}.zip")
+    if os.path.isfile(model_name):
+        model_path = os.path.abspath(model_name)
+    elif os.path.isfile(os.path.join(_PROJECT_ROOT, model_name)):
+        model_path = os.path.join(_PROJECT_ROOT, model_name)
+    elif os.path.isfile(os.path.join(_PROJECT_ROOT, f"{model_name}.zip")):
+        model_path = os.path.join(_PROJECT_ROOT, f"{model_name}.zip")
+    elif os.path.isfile(f"{model_name}.zip"):
+        model_path = os.path.abspath(f"{model_name}.zip")
+    else:
+        model_path = os.path.join(_PROJECT_ROOT, f"{model_name}.zip")
+
     if not os.path.isfile(model_path):
         print(f"\n[Error] Model file not found at: {model_path}")
         print("Please train the model first by running train.py!\n")
@@ -77,13 +93,35 @@ def evaluate(
     print(f"Evaluation DR Level: {dr_level:.2f} ({'Nominal clean sim' if dr_level == 0.0 else 'Sim-to-Real Hardened' if dr_level == 1.0 else 'Partial Randomization'})")
     print(f"Hover Gain Scale   : {hover_gain:.2f} ({'Unattenuated (100% authority)' if hover_gain >= 1.0 else f'{int((1.0 - hover_gain)*100)}% attenuated'})")
     print(f"Initial State      : Pos={'[0.0, 0.0, 1.2] (fixed)' if not random_initial_pos else 'Randomized'} | Vel={'Randomized' if random_initial_vel else 'Zero'}")
-    model = PPO.load(model_path)
+    detected_actor_dim = ACTOR_TOTAL_DIM
+    try:
+        import zipfile
+        import io
+        with zipfile.ZipFile(model_path, "r") as z:
+            if "policy.pth" in z.namelist():
+                with z.open("policy.pth") as f:
+                    sd = torch.load(io.BytesIO(f.read()), map_location="cpu")
+                    if "mlp_extractor.policy_net.0.weight" in sd:
+                        detected_actor_dim = int(sd["mlp_extractor.policy_net.0.weight"].shape[1])
+    except Exception:
+        pass
+
+    coord_desc = "with XYZ coordinates" if detected_actor_dim == ACTOR_TOTAL_DIM else "legacy (no coordinates)"
+    print(f"Inference Mode     : {'Actor Only (' + str(detected_actor_dim) + ' dims, ' + coord_desc + ')' if eval_actor_only else f'Full Observation Vector ({TOTAL_OBS_DIM} dims)'}")
+    model = PPO.load(
+        model_path,
+        custom_objects=dict(
+            policy_class=AsymmetricActorCriticPolicy,
+            actor_obs_dim=detected_actor_dim,
+        ),
+    )
     env = QuadFlipEnv(
         episode_seconds=episode_seconds,
         random_initial_state=random_initial_state,
         random_initial_pos=random_initial_pos,
         random_initial_vel=random_initial_vel,
         random_initial_att=random_initial_att,
+        arena_radius=2.5,
         hover_gain=hover_gain,
     )
     env.set_dr_level(dr_level)
@@ -99,11 +137,14 @@ def evaluate(
     vec_norm = None
     for sp in stats_candidates:
         if os.path.isfile(sp):
-            print(f"Loaded VecNormalize statistics from: {sp}")
-            dummy_vec = DummyVecEnv([lambda: env])
-            vec_norm = VecNormalize.load(sp, dummy_vec)
-            vec_norm.training = False
-            break
+            try:
+                dummy_vec = DummyVecEnv([lambda: env])
+                vec_norm = VecNormalize.load(sp, dummy_vec)
+                vec_norm.training = False
+                print(f"Loaded VecNormalize statistics from: {sp}")
+                break
+            except Exception as e:
+                print(f"Note: Could not load {sp} due to shape mismatch: {e}")
 
     if vec_norm is None:
         print("\n" + "!" * 70)
@@ -127,6 +168,9 @@ def evaluate(
 
     episode_idx = 1
     total_reward = 0.0
+    max_pitch_deg = 0.0
+    max_tilt_deg = 0.0
+    batch_results = []
 
     try:
         while True:
@@ -134,10 +178,19 @@ def evaluate(
                 break
 
             step_start = time.time()
-            obs_input = vec_norm.normalize_obs(obs) if vec_norm else obs
+            obs_normalized = vec_norm.normalize_obs(obs) if vec_norm else obs
+            if eval_actor_only:
+                # Pass strictly the actor observation slice
+                obs_input = obs_normalized[:detected_actor_dim]
+            else:
+                obs_input = obs_normalized
+
             action, _ = model.predict(obs_input, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
+            max_pitch_deg = max(max_pitch_deg, abs(float(np.degrees(env.quad.euler[1]))))
+            tilt_deg = float(np.degrees(np.arccos(np.clip(env.quad.dcm[2, 2], -1.0, 1.0))))
+            max_tilt_deg = max(max_tilt_deg, tilt_deg)
 
             if telemetry is not None and episode_idx == 1:
                 telemetry["t"].append(info["t"])
@@ -160,12 +213,19 @@ def evaluate(
 
             if terminated or truncated:
                 if terminated:
-                    if env.quad.check_ground_contact():
+                    term_reason = info.get("termination_reason", getattr(env, "termination_reason", "none"))
+                    if term_reason == "phase2_reinversion":
+                        status = "Failed (Re-inverted in Phase 2)"
+                    elif term_reason == "phase1_overrotation":
+                        status = "Failed (Over-rotated in Phase 1)"
+                    elif term_reason == "phase1_timeout":
+                        status = "Failed (Phase 1 Timeout > 1.0s)"
+                    elif term_reason == "ground_crash" or env.quad.check_ground_contact():
                         status = "Crashed (Ground Contact)"
-                    elif env.quad.pos[2] > 2.5:
+                    elif term_reason == "ceiling_breach" or env.quad.pos[2] > 2.5:
                         status = "Breached (Ceiling > 2.5m)"
-                    elif float(np.linalg.norm(env.quad.pos[:2])) > 1.5:
-                        status = "Breached (Arena XY > 1.5m)"
+                    elif term_reason == "arena_breach" or float(np.linalg.norm(env.quad.pos[:2])) > env.arena_radius:
+                        status = f"Breached (Arena XY > {env.arena_radius:.1f}m)"
                     else:
                         status = "Terminated (Divergent State)"
                 else:
@@ -174,7 +234,7 @@ def evaluate(
                 dist = info.get("active_disturbances", {})
                 flip_deg = np.rad2deg(getattr(env, "accumulated_pitch", getattr(env, "accumulated_roll", 0.0)))
                 wind_spd = getattr(env.wind, "velW_max", 0.0) if env.random_wind else 0.0
-                print(f"[Episode {episode_idx}] Steps: {env.steps:4d} ({info['t']:.2f}s) | Rew: {total_reward:7.1f} | Flip: {str(env.flip_completed):5s} ({flip_deg:3.0f}°) | {status}")
+                print(f"[Episode {episode_idx}] Steps: {env.steps:4d} ({info['t']:.2f}s) | Rew: {total_reward:7.1f} | Flip: {str(env.flip_completed):5s} (Progress: {flip_deg:3.0f}°, PeakTilt: {max_tilt_deg:3.0f}°) | {status}")
                 sp = getattr(env, "spawn_pos", env.quad.pos)
                 sv = getattr(env, "spawn_vel", env.quad.vel)
                 print(f"             Spawn State : pos=[{sp[0]:+.2f}, {sp[1]:+.2f}, {sp[2]:+.2f}]m | vel=[{sv[0]:+.2f}, {sv[1]:+.2f}, {sv[2]:+.2f}]m/s")
@@ -202,16 +262,44 @@ def evaluate(
                     dr_str = f"tau={tau_ms:.1f}ms | lat={lat}st ({lat*10}ms) | batt={batt:.2f}x | wind={wind_spd:.2f}m/s"
                     print(f"             Disturbances: {dr_str}")
 
-                if viewer is None or not loop:
+                batch_results.append({
+                    "flip": env.flip_completed,
+                    "status": status,
+                    "rew": total_reward,
+                    "steps": env.steps,
+                    "peak_tilt": max_tilt_deg,
+                    "xy_drift": float(np.linalg.norm(env.quad.pos[:2] - env.target_state[:2])),
+                    "z_err": float(abs(env.quad.pos[2] - env.target_state[2])),
+                })
+
+                if not loop and episode_idx >= num_episodes:
                     break
 
                 time.sleep(0.3)
                 obs, info = env.reset()
                 total_reward = 0.0
+                max_pitch_deg = 0.0
+                max_tilt_deg = 0.0
                 episode_idx += 1
     finally:
         if viewer is not None and viewer.is_running():
             viewer.close()
+
+    if not loop and len(batch_results) > 1:
+        flips = sum(1 for r in batch_results if r["flip"])
+        hovers = sum(1 for r in batch_results if "Stable Hover" in r["status"])
+        mean_rew = np.mean([r["rew"] for r in batch_results])
+        mean_xy = np.mean([r["xy_drift"] for r in batch_results])
+        mean_z = np.mean([r["z_err"] for r in batch_results])
+        mean_tilt = np.mean([r["peak_tilt"] for r in batch_results])
+        print(f"\n{'='*70}")
+        print(f"BATCH EVALUATION SUMMARY ({len(batch_results)} episodes | DR={dr_level:.2f} | HoverGain={hover_gain:.2f}):")
+        print(f"  Flip Success Rate : {flips}/{len(batch_results)} ({flips/len(batch_results)*100:.0f}%)")
+        print(f"  Hover Recovery    : {hovers}/{len(batch_results)} ({hovers/len(batch_results)*100:.0f}%)")
+        print(f"  Mean Return       : {mean_rew:.1f}")
+        print(f"  Mean Peak Tilt    : {mean_tilt:.0f}°")
+        print(f"  Mean Hover Drift  : XY = {mean_xy:.2f}m | Z = {mean_z:.2f}m")
+        print(f"{'='*70}\n")
 
     # Telemetry plotting
     if show_plots and telemetry and len(telemetry["t"]) > 0:
