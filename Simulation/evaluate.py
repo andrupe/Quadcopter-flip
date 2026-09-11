@@ -31,7 +31,7 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from quad_flip_env import QuadFlipEnv, ACTOR_TOTAL_DIM, TOTAL_OBS_DIM
+from quad_flip_env import QuadFlipEnv, ACTOR_TOTAL_DIM, TOTAL_OBS_DIM, ENCODER_AUX_DIM
 from asymmetric_policy import AsymmetricActorCriticPolicy
 import utils
 
@@ -47,7 +47,68 @@ NUM_EPISODES: int = 1                 # Number of test episodes to run before sh
 SHOW_VIEWER: bool = True              # Launch interactive 3D MuJoCo viewer window
 SHOW_PLOTS: bool = True               # Display 2D telemetry matplotlib plots after run
 LOOP: bool = True                    # Set True to loop continuously; False to show plots after 1 episode
-EVAL_ACTOR_ONLY: bool = True          # True = pass ONLY the 51-dim onboard sensor observation to model.predict
+EVAL_ACTOR_ONLY: bool = True          # True = pass ONLY the onboard sensor observation to model.predict
+
+# Frozen history encoder produced by Simulation/encoder/train_encoder.py.
+ENCODER_CHECKPOINT: str = os.path.join(_PROJECT_ROOT, "logs", "encoder_gru.pt")
+Z_DIM: int = 16
+
+
+class _LatentInjector:
+    """
+    Owns the frozen encoder's recurrent state and appends z to a RAW env observation.
+
+    Deliberately NOT a VecEnv wrapper. Wrapping the env in a DummyVecEnv to reach
+    LatentObsWrapper looks equivalent, but SB3's DummyVecEnv AUTO-RESETS on done - so by
+    the time the evaluation loop reads the terminal telemetry (env.steps, env.quad.pos,
+    env.termination_reason) the environment has already been reset and the loop is reading
+    a FRESH episode's state. That made every episode report "Steps: 0" and terminate
+    immediately, hundreds of times in a row, with a stale termination reason.
+
+    Injecting z directly keeps the raw env authoritative: the loop still calls env.step(),
+    every env.* read stays correct, and the encoder is driven through its incremental
+    `step()` - the same path the flight controller would use - rather than a batch path
+    that only ever runs in training.
+
+    Produces the identical layout to LatentObsWrapper:
+        [o_t (actor_dim) | z (z_dim) | aux | privileged]
+    """
+
+    def __init__(self, encoder_path: str, actor_dim: int, aux_dim: int, z_dim: int):
+        from encoder.history_encoder import load_encoder_checkpoint
+        from encoder.observation_spec import frame_from_env_obs  # noqa: F401
+
+        encoder, norm, _ = load_encoder_checkpoint(encoder_path)
+        if int(encoder.z_dim) != int(z_dim):
+            raise ValueError(
+                f"encoder at {encoder_path} has z_dim={encoder.z_dim}, expected {z_dim}"
+            )
+        self.encoder = encoder
+        self.norm = norm
+        self.actor_dim = int(actor_dim)
+        self.aux_dim = int(aux_dim)
+        self.z_dim = int(z_dim)
+        self.h = encoder.init_state(1)
+        self.z = np.zeros((1, self.z_dim), dtype=np.float32)
+
+    @torch.no_grad()
+    def reset(self) -> None:
+        """Zero the recurrent state. Must be called whenever the env resets."""
+        self.h = self.encoder.init_state(1)
+        self.z = np.zeros((1, self.z_dim), dtype=np.float32)
+
+    @torch.no_grad()
+    def inject(self, env_obs: np.ndarray) -> np.ndarray:
+        from encoder.observation_spec import frame_from_env_obs
+
+        raw = frame_from_env_obs(env_obs, self.actor_dim, self.aux_dim)
+        frame = self.norm.standardize_frame(raw)[None, :]
+        x = torch.from_numpy(np.ascontiguousarray(frame, dtype=np.float32))
+        z, self.h = self.encoder.step(x, self.h)
+        self.z = z.numpy()
+        return np.concatenate(
+            [env_obs[: self.actor_dim], self.z[0], env_obs[self.actor_dim:]]
+        ).astype(np.float32)
 RANDOM_INITIAL_POS: bool = True      # False = ALWAYS spawn at fixed [0.0, 0.0, 1.2] meters
 RANDOM_INITIAL_VEL: bool = True       # True = randomize initial linear and angular velocities
 RANDOM_INITIAL_ATT: bool = True       # True = slight random orientation tilt (roll/pitch/yaw)
@@ -133,8 +194,31 @@ def evaluate(
     except Exception:
         pass
 
-    coord_desc = "with XYZ coordinates" if detected_actor_dim == ACTOR_TOTAL_DIM else "legacy (no coordinates)"
+    coord_desc = ("trajectory-tracking frame" if detected_actor_dim in (ACTOR_TOTAL_DIM, ACTOR_TOTAL_DIM + 16)
+                  else "PRE-MIGRATION layout")
     print(f"Inference Mode     : {'Actor Only (' + str(detected_actor_dim) + ' dims, ' + coord_desc + ')' if eval_actor_only else f'Full Observation Vector ({TOTAL_OBS_DIM} dims)'}")
+
+    # GUARD against silently evaluating on the wrong input.
+    #
+    # `detected_actor_dim` is read back out of the checkpoint's first policy layer, and the
+    # actor is then fed obs[..., :detected_actor_dim]. Two cases are valid here:
+    #
+    #   ACTOR_TOTAL_DIM (29)      current tracking frame, no encoder -> used as-is
+    #   ACTOR_TOTAL_DIM + z (45)  trained WITH the encoder -> the wrapper is attached
+    #                             below, which makes obs[:45] exactly [o_t | z]
+    #
+    # Anything else is a checkpoint from an EARLIER observation layout (the old 51-dim
+    # 3-frame stack). Its weights are meaningless against this environment, and slicing it
+    # would produce a wrong evaluation with no error, so it is refused.
+    if detected_actor_dim not in (ACTOR_TOTAL_DIM, ACTOR_TOTAL_DIM + Z_DIM):
+        raise SystemExit(
+            f"\n[Error] Checkpoint expects a {detected_actor_dim}-dim actor input, but this "
+            f"build produces {ACTOR_TOTAL_DIM} (no encoder) or {ACTOR_TOTAL_DIM + Z_DIM} "
+            f"(with the encoder).\n"
+            f"        This checkpoint PREDATES the trajectory-tracking migration - its "
+            f"observation layout no longer exists, so its weights cannot be evaluated.\n"
+            f"        Retrain with:  .venv/bin/python Simulation/train.py\n"
+        )
 
     custom_objs = dict(
         policy_class=AsymmetricActorCriticPolicy,
@@ -162,7 +246,33 @@ def evaluate(
         hover_gain=hover_gain,
     )
     env.set_dr_level(dr_level)
+
+    # --- observation path -----------------------------------------------------------
+    # A checkpoint trained WITH the frozen history encoder expects its actor input to be
+    # [o_t | z]. Only LatentObsWrapper can produce that. Slicing the raw env observation
+    # instead would silently hand the actor [o_t | aux | privileged...] with no error and
+    # no crash, so the wrapper is attached whenever the checkpoint's actor dim says a
+    # latent is present - and the slicing logic below then needs no change at all, because
+    # with the wrapper in place obs[:detected_actor_dim] IS exactly [o_t | z].
+    if detected_actor_dim == ACTOR_TOTAL_DIM + Z_DIM:
+        if not os.path.isfile(ENCODER_CHECKPOINT):
+            raise SystemExit(
+                f"\n[Error] Checkpoint expects a {Z_DIM}-dim latent, but no encoder was found at\n"
+                f"        {ENCODER_CHECKPOINT}\n"
+                f"        Rebuild it:  .venv/bin/python Simulation/encoder/collect_data.py\n"
+                f"                     .venv/bin/python Simulation/encoder/train_encoder.py\n"
+            )
+        injector = _LatentInjector(ENCODER_CHECKPOINT, ACTOR_TOTAL_DIM, ENCODER_AUX_DIM, Z_DIM)
+        print(f"History Encoder    : ATTACHED ({os.path.basename(ENCODER_CHECKPOINT)}); "
+              f"actor input = [o_t({ACTOR_TOTAL_DIM}) | z({Z_DIM})]")
+    else:
+        injector = None
+        print(f"History Encoder    : none; actor input = o_t({detected_actor_dim})")
+
     obs, info = env.reset()
+    if injector is not None:
+        injector.reset()
+        obs = injector.inject(obs)
 
     # Load observation normalization statistics if available
     stats_candidates = [
@@ -226,6 +336,8 @@ def evaluate(
 
             action, _ = model.predict(obs_input, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
+            if injector is not None:
+                obs = injector.inject(obs)
             total_reward += reward
             max_pitch_deg = max(max_pitch_deg, abs(float(np.degrees(env.quad.euler[1]))))
             tilt_deg = float(np.degrees(np.arccos(np.clip(env.quad.dcm[2, 2], -1.0, 1.0))))
@@ -318,6 +430,9 @@ def evaluate(
 
                 time.sleep(0.3)
                 obs, info = env.reset()
+                if injector is not None:
+                    injector.reset()
+                    obs = injector.inject(obs)
                 total_reward = 0.0
                 max_pitch_deg = 0.0
                 max_tilt_deg = 0.0

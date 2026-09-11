@@ -93,6 +93,10 @@ class QuadcopterMuJoCo:
             "motorc1": 26.0,
             "motorc0": 0.0,
             "motordeadband": 1,
+            # 1S LiPo nominal voltage. Thrust scales with V^2 on a voltage-mode ESC,
+            # so V_batt is recoverable exactly from the effective thrust coefficient:
+            # V/V_nom = sqrt(kTh_effective / kTh). See update().
+            "V_nom": 3.7,
         }
 
         self.params["mixerFM"] = makeMixerFM(self.params)
@@ -111,6 +115,15 @@ class QuadcopterMuJoCo:
             self.floor_geom_id = self.model.geom("floor").id
         except Exception:
             self.floor_geom_id = -1
+
+        # Cache the IMU accelerometer sensor address. The MJCF declares this sensor
+        # (quadcopter.xml, site "imu") but nothing read it before the history-encoder
+        # work. It returns SPECIFIC FORCE (gravity reaction + motion), which is the
+        # single most informative measurement for identifying mass, thrust scale,
+        # CoM offset and motor mismatch.
+        _accel_sid = int(mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "accelerometer"))
+        self.accel_sensor_id: int = _accel_sid
+        self.accel_sensor_adr: int = int(self.model.sensor_adr[_accel_sid]) if _accel_sid >= 0 else -1
 
         # Cache body and rotor site properties for dynamic hardware distortion
         self.body_id = self.model.body("quadcopter").id
@@ -137,6 +150,11 @@ class QuadcopterMuJoCo:
         self.omega_dot: np.ndarray = np.zeros(3)
         self.omega_filtered: np.ndarray = np.zeros(3)
         self.acc: np.ndarray = np.zeros(3)
+        # Encoder-facing auxiliary observations (see quad_flip_env._compute_encoder_aux)
+        self.specific_force_b: np.ndarray = np.zeros(3)
+        self.dynamic_sag: float = 1.0
+        self.v_batt: float = float(self.params["V_nom"])
+        self.v_batt_norm: float = 1.0
 
         self.reset()
 
@@ -219,6 +237,11 @@ class QuadcopterMuJoCo:
         self.wMotor = np.ones(4) * self.params["w_hover"]
         self.thr = self.kTh_effective * (self.wMotor ** 2)
         self.tor = self.kTo_effective * (self.wMotor ** 2)
+        # Battery state implied by the reset-time thrust scaling (V/V_nom = sqrt(scale)).
+        self.dynamic_sag = 1.0
+        self.v_batt_norm = float(np.sqrt(max(float(thrust_scale), 0.0)))
+        self.v_batt = float(self.params["V_nom"]) * self.v_batt_norm
+
         self.vel_dot = np.zeros(3)
         self.omega_dot = np.zeros(3)
         self.omega_filtered = np.zeros(3)
@@ -252,6 +275,14 @@ class QuadcopterMuJoCo:
 
         # Rotation matrix (DCM)
         self.dcm = utils.quat2Dcm(self.quat)
+
+        # Specific force (accelerometer) in the body frame. Site "imu" is at the
+        # body origin with no rotation, so the sensor frame IS the body frame.
+        if self.accel_sensor_adr >= 0:
+            _a = self.accel_sensor_adr
+            self.specific_force_b = self.data.sensordata[_a : _a + 3].copy()
+        else:
+            self.specific_force_b = np.zeros(3)
 
         # 21-element compatibility state vector:
         # [x, y, z, q0, q1, q2, q3, vx, vy, vz, p, q, r, wM1, 0, wM2, 0, wM3, 0, wM4, 0]
@@ -310,6 +341,7 @@ class QuadcopterMuJoCo:
             wz = velW * np.sin(qW2)
             self.model.opt.wind[:] = [wx, wy, wz]
 
+        dynamic_sag = 1.0
         # Step physics solver using exact sub-stepping
         sim_dt = self.model.opt.timestep
         n_substeps = max(1, int(round(dt / sim_dt)))
@@ -362,6 +394,13 @@ class QuadcopterMuJoCo:
         self.t = t + dt
         self.thr = thrusts
         self.tor = torques
+
+        # Battery voltage implied by the (static) thrust scaling and the instantaneous
+        # burst sag. Reconstructible on real hardware, where V_batt is telemetry.
+        self.dynamic_sag = float(dynamic_sag)
+        _kt_ratio = float(self.kTh_effective / self.params["kTh"]) if self.params["kTh"] > 0.0 else 1.0
+        self.v_batt_norm = float(np.sqrt(max(_kt_ratio * self.dynamic_sag, 0.0)))
+        self.v_batt = float(self.params["V_nom"]) * self.v_batt_norm
 
         # Nyquist anti-aliasing filter: average angular rate across sub-steps (models on-chip BMI088 LPF)
         self.omega_filtered = omega_sum / n_substeps

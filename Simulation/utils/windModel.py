@@ -58,7 +58,11 @@ def _value_noise_1d(t: float, seed: int = 0, octaves: int = 3, persistence: floa
 
 class Wind:
 
-    def __init__(self, *args):
+    def __init__(self, *args, rng=None):
+
+        # Seeded generator, or None to fall back to the module-level `random`. Must be set
+        # before anything below draws from it.
+        self._rng = rng
 
         if (len(args) == 0):
             self.windType = 'NONE'
@@ -89,9 +93,9 @@ class Wind:
                 qW2_min  = args[6]   # deg
 
                 # Median values
-                self.velW_med = (velW_max - velW_min)*rd.random() + velW_min
-                self.qW1_med  = ((qW1_max - qW1_min)*rd.random() + qW1_min)*deg2rad
-                self.qW2_med  = ((qW2_max - qW2_min)*rd.random() + qW2_min)*deg2rad
+                self.velW_med = (velW_max - velW_min)*self._u01() + velW_min
+                self.qW1_med  = ((qW1_max - qW1_min)*self._u01() + qW1_min)*deg2rad
+                self.qW2_med  = ((qW2_max - qW2_min)*self._u01() + qW2_min)*deg2rad
 
             else:
                 self.velW_max = float(args[1]) if len(args) > 1 else 2.0
@@ -129,11 +133,11 @@ class Wind:
             self.velW_max = float(args[1]) if len(args) > 1 else 1.0
             self.velW_med = self.velW_max * 0.3  # Light baseline breeze
             # Random seeds per episode (re-randomized in reseed())
-            self._seed_vel = rd.randint(0, 100000)
-            self._seed_heading = rd.randint(0, 100000)
-            self._seed_elev = rd.randint(0, 100000)
+            self._seed_vel = self._randint(0, 100000)
+            self._seed_heading = self._randint(0, 100000)
+            self._seed_elev = self._randint(0, 100000)
             # Noise time scale: lower = slower, more gradual gusts
-            self._time_scale = 0.8 + rd.random() * 0.6  # 0.8–1.4
+            self._time_scale = 0.8 + self._u01() * 0.6  # 0.8–1.4
 
         elif (self.windType == 'FIXED'):
 
@@ -151,19 +155,40 @@ class Wind:
 
             raise Exception('Not a valid wind type.')
 
+    def set_rng(self, rng) -> None:
+        """
+        Route this model's randomness through a seeded generator.
+
+        The module-level `random` (rd) is a GLOBAL generator shared by every Wind object
+        in the process, so what wind an episode sees depends on how many other Wind
+        objects were constructed before it. That silently defeats `env.reset(seed=)` and
+        makes training runs irreproducible - the same seed produces a different episode
+        on every run. Passing the environment's own seeded generator removes that coupling.
+        """
+        self._rng = rng
+
+    def _u01(self) -> float:
+        """Uniform [0, 1) from the seeded generator, falling back to the global one."""
+        return float(self._rng.random()) if self._rng is not None else rd.random()
+
+    def _randint(self, lo: int, hi: int) -> int:
+        if self._rng is not None:
+            return int(self._rng.integers(lo, hi))
+        return int(rd.randint(lo, hi))
+
     def reseed(self):
         """Re-randomize wind pattern for a new episode. Call from env.reset()."""
         if self.windType == 'PERLIN':
-            self._seed_vel = rd.randint(0, 100000)
-            self._seed_heading = rd.randint(0, 100000)
-            self._seed_elev = rd.randint(0, 100000)
-            self._time_scale = 0.8 + rd.random() * 0.6
-            self.velW_med = self.velW_max * (0.1 + 0.4 * rd.random())  # Randomize baseline
+            self._seed_vel = self._randint(0, 100000)
+            self._seed_heading = self._randint(0, 100000)
+            self._seed_elev = self._randint(0, 100000)
+            self._time_scale = 0.8 + self._u01() * 0.6
+            self.velW_med = self.velW_max * (0.1 + 0.4 * self._u01())  # Randomize baseline
         elif self.windType == 'RANDOMSINE':
             # Re-randomize sine medians for new episode
-            self.velW_med = self.velW_max * rd.random()
-            self.qW1_med = (360.0 * rd.random() - 180.0) * deg2rad
-            self.qW2_med = (30.0 * rd.random() - 15.0) * deg2rad
+            self.velW_med = self.velW_max * self._u01()
+            self.qW1_med = (360.0 * self._u01() - 180.0) * deg2rad
+            self.qW2_med = (30.0 * self._u01() - 15.0) * deg2rad
 
     def randomWind(self, t):
         if (self.windType == 'SINE') or (self.windType == 'RANDOMSINE'):

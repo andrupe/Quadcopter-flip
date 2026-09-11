@@ -24,33 +24,88 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
 from quad_flip_env import QuadFlipEnv, ACTOR_TOTAL_DIM, TOTAL_OBS_DIM
 from asymmetric_policy import AsymmetricActorCriticPolicy
 
+# The frozen history encoder lives in Simulation/encoder/. Imported defensively: the
+# encoder is an ADD-ON, so a missing or incomplete encoder package must degrade to
+# "train without the latent" rather than stopping training from starting at all. A hard
+# import here means one absent file makes the whole trainer unimportable.
+try:
+    from encoder.latent_obs_wrapper import LatentObsWrapper
+except ImportError:  # pragma: no cover - exercised by the no-encoder configuration
+    LatentObsWrapper = None
+
+# Frozen history encoder produced by Simulation/encoder/train_encoder.py. The wrapper
+# injects its z output into the observation between the actor block and the aux block.
+ENCODER_CHECKPOINT: str = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "encoder_gru.pt"
+)
+Z_DIM: int = 16
+
 
 # ======================================================================================
 # TRAINING CONFIGURATION (Edit parameters directly here, then click Run in VS Code)
 # ======================================================================================
-TOTAL_TIMESTEPS: int = 20_000_000      # Target total steps for Asymmetric Actor-Critic run (~28-35 mins on 10 workers)
-NUM_WORKERS: int = 10                # Parallel CPU worker environments
-MODEL_NAME: str = "quad_flip_model"   # Model output name (.zip saved in root directory)
-DEVICE: str = "cpu"                   # "cpu" (recommended for Apple Silicon / M4) or "mps"
+# ======================================================================================
+# BASELINE RUN (trajectory tracking)
+#
+# These values replace a schedule tuned for the OLD two-phase flip task. Two properties of
+# that task drove the old numbers, and neither one still holds:
+#
+#   1. It had a hard EXPLORATION problem. "Master the nominal flip before randomising
+#      anything" is why the LR sat at 3e-4 for 7,000,000 steps. Tracking does not have that
+#      shape: the reference tells the policy what to do at EVERY step and the reward is
+#      dense and bounded, so there is no binary discovery event to wait for and no reason
+#      to hold a high LR for 7M steps.
+#   2. It was a SINGLE manoeuvre. This task is a mixture (hover / waypoints / figure-8 /
+#      flip) present from step 0, so a "nominal only" phase has no meaning.
+#
+# The phases are therefore aligned with the ADR ramp instead of with a manoeuvre:
+#   Phase 1 (no DR)      learn the mixture on clean dynamics
+#   Phase 2 (= DR ramp)  adapt while the dynamics are being corrupted
+#   Phase 3 (full DR)    polish
+# LR_WARMUP_STEPS == DR_START_STEPS makes that alignment exact. Change one, change both.
+# ======================================================================================
+TOTAL_TIMESTEPS: int = 10_000_000      # ~30 min at ~6000 steps/s on 10 workers
+NUM_WORKERS: int = 10                  # Parallel CPU worker environments
+MODEL_NAME: str = "quad_flip_model"    # Model output name (.zip saved in root directory)
+DEVICE: str = "cpu"                    # "cpu" (recommended for Apple Silicon) or "mps"
 
 # Training Mode:
-LOAD_PREVIOUS_MODEL: bool = False     # False: Fresh training from scratch with clean slate
-PREVIOUS_MODEL_PATH: Optional[str] = None # Model checkpoint to resume from (if LOAD_PREVIOUS_MODEL=True)
+LOAD_PREVIOUS_MODEL: bool = False      # False: Fresh training from scratch with clean slate
+PREVIOUS_MODEL_PATH: Optional[str] = None  # Model checkpoint to resume from (if LOAD_PREVIOUS_MODEL=True)
 
-# Fresh Training Schedule (Piecewise Linear - Asymmetric Actor-Critic Aligned):
-LR_START: float = 3e-4                # Phase 1 start: Initial high exploration learning rate
-LR_MID: float = 1.5e-4                # Phase 2 start: Target learning rate at 3,000,000 steps (ADR ramp start)
-LR_ADR_END: float = 5e-5              # Phase 3 start: Target learning rate at 12,000,000 steps (full DR reached)
-LR_FLOOR: float = 3e-5                # Phase 3 end: Fine-tuning floor learning rate at 16,000,000 steps
-LR_WARMUP_STEPS: int = 7_000_000      # Phase 1 duration: Extended nominal flip mastering before ADR
-LR_FINAL_STABLE: bool = False         # False: decay from LR_ADR_END to LR_FLOOR in Phase 3; True: hold at LR_FLOOR
-ENT_COEF: float = 0.01                 # Entropy coefficient start (scheduled: 0.01 → 0.001 over training)
-CHECKPOINT_FREQ: int = 50_000         # Checkpoint interval (timesteps per worker = 500,000 total steps)
+LR_START: float = 3e-4                 # Phase 1: explore the mixture on clean dynamics
+LR_MID: float = 1.5e-4                 # Phase 2 start, as the ADR ramp begins
+LR_ADR_END: float = 5e-5               # Phase 3 start, at full DR
+LR_FLOOR: float = 3e-5                 # Phase 3 end
+LR_WARMUP_STEPS: int = 2_000_000       # Phase 1 duration. Keep equal to DR_START_STEPS.
+LR_FINAL_STABLE: bool = False          # False: decay to LR_FLOOR in Phase 3; True: hold at LR_ADR_END
+CHECKPOINT_FREQ: int = 250_000         # Timesteps per worker (2.5M total across 10 workers)
+
+# ENTROPY. 0.01 -> 0.001 is the "classic" anneal and is deliberately conservative here.
+# Andrychowicz et al. (2020), 'What Matters in On-Policy RL', find ent_coef = 0.0 is usually
+# optimal for continuous control, and the RMA reference implementation (legged_gym) also
+# uses 0.0 - with an adaptive-KL learning rate doing the work instead.
+#
+# The reason to keep a NONZERO coefficient on THIS task is the mixture: a policy that gives
+# up on the flip can still collect decent average reward from hover and waypoints, which is
+# exactly the kind of local optimum entropy pressure is the standard antidote to. Set
+# ENT_COEF_END = 0.0 for the RMA-style configuration.
+ENT_COEF: float = 0.01
+ENT_COEF_END: float = 0.001
 
 # Automatic Domain Randomization (ADR):
-DR_ENABLED: bool = True               # Enable progressive domain randomization
-DR_START_STEPS: int = 7_000_000       # Start ADR after nominal flip is mastered (7.0M steps)
-DR_END_STEPS: int = 16_000_000        # Reach full 100% DR at 16.0M steps (9.0M step ramp)
+DR_ENABLED: bool = True                # Enable progressive domain randomization
+DR_START_STEPS: int = 2_000_000        # Start corrupting dynamics once the mixture is learnt clean
+DR_END_STEPS: int = 7_000_000          # Reach full 100% DR
+
+# RMA-STYLE ADAPTIVE LEARNING RATE (Schulman 2017 KL controller, as used by legged_gym/RMA).
+# Off by default so a baseline run has a PREDICTABLE schedule. Turn it on when you would
+# rather the LR find its own level than trust the hand-tuned phases above - which is the
+# right call precisely when the task has changed and the phases are what you least trust.
+ADAPTIVE_KL_LR: bool = False
+ADAPTIVE_KL_DESIRED: float = 0.01      # legged_gym default
+ADAPTIVE_KL_LR_MIN: float = 1e-5
+ADAPTIVE_KL_LR_MAX: float = 3e-3
 
 # Fine-Tuning Settings (Used only when LOAD_PREVIOUS_MODEL = True):
 FT_LR_START: float = 3e-5             # Initial learning rate for fine-tuning
@@ -306,6 +361,74 @@ class EntCoefScheduleCallback(BaseCallback):
         self.model.ent_coef = float(new_ent)
 
 
+class AdaptiveKLScheduleCallback(BaseCallback):
+    """
+    RMA / legged_gym style adaptive learning rate: drive the PPO KL toward a target by
+    scaling the LR multiplicatively once per rollout.
+
+        kl > desired * 2   ->  lr /= 1.5     (steps too large, back off)
+        kl < desired / 2   ->  lr *= 1.5     (steps too small, push harder)
+
+    This is the one piece of the RMA reference implementation worth borrowing, and it is
+    borrowed because of what actually went wrong here: the 3-phase schedule in this file
+    was fitted to the OLD two-phase flip reward, so there is no reason its phase
+    boundaries suit the tracking reward. An adaptive controller needs to know nothing
+    about the task - only that the KL is measurable.
+
+    The LR is clamped to [lr_min, lr_max] so one bad KL estimate cannot collapse or blow
+    up the run. The 1.5x update is deliberately gentle: each rollout here is
+    2048 x 10 = 20k steps, a much coarser control interval than legged_gym's, so a large
+    multiplier would overshoot badly between corrections.
+    """
+
+    def __init__(
+        self,
+        desired_kl: float = ADAPTIVE_KL_DESIRED,
+        lr_min: float = ADAPTIVE_KL_LR_MIN,
+        lr_max: float = ADAPTIVE_KL_LR_MAX,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.desired_kl = float(desired_kl)
+        self.lr_min = float(lr_min)
+        self.lr_max = float(lr_max)
+        self.lr_history: list[float] = []
+
+    def _current_lr(self) -> float:
+        lr = getattr(self.model, "lr_schedule", None)
+        if callable(lr):
+            lr = lr(1.0)
+        if lr is None:
+            lr = self.model.learning_rate
+        if callable(lr):
+            lr = lr(1.0)
+        lr = float(lr)
+        return lr if np.isfinite(lr) and lr > 0.0 else self.lr_min
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if self.logger is None:
+            return
+        kl = self.logger.name_to_value.get("train/approx_kl")
+        if kl is None or not np.isfinite(kl):
+            return
+
+        lr = self._current_lr()
+        if kl > self.desired_kl * 2.0:
+            lr = max(self.lr_min, lr / 1.5)
+        elif kl < self.desired_kl / 2.0:
+            lr = min(self.lr_max, lr * 1.5)
+
+        # SB3 reads lr_schedule(progress) every update, so a constant closure is what
+        # actually pins the LR. Setting model.learning_rate alone would be overwritten on
+        # the next _update_learning_rate() call.
+        self.model.learning_rate = lr
+        self.model.lr_schedule = lambda _progress, _lr=lr: _lr
+        self.lr_history.append(lr)
+
+
 def plot_training_curves(
     timesteps: list[int] | np.ndarray,
     rew_means: list[float] | np.ndarray,
@@ -456,6 +579,7 @@ def train(
     ft_lr_start: float = FT_LR_START,
     ft_lr_floor: float = FT_LR_FLOOR,
     ent_coef: float = ENT_COEF,
+    ent_coef_end: float = ENT_COEF_END,
     checkpoint_freq: int = CHECKPOINT_FREQ,
     load_previous_model: bool = LOAD_PREVIOUS_MODEL,
     previous_model_path: Optional[str] = PREVIOUS_MODEL_PATH,
@@ -481,7 +605,24 @@ def train(
 
     anneal_steps = (DR_END_STEPS - DR_START_STEPS) if DR_ENABLED else 10_000_000
 
+    # Schedule sanity. Both of these are silent when wrong - training just runs with a
+    # schedule that does not do what the constants say it does - so they are checked.
+    if not load_previous_model:
+        if LR_WARMUP_STEPS != DR_START_STEPS:
+            print(f"  [warn] LR_WARMUP_STEPS ({LR_WARMUP_STEPS:,}) != DR_START_STEPS "
+                  f"({DR_START_STEPS:,}): the LR phases will not line up with the ADR ramp.")
+        if LR_WARMUP_STEPS + anneal_steps > total_timesteps:
+            print(f"  [warn] LR phases span {LR_WARMUP_STEPS + anneal_steps:,} steps but the run "
+                  f"is {total_timesteps:,}: Phase 3 (full-DR polish) will never be reached.")
+
     def make_env():
+        # NOTE: the old tol_*/w_* reward knobs are deliberately gone. The two-phase flip
+        # reward they configured no longer exists; it was replaced by a single
+        # trajectory-tracking objective whose tolerances are keyed per manoeuvre
+        # (TRACK_TOL in quad_flip_env.py). Those tolerances are what let ONE reward serve
+        # a hover, a figure-8 and a 360 deg flip, so exposing them as per-run tuning would
+        # let a run silently re-weight the task back toward whichever manoeuvre it
+        # happened to be failing.
         return QuadFlipEnv(
             action_mode=ACTION_MODE,
             episode_seconds=EPISODE_SECONDS,
@@ -491,21 +632,28 @@ def train(
             arena_radius_start=ARENA_RADIUS_START,
             arena_radius_end=ARENA_RADIUS_END,
             curriculum_arena=CURRICULUM_ARENA,
-            tol_xy_hover=TOL_XY_HOVER,
-            tol_vel_hover=TOL_VEL_HOVER,
-            tol_z_hover=TOL_Z_HOVER,
-            tol_so3_attitude=TOL_SO3_ATTITUDE,
-            tol_z_vel_flip=TOL_Z_VEL_FLIP,
-            w_xy=W_XY,
-            w_z=W_Z,
-            w_vel=W_VEL,
-            w_action=W_ACTION,
-            w_upright=W_UPRIGHT,
-            w_heading=W_HEADING,
-            w_omega=W_OMEGA,
         )
 
     vec_env = make_vec_env(make_env, n_envs=num_workers, vec_env_cls=SubprocVecEnv)
+
+    # Frozen history encoder -> z. Built HERE, in the trainer process, not inside the
+    # workers: one batched forward serves all workers, and Simulation/quad_flip_env.py
+    # stays torch-free (SubprocVecEnv uses fork/spawn, so a set_num_threads() call in this
+    # process would not reach the workers anyway).
+    actor_obs_dim = ACTOR_TOTAL_DIM
+    if LatentObsWrapper is None:
+        print("WARNING: the encoder package (Simulation/encoder/) is not importable.\n"
+              f"         Training WITHOUT the history encoder; the actor sees {actor_obs_dim} dims.\n"
+              f"         This is a valid configuration, just a less informed policy.\n")
+    elif os.path.isfile(ENCODER_CHECKPOINT):
+        vec_env = LatentObsWrapper(vec_env, encoder_path=ENCODER_CHECKPOINT, z_dim=Z_DIM)
+        actor_obs_dim = ACTOR_TOTAL_DIM + Z_DIM
+        print(f"Loaded history encoder from {ENCODER_CHECKPOINT}: actor sees {actor_obs_dim} dims "
+              f"({ACTOR_TOTAL_DIM} obs + {Z_DIM} latent)")
+    else:
+        print(f"WARNING: encoder checkpoint not found at {ENCODER_CHECKPOINT}.\n"
+              f"         Training WITHOUT the history encoder; the actor sees {actor_obs_dim} dims.")
+
     stats_path = os.path.join(_PROJECT_ROOT, f"{model_name}_vecnormalize.pkl")
     save_dir = os.path.join(_PROJECT_ROOT, "logs")
     os.makedirs(save_dir, exist_ok=True)
@@ -523,7 +671,7 @@ def train(
             vec_env = VecNormalize.load(stats_path, vec_env)
             vec_env.training = True
         else:
-            vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+            vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=False, clip_obs=10.0)
 
         print(f"Resuming model training from checkpoint: {model_to_load}")
         model = PPO.load(
@@ -532,12 +680,12 @@ def train(
             device=device,
             custom_objects=dict(
                 policy_class=AsymmetricActorCriticPolicy,
-                actor_obs_dim=ACTOR_TOTAL_DIM,
+                actor_obs_dim=actor_obs_dim,
             ),
         )
         initial_steps = int(getattr(model, "num_timesteps", 0))
     else:
-        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+        vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=False, clip_obs=10.0)
         model = None
 
     # Determine steps to train and lifetime steps
@@ -564,13 +712,17 @@ def train(
     if model_to_load:
         print(f"  Fine-Tuning LR : {ft_lr_start:.1e} -> {ft_lr_floor:.1e} (Linear decay over {steps_to_train:,} steps)")
     else:
-        print(f"  LR Schedule    : Phase 1 (0 -> {LR_WARMUP_STEPS:,}): {learning_rate:.1e} -> {lr_mid:.1e} (Nominal Flip)")
-        print(f"                   Phase 2 ({LR_WARMUP_STEPS:,} -> {LR_WARMUP_STEPS + anneal_steps:,}): {lr_mid:.1e} -> {lr_adr_end:.1e} (ADR Adaptation)")
-        print(f"                   Phase 3 ({LR_WARMUP_STEPS + anneal_steps:,} -> {total_timesteps:,}): {lr_adr_end:.1e} -> {lr_floor:.1e} (Hardened Polishing)")
+        print(f"  Task           : TRAJECTORY TRACKING (hover / waypoints / figure-8 / flip mixture)")
+        if ADAPTIVE_KL_LR:
+            print(f"  LR Schedule    : ADAPTIVE KL (target {ADAPTIVE_KL_DESIRED}, "
+                  f"clamped to [{ADAPTIVE_KL_LR_MIN:.0e}, {ADAPTIVE_KL_LR_MAX:.0e}]) - RMA/legged_gym style")
+        else:
+            print(f"  LR Schedule    : Phase 1 (0 -> {LR_WARMUP_STEPS:,}): {learning_rate:.1e} -> {lr_mid:.1e} (mixture, no DR)")
+            print(f"                   Phase 2 ({LR_WARMUP_STEPS:,} -> {LR_WARMUP_STEPS + anneal_steps:,}): {lr_mid:.1e} -> {lr_adr_end:.1e} (DR ramp)")
+            print(f"                   Phase 3 ({LR_WARMUP_STEPS + anneal_steps:,} -> {total_timesteps:,}): {lr_adr_end:.1e} -> {lr_floor:.1e} (full-DR polish)")
+    print(f"  Entropy Coef   : {ent_coef:.4f} -> {ent_coef_end:.4f} (linear; set both to 0.0 for RMA-style)")
+    print(f"  Tracker Tol.   : per-manoeuvre, see TRACK_TOL in quad_flip_env.py")
     print(f"  Motor Dynamics : motor_tau = 25ms (realistic Crazyflie motor response)")
-    print(f"  Flare Braking  : tol_xy={TOL_XY_HOVER}m, tol_vel={TOL_VEL_HOVER}m/s, tol_so3={TOL_SO3_ATTITUDE}, w_vel={W_VEL}")
-    print(f"  Altitude Hold  : tol_z={TOL_Z_HOVER}m, tol_vz_flip={TOL_Z_VEL_FLIP}m/s, w_z={W_Z}")
-    print(f"  Smoothness     : w_action={W_ACTION} (motor chatter regularized)")
     if DR_ENABLED:
         if DR_START_STEPS == 0 and DR_END_STEPS == 0:
             print(f"  ADR Mode       : Fixed 100% full domain randomization throughout (dr_level = 1.0)")
@@ -616,7 +768,7 @@ def train(
             clip_range=0.2,
             ent_coef=ent_coef,
             policy_kwargs=dict(
-                actor_obs_dim=ACTOR_TOTAL_DIM,
+                actor_obs_dim=actor_obs_dim,
                 activation_fn=nn.Tanh,
                 net_arch=dict(pi=[128, 128], vf=[512, 256, 128]),
                 log_std_init=-0.5,
@@ -639,17 +791,24 @@ def train(
         plot_freq=100_000,
     )
     std_floor_cb = StdFloorCallback(
-        min_log_std_start=-1.0,   # Early: std >= 0.37 (forces flip exploration)
-        min_log_std_end=-2.5,     # Late: std >= 0.08 (allows precision hover)
+        min_log_std_start=-1.0,   # Early: std >= 0.37 (broad exploration)
+        min_log_std_end=-2.5,     # Late: std >= 0.08 (allows precision tracking)
         max_log_std=0.0,
         total_timesteps=total_lifetime_steps,
     )
     ent_schedule_cb = EntCoefScheduleCallback(
-        start_value=ent_coef,     # 0.01 (escape hover trap)
-        end_value=0.001,          # Precision convergence
+        start_value=ent_coef,     # escapes the "only hover well" local optimum
+        end_value=ent_coef_end,   # 0.001 classic, 0.0 RMA-style
         total_timesteps=total_lifetime_steps,
     )
     callbacks = [checkpoint_cb, vecnorm_cb, metrics_cb, std_floor_cb, ent_schedule_cb]
+
+    if ADAPTIVE_KL_LR:
+        callbacks.append(AdaptiveKLScheduleCallback(
+            desired_kl=ADAPTIVE_KL_DESIRED,
+            lr_min=ADAPTIVE_KL_LR_MIN,
+            lr_max=ADAPTIVE_KL_LR_MAX,
+        ))
 
     if DR_ENABLED:
         dr_cb = DomainRandomizationCallback(

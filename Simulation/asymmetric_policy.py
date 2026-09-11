@@ -23,7 +23,10 @@ from stable_baselines3.common.utils import get_device, is_vectorized_observation
 try:
     from quad_flip_env import ACTOR_TOTAL_DIM
 except ImportError:
-    ACTOR_TOTAL_DIM = 51
+    # Import-time fallback only. QuadFlipEnv is the source of truth; this exists so the
+    # module can be introspected without MuJoCo on the path. It must be kept in step with
+    # ACTOR_SINGLE_OBS_DIM * OBS_HISTORY_LEN in quad_flip_env.py (29 * 1).
+    ACTOR_TOTAL_DIM = 29
 
 
 class AsymmetricMlpExtractor(nn.Module):
