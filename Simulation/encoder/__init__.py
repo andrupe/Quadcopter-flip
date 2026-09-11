@@ -7,7 +7,8 @@ the observation stream, plus the plumbing to inject its output into PPO.
 Modules:
     observation_spec     input frame contract + frozen normalization constants
     history_encoder      the GRU itself, plus losses and checkpoint I/O
-    latent_obs_wrapper   VecEnvWrapper that injects z into the observation
+    latent_obs_wrapper   VecEnvWrapper that injects z into the observation (training)
+    latent_injector      single-env z injection for scripts that drive a raw env
     collect_data         pretraining data driver (mixed controllers)
     train_encoder        supervised pretraining + R^2 gating
 
@@ -31,6 +32,7 @@ from .history_encoder import (  # noqa: F401
     load_encoder_checkpoint,
     save_encoder_checkpoint,
 )
+from .latent_injector import LatentInjector  # noqa: F401
 
 __all__ = [
     "ACTOR_FRAME_DIM",
@@ -40,6 +42,7 @@ __all__ = [
     "frame_from_env_obs",
     "EncoderWithHead",
     "HistoryEncoder",
+    "LatentInjector",
     "load_encoder_checkpoint",
     "save_encoder_checkpoint",
 ]

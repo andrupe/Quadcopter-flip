@@ -251,6 +251,11 @@ def showFigures(
     preventing the macOS Cocoa backend from opening GUI windows. When detected, this function
     delegates plotting to a main-thread Python process to seamlessly open interactive windows.
     """
+    # makeFigures indexes column 0 immediately, so an empty recording would fail with an
+    # opaque IndexError deep inside the plotting code instead of saying what is wrong.
+    if time is None or len(time) == 0:
+        raise ValueError("showFigures received no telemetry samples; nothing to plot.")
+
     if is_gui_thread():
         makeFigures(
             params, time, pos_all, vel_all, quat_all, omega_all, euler_all,

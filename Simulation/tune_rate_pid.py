@@ -54,7 +54,8 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
 import quad_flip_env
 from quadFiles.quad_mujoco import QuadcopterMuJoCo
 from utils.rate_pid import RatePIDController
-from asymmetric_policy import AsymmetricActorCriticPolicy
+from quad_flip_env import ACTOR_TOTAL_DIM
+from actor_input import Z_DIM, ActorInput, load_checkpoint, read_checkpoint_arch
 
 
 # ======================================================================================
@@ -81,6 +82,7 @@ LOG_BOUNDS_6D = [
 _WORKER_MODEL: Optional[PPO] = None
 _WORKER_VEC_NORM: Optional[VecNormalize] = None
 _WORKER_ENV: Optional[quad_flip_env.QuadFlipEnv] = None
+_WORKER_INPUT: Optional[ActorInput] = None
 _STOP_REQUESTED: bool = False
 
 
@@ -159,7 +161,7 @@ def check_fast_stability(kp: np.ndarray, ki: np.ndarray, kd: np.ndarray) -> Tupl
 
 def init_worker_process(model_path: str, norm_path: Optional[str], dr_level: float):
     """Worker process initializer to load model and environment once per core."""
-    global _WORKER_MODEL, _WORKER_VEC_NORM, _WORKER_ENV
+    global _WORKER_MODEL, _WORKER_VEC_NORM, _WORKER_ENV, _WORKER_INPUT
     torch.set_num_threads(1)
 
     _WORKER_ENV = quad_flip_env.QuadFlipEnv(
@@ -168,11 +170,12 @@ def init_worker_process(model_path: str, norm_path: Optional[str], dr_level: flo
         random_initial_pos=True,
         random_initial_vel=True,
         random_initial_att=True,
-        arena_radius=2.5,
-        hover_gain=1.0,
     )
     _WORKER_ENV.set_dr_level(dr_level)
 
+    # Observation normalisation. train.py runs with norm_obs=False / norm_reward=False, so
+    # this is normally a no-op; it exists so that a run which DOES normalise is evaluated
+    # on the same statistics it was trained with.
     dummy = DummyVecEnv([lambda: _WORKER_ENV])
     if norm_path and os.path.isfile(norm_path):
         _WORKER_VEC_NORM = VecNormalize.load(norm_path, dummy)
@@ -180,20 +183,21 @@ def init_worker_process(model_path: str, norm_path: Optional[str], dr_level: flo
     else:
         _WORKER_VEC_NORM = None
 
-    _WORKER_MODEL = PPO.load(
-        model_path,
-        custom_objects=dict(
-            policy_class=AsymmetricActorCriticPolicy,
-            actor_obs_dim=51,
-        ),
-        device="cpu",
-    )
+    _WORKER_MODEL = load_checkpoint(model_path, device="cpu")
+    # The actor width is read from the checkpoint's weights, never assumed: 29 dims is
+    # plain o_t, 45 is [o_t | z] with the frozen history encoder. ActorInput owns the
+    # encoder state and rejects any other width with an explanation.
+    actor_dim, _ = read_checkpoint_arch(model_path)
+    if actor_dim is None:  # unreadable zip: trust the policy that was just constructed
+        actor_dim = int(_WORKER_MODEL.policy.actor_obs_dim)
+    _WORKER_INPUT = ActorInput(actor_dim)
 
 
 def evaluate_single_flight(
     env: quad_flip_env.QuadFlipEnv,
     model: PPO,
     vec_norm: Optional[VecNormalize],
+    actor_input: ActorInput,
     kp: np.ndarray,
     ki: np.ndarray,
     kd: np.ndarray,
@@ -203,6 +207,7 @@ def evaluate_single_flight(
     """Execute a single flight test episode with candidate PID gains."""
     env.set_rate_pid_gains(kp=kp, ki=ki, kd=kd)
     obs, info = env.reset(seed=seed)
+    actor_input.reset()  # fresh episode => fresh encoder state
 
     total_reward = 0.0
     omega_errors = []
@@ -211,8 +216,7 @@ def evaluate_single_flight(
     prev_w = env.quad.wMotor.copy()
 
     for step in range(max_steps):
-        obs_norm = vec_norm.normalize_obs(obs)[:51] if vec_norm else obs[:51]
-        action, _ = model.predict(obs_norm, deterministic=True)
+        action, _ = model.predict(actor_input.prepare(obs, vec_norm), deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
 
@@ -249,7 +253,7 @@ def evaluate_single_flight(
 
 def worker_eval_candidate(x: np.ndarray, seeds: List[int], dr_level: float) -> float:
     """Worker evaluation function called by multiprocessing pool."""
-    global _WORKER_MODEL, _WORKER_VEC_NORM, _WORKER_ENV
+    global _WORKER_MODEL, _WORKER_VEC_NORM, _WORKER_ENV, _WORKER_INPUT
 
     kp, ki, kd = vector_to_gains(x)
 
@@ -259,14 +263,16 @@ def worker_eval_candidate(x: np.ndarray, seeds: List[int], dr_level: float) -> f
         return penalty
 
     # Tier 2: Flight simulations across evaluation seeds
-    if _WORKER_ENV is None or _WORKER_MODEL is None:
+    if _WORKER_ENV is None or _WORKER_MODEL is None or _WORKER_INPUT is None:
         raise RuntimeError("Worker process was not properly initialized!")
 
     _WORKER_ENV.set_dr_level(dr_level)
 
     total_loss = 0.0
     for s in seeds:
-        res = evaluate_single_flight(_WORKER_ENV, _WORKER_MODEL, _WORKER_VEC_NORM, kp, ki, kd, seed=s)
+        res = evaluate_single_flight(
+            _WORKER_ENV, _WORKER_MODEL, _WORKER_VEC_NORM, _WORKER_INPUT, kp, ki, kd, seed=s
+        )
         
         crash_cost = 500.0 * float(res["crashed"])
         flip_cost = 300.0 * float(not res["flip"])
@@ -433,7 +439,7 @@ def run_paired_benchmark(
     print("=" * 80)
 
     init_worker_process(model_path, norm_path, dr_level)
-    global _WORKER_ENV, _WORKER_MODEL, _WORKER_VEC_NORM
+    global _WORKER_ENV, _WORKER_MODEL, _WORKER_VEC_NORM, _WORKER_INPUT
 
     def _eval_gain_set(name: str, gains: Tuple[np.ndarray, np.ndarray, np.ndarray]) -> Dict[str, Any]:
         kp, ki, kd = gains
@@ -451,6 +457,7 @@ def run_paired_benchmark(
             seed = 5000 + ep
             _WORKER_ENV.set_rate_pid_gains(kp=kp, ki=ki, kd=kd)
             obs, info = _WORKER_ENV.reset(seed=seed)
+            _WORKER_INPUT.reset()
 
             ep_rew = 0.0
             prev_w = _WORKER_ENV.quad.wMotor.copy()
@@ -458,8 +465,9 @@ def run_paired_benchmark(
             errs_r, errs_p, errs_y = [], [], []
 
             for step in range(DEFAULT_MAX_STEPS):
-                obs_norm = _WORKER_VEC_NORM.normalize_obs(obs)[:51] if _WORKER_VEC_NORM else obs[:51]
-                action, _ = _WORKER_MODEL.predict(obs_norm, deterministic=True)
+                action, _ = _WORKER_MODEL.predict(
+                    _WORKER_INPUT.prepare(obs, _WORKER_VEC_NORM), deterministic=True
+                )
                 obs, rew, term, trunc, info = _WORKER_ENV.step(action)
                 ep_rew += float(rew)
 
@@ -687,6 +695,21 @@ def tune_rate_pid(
         os.path.join(_PROJECT_ROOT, "quad_flip_model_vecnormalize.pkl"),
     ]
     norm_path = next((p for p in norm_candidates if os.path.isfile(p)), None)
+
+    # Refuse to tune against a checkpoint whose actor input this build cannot assemble.
+    # The 51-dim slice this file used to hardcode silently fed it [o_t | aux | privileged]
+    # where the policy expected [o_t | z]; a wrong input is worse than no tuning, because
+    # the gains would then be optimised for a policy that does not exist.
+    actor_dim, _ = read_checkpoint_arch(model_path)
+    if actor_dim is None or actor_dim not in (ACTOR_TOTAL_DIM, ACTOR_TOTAL_DIM + Z_DIM):
+        raise SystemExit(
+            f"\n[Error] Could not read a supported actor width from {model_path}\n"
+            f"        (expected {ACTOR_TOTAL_DIM} without the history encoder, or "
+            f"{ACTOR_TOTAL_DIM + Z_DIM} with it).\n"
+            "        Retrain with:  .venv/bin/python Simulation/train.py\n"
+        )
+    _desc = f"[o_t | z({Z_DIM})]" if actor_dim == ACTOR_TOTAL_DIM + Z_DIM else "o_t"
+    print(f"[TunePID] Checkpoint actor input: {_desc} ({actor_dim} dims)")
 
     if workers is None or workers <= 0:
         cpu_total = os.cpu_count() or 4

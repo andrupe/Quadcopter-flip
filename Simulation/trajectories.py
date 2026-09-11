@@ -37,6 +37,7 @@ Standalone and dependency-free apart from numpy so it can be unit-tested and reu
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -47,16 +48,29 @@ MASS_NOMINAL: float = 0.028
 MAX_THRUST_TOTAL: float = 0.60          # matches QuadcopterMuJoCo params["maxThr"]
 MIN_THRUST_TOTAL: float = 0.0
 
+# Seconds of terminal hover appended to every manoeuvre. Shared so the sampler can work
+# out the highest manoeuvre frequency that still fits inside one episode (see
+# TrajectoryConfig.episode_seconds) instead of duplicating the number.
+TRAJECTORY_TAIL: float = 0.6
+
 
 # =====================================================================================
 # small rotation helpers
 # =====================================================================================
 def _normalize(v: np.ndarray, fallback: Optional[np.ndarray] = None) -> np.ndarray:
+    """Unit vector.
+
+    Scalars rather than np.linalg.norm + broadcast division. At 3 elements numpy's
+    dispatch overhead is two orders of magnitude larger than the arithmetic, and this
+    is called several times per reference sample. Same formula, same float64
+    operations, same result to the last ULP.
+    """
     v = np.asarray(v, dtype=np.float64)
-    n = float(np.linalg.norm(v))
+    x, y, z = float(v[0]), float(v[1]), float(v[2])
+    n = math.sqrt(x * x + y * y + z * z)
     if n < 1e-9:
         return np.array([0.0, 0.0, 1.0]) if fallback is None else np.asarray(fallback, dtype=np.float64)
-    return v / n
+    return np.array([x / n, y / n, z / n], dtype=np.float64)
 
 
 def axis_angle_rotation(axis: np.ndarray, angle: float) -> np.ndarray:
@@ -72,16 +86,34 @@ def dcm_from_thrust_dir_and_yaw(z_b: np.ndarray, yaw: float) -> np.ndarray:
 
     Identical construction to the one already used by the PD controller in
     collect_data.py, so reference and controller agree on what 'heading' means.
+
+    WHY THIS IS WRITTEN WITH SCALARS. Measured on this machine, the numpy version cost
+    ~41 us per call (np.cross dispatches through moveaxis/normalize_axis_tuple even for
+    a 3-element vector) against ~3 us for the scalar twin, and it is called three times
+    per reference sample - roughly a fifth of a whole environment step. The arithmetic
+    is the same: y_b = z_b x [cos yaw, sin yaw, 0], x_b = y_b x z_b, both normalised.
     """
     z_b = _normalize(z_b)
-    x_c = np.array([np.cos(yaw), np.sin(yaw), 0.0])
-    y_b = np.cross(z_b, x_c)
-    if np.linalg.norm(y_b) < 1e-6:
-        x_c = np.array([np.cos(yaw + np.pi / 2.0), np.sin(yaw + np.pi / 2.0), 0.0])
-        y_b = np.cross(z_b, x_c)
-    y_b = _normalize(y_b)
-    x_b = np.cross(y_b, z_b)
-    return np.column_stack([x_b, y_b, z_b])
+    zx, zy, zz = float(z_b[0]), float(z_b[1]), float(z_b[2])
+    yaw = float(yaw)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    # y_b = z_b x x_c,  x_c = [cos(yaw), sin(yaw), 0]
+    yx = zy * 0.0 - zz * sy
+    yy = zz * cy - zx * 0.0
+    yz = zx * sy - zy * cy
+    if math.sqrt(yx * yx + yy * yy + yz * yz) < 1e-6:
+        # z_b parallel to the heading axis: turn the heading reference a quarter turn.
+        cy, sy = math.cos(yaw + 0.5 * math.pi), math.sin(yaw + 0.5 * math.pi)
+        yx = zy * 0.0 - zz * sy
+        yy = zz * cy - zx * 0.0
+        yz = zx * sy - zy * cy
+    ny = math.sqrt(yx * yx + yy * yy + yz * yz)
+    yx, yy, yz = yx / ny, yy / ny, yz / ny
+    # x_b = y_b x z_b
+    xx = yy * zz - yz * zy
+    xy = yz * zx - yx * zz
+    xz = yx * zy - yy * zx
+    return np.array([[xx, yx, zx], [xy, yy, zy], [xz, yz, zz]], dtype=np.float64)
 
 
 def omega_from_dcm(R_prev: np.ndarray, R_mid: np.ndarray, R_next: np.ndarray, h: float) -> np.ndarray:
@@ -116,6 +148,24 @@ def _poly_deriv(k: int, d: int, t: float) -> float:
     for j in range(d):
         c *= (k - j)
     return c * (t ** (k - d))
+
+
+def _settle_envelope(t: float, T: float, L: float) -> Tuple[float, float, float]:
+    """
+    C2 amplitude envelope: 1 for the body of a manoeuvre, quintic ramp to 0 over the last
+    `L` seconds. Returns (e, de/dt, d2e/dt2).
+
+    Because e, e' and e'' all reach zero at T, multiplying a position profile by this makes
+    p -> final, v -> 0 AND a -> 0. That last one matters: v -> 0 alone would leave the
+    reference attitude tilted by whatever acceleration the profile still had, so the
+    handover to the terminal hover would come with an attitude step.
+    """
+    if L <= 1e-9 or t <= T - L:
+        return 1.0, 0.0, 0.0
+    s = float(np.clip((t - (T - L)) / L, 0.0, 1.0))
+    ds = (30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4) / L
+    dds = (60.0 * s - 180.0 * s**2 + 120.0 * s**3) / (L * L)
+    return 1.0 - (10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5), -ds, -dds
 
 
 # =====================================================================================
@@ -158,6 +208,30 @@ class Maneuver:
 
     def __init__(self) -> None:
         self.duration = float(self.duration)
+        self.yaw: float = 0.0
+        # Optional slow YAW manoeuvre. Without this the heading is pinned for the whole
+        # episode, so nothing in the mixture ever asks the policy to track a yaw reference
+        # - the yaw channel is trained purely as a disturbance-rejection problem.
+        self.yaw_rate: float = 0.0
+
+    def _yaw(self, t: float) -> float:
+        """
+        Heading at time t, eased so it starts AND ends at zero yaw rate.
+
+        The easing is not cosmetic. omega is a central difference of R, and the terminal
+        hover freezes R at its final value - so a heading still rotating at t = T would put
+        a STEP in the reference body rate at the handover. That is the same defect the
+        waypoint trajectory had at its knots. The quintic has zero 1st and 2nd derivatives
+        at both ends, so the reference rate stays continuous.
+
+        The clip is safe here (unlike elsewhere): the eased profile is C2-flat at u = 0 and
+        u = 1, so freezing it outside [0, T] introduces no discontinuity.
+        """
+        if abs(self.yaw_rate) < 1e-9:
+            return self.yaw
+        u = float(np.clip(t / max(1e-9, self.duration), 0.0, 1.0))
+        s = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
+        return self.yaw + self.yaw_rate * self.duration * s
 
     def pose(self, t: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
         raise NotImplementedError
@@ -178,15 +252,18 @@ class Maneuver:
 class Hover(Maneuver):
     kind = "hover"
 
-    def __init__(self, p0: Sequence[float], yaw: float = 0.0, duration: float = 2.0):
+    def __init__(self, p0: Sequence[float], yaw: float = 0.0, duration: float = 2.0,
+                 yaw_rate: float = 0.0):
         super().__init__()
         self.p0 = np.asarray(p0, dtype=np.float64)
         self.yaw = float(yaw)
+        self.yaw_rate = float(yaw_rate)
         self.duration = float(duration)
 
     def pose(self, t):
         a = np.zeros(3)
-        return self.p0.copy(), np.zeros(3), a, self.flat_attitude(a, self.yaw), 0.0, self.required_thrust(a)
+        return (self.p0.copy(), np.zeros(3), a,
+                self.flat_attitude(a, self._yaw(t)), 0.0, self.required_thrust(a))
 
 
 class WaypointTrajectory(Maneuver):
@@ -331,7 +408,166 @@ class FigureEight(Maneuver):
         p = np.array([0.0, 0.0, self.z0]) + e * lem
         v = de * lem + e * lem_v
         a = dde * lem + 2.0 * de * lem_v + e * lem_a
-        return p, v, a, self.flat_attitude(a, self.yaw), 0.0, self.required_thrust(a)
+        return p, v, a, self.flat_attitude(a, self._yaw(t)), 0.0, self.required_thrust(a)
+
+
+class Orbit(Maneuver):
+    """
+    Circular orbit, optionally climbing (a helix), with analytic derivatives.
+
+        p(t) = c + e(t) * (R cos(w t), R sin(w t), climb * t / T)
+
+    WHY THIS IS NOT JUST "ANOTHER PATH". A circle requires a constant inward centripetal
+    acceleration, so the flatness relation banks the reference by atan(R w^2 / g) and HOLDS
+    that bank for the whole manoeuvre. Every other trajectory here is level or only
+    transiently tilted, so a sustained banked attitude is a genuinely new regime - and it is
+    the one that loads the ROLL channel continuously rather than in bursts.
+
+    The settle envelope is essential rather than cosmetic: a circle is still travelling at
+    R*w when its period expires, so without damping it would hand an attitude and velocity
+    step to the terminal hover.
+    """
+
+    kind = "orbit"
+
+    def __init__(self, center: Sequence[float], radius: float, w: float, climb: float = 0.0,
+                 turns: float = 1.0, yaw: float = 0.0, yaw_rate: float = 0.0,
+                 settle: Optional[float] = None, duration: Optional[float] = None):
+        super().__init__()
+        self.center = np.asarray(center, dtype=np.float64)
+        self.R = float(radius)
+        self.w = float(w)
+        self.climb = float(climb)
+        self.yaw = float(yaw)
+        self.yaw_rate = float(yaw_rate)
+        # `duration` lets the caller fix the length and derive the angular rate from it.
+        # Sampling w directly instead forces a choice between very slow circles (a 2-turn
+        # orbit at w=0.7 runs 18 s) and counting discrete turns.
+        if duration is not None:
+            self.duration = float(duration)
+            self.w = float(turns * 2.0 * np.pi / max(1e-6, self.duration))
+        else:
+            self.duration = float(turns * 2.0 * np.pi / max(1e-6, abs(w)))
+        self.settle = float(min(0.35 * self.duration, 1.2) if settle is None else settle)
+
+    def pose(self, t):
+        w, R, T = self.w, self.R, max(1e-9, self.duration)
+        e, de, dde = _settle_envelope(t, self.duration, self.settle)
+        c, s = np.cos(w * t), np.sin(w * t)
+        base = np.array([R * c, R * s, self.climb * t / T])
+        base_v = np.array([-R * w * s, R * w * c, self.climb / T])
+        base_a = np.array([-R * w * w * c, -R * w * w * s, 0.0])
+        p = self.center + e * base
+        v = de * base + e * base_v
+        a = dde * base + 2.0 * de * base_v + e * base_a
+        return p, v, a, self.flat_attitude(a, self._yaw(t)), 0.0, self.required_thrust(a)
+
+
+class Lissajous(Maneuver):
+    """
+    General Lissajous figure, damped to rest by the shared C2 settle envelope.
+
+        x = e(t) A sin(a w t + phi),   y = e(t) B sin(b w t),   z = z0 + e(t) C sin(c w t)
+
+    `FigureEight` is the (a=1, b=2, phi=0, C=0) special case. Generalising it buys genuinely
+    different geometry - 1:3 loops, tilted and drifting patterns, a gentle altitude bob -
+    from the same code path, so the mixture stops containing one memorisable fixed shape.
+    """
+
+    kind = "lissajous"
+
+    def __init__(self, A: float, B: float, w: float, z0: float, a: float = 1.0, b: float = 2.0,
+                 phi: float = 0.0, C: float = 0.0, c: float = 2.0, cycles: float = 1.0,
+                 yaw: float = 0.0, yaw_rate: float = 0.0, settle: Optional[float] = None):
+        super().__init__()
+        self.A, self.B, self.w, self.z0 = float(A), float(B), float(w), float(z0)
+        self.a, self.b, self.phi, self.C, self.c = float(a), float(b), float(phi), float(C), float(c)
+        self.yaw = float(yaw)
+        self.yaw_rate = float(yaw_rate)
+        self.duration = float(cycles * 2.0 * np.pi / max(1e-6, abs(w)))
+        self.settle = float(min(0.35 * self.duration, 1.2) if settle is None else settle)
+
+    def pose(self, t):
+        w, ph = self.w, self.phi
+        e, de, dde = _settle_envelope(t, self.duration, self.settle)
+        args = np.array([self.a * w * t + ph, self.b * w * t, self.c * w * t])
+        amp = np.array([self.A, self.B, self.C if self.C != 0.0 else 0.0])
+        base = amp * np.sin(args)
+        base_v = amp * self.__freqs() * w * np.cos(args)
+        base_a = -amp * (self.__freqs() * w) ** 2 * np.sin(args)
+        off = np.array([0.0, 0.0, self.z0])
+        p = off + e * base
+        v = de * base + e * base_v
+        a = dde * base + 2.0 * de * base_v + e * base_a
+        return p, v, a, self.flat_attitude(a, self._yaw(t)), 0.0, self.required_thrust(a)
+
+    def __freqs(self) -> np.ndarray:
+        return np.array([self.a, self.b, self.c])
+
+
+class Slalom(Maneuver):
+    """
+    Weaving traverse: a straight run with a sinusoidal lateral weave, along a heading that
+    is deliberately NOT the direction of travel.
+
+        travel = u * dist * s(t/T)          s = quintic, zero velocity and accel at both ends
+        weave  = e(t) * n * A sin(w t)      e = settle envelope, C2 to zero
+
+    Exercises continuous ROLL REVERSAL: the lateral acceleration flips sign every half
+    period, so the reference bank rocks back and forth for the whole run. A figure-8 also
+    reverses, but on a closed path at constant speed; here the heading and the direction of
+    travel are independent, so the two channels must be tracked separately.
+
+    The travel term carries its OWN zero-velocity profile rather than riding the settle
+    envelope. Multiplying a traverse by a global envelope that decays to zero would drag it
+    back to where it started - a weave in place, not a traverse.
+    """
+
+    kind = "slalom"
+
+    def __init__(self, start: Sequence[float], heading: float, dist: float, A: float, w: float,
+                 z0: float, yaw: float = 0.0, yaw_rate: float = 0.0,
+                 settle: Optional[float] = None, cycles: float = 2.5,
+                 duration: Optional[float] = None):
+        super().__init__()
+        self.p0 = np.asarray(start, dtype=np.float64)
+        self.heading = float(heading)
+        self.dist = float(dist)
+        self.A = float(A)
+        self.w = float(w)
+        self.z0 = float(z0)
+        self.yaw = float(yaw)
+        self.yaw_rate = float(yaw_rate)
+        # Duration-driven, like Orbit. Deriving w from an explicit duration keeps the weave
+        # frequency tied to the episode length; clamping w instead collapsed every sample
+        # onto the same duration and silently removed the variation.
+        if duration is not None:
+            self.duration = float(duration)
+            self.w = float(cycles * 2.0 * np.pi / max(1e-6, self.duration))
+        else:
+            self.duration = float(np.clip(cycles * 2.0 * np.pi / max(1e-6, abs(w)), 2.5, 4.5))
+        self.settle = float(min(0.35 * self.duration, 1.2) if settle is None else settle)
+
+    def pose(self, t):
+        T = max(1e-9, self.duration)
+        u = float(t / T)
+        s = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
+        ds = (30.0 * u**2 - 60.0 * u**3 + 30.0 * u**4) / T
+        dds = (60.0 * u - 180.0 * u**2 + 120.0 * u**3) / (T * T)
+        e, de, dde = _settle_envelope(t, self.duration, self.settle)
+
+        u_vec = np.array([np.cos(self.heading), np.sin(self.heading), 0.0])
+        n_vec = np.array([-np.sin(self.heading), np.cos(self.heading), 0.0])
+        ph = self.w * t
+
+        off = np.array([self.p0[0], self.p0[1], self.z0])
+        p = off + u_vec * (self.dist * s) + e * (n_vec * (self.A * np.sin(ph)))
+        v = u_vec * (self.dist * ds) + de * (n_vec * (self.A * np.sin(ph))) \
+            + e * (n_vec * (self.A * self.w * np.cos(ph)))
+        a = u_vec * (self.dist * dds) + dde * (n_vec * (self.A * np.sin(ph))) \
+            + 2.0 * de * (n_vec * (self.A * self.w * np.cos(ph))) \
+            + e * (n_vec * (-self.A * self.w * self.w * np.sin(ph)))
+        return p, v, a, self.flat_attitude(a, self._yaw(t)), 0.0, self.required_thrust(a)
 
 
 class Flip(Maneuver):
@@ -508,7 +744,7 @@ class Trajectory:
     ignore, and cheap (two extra pose evaluations per sample).
     """
 
-    def __init__(self, maneuver: Maneuver, omega_dt: float = 0.001, tail: float = 0.6):
+    def __init__(self, maneuver: Maneuver, omega_dt: float = 0.001, tail: float = TRAJECTORY_TAIL):
         self.maneuver = maneuver
         self.maneuver_duration = float(maneuver.duration)
         self.tail = float(max(0.0, tail))
@@ -537,7 +773,6 @@ class Trajectory:
             return self.maneuver.pose(t)
         return (self._hold_p, np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64),
                 self._hold_R, self._hold_spin, self._hold_thrust)
-        self.h = float(omega_dt)
 
     def sample(self, t: float) -> Reference:
         t = float(np.clip(t, 0.0, self.duration))
@@ -565,12 +800,47 @@ class Trajectory:
 class TrajectoryConfig:
     """Sampling configuration for the manoeuvre mixture."""
 
+    # FLIGHT VOLUME.
+    #
+    # A sphere of radius `flight_radius` centred on the spawn point (0, 0, spawn_z). The
+    # sphere's natural bottom is spawn_z - flight_radius = -0.8 m, i.e. underground, so it
+    # is effectively CLIPPED AT THE GROUND - which is exactly 1.2 m below the start. That
+    # clip is the reason the spawn sits at the CENTRE of the volume rather than on its
+    # floor: with the pad on the boundary, any downward component of the initial-velocity
+    # randomisation would put the vehicle outside the volume on step 1.
+    spawn_z: float = 1.2
+    flight_radius: float = 2.0
+
+    # Where reference TARGETS may go. Every manoeuvre STARTS at spawn_z; only waypoint
+    # targets are allowed to climb. At the top of this range the sphere's horizontal
+    # allowance is still ~1.83 m, comfortably more than bounds_xy, so the whole reference
+    # stays inside the volume.
     bounds_xy: float = 1.0
-    z_range: Tuple[float, float] = (1.0, 1.8)
+    z_range: Tuple[float, float] = (1.2, 2.0)
+
+    # Top of the sphere: spawn_z + flight_radius. Used to screen flip altitude excursions.
+    z_max: float = 3.2
+
+    # Weights are over DRAWS, not over accepted episodes: a manoeuvre that is rejected more
+    # often is under-represented in the realised mixture. Flips still reject ~32% of draws
+    # (almost all the k=2 doubles, whose altitude excursion is 4x the single and does not
+    # fit inside a 2 m sphere), so the flip weight is set ABOVE its intended share to
+    # compensate. Measured realised mixture at these weights is printed by
+    # scratch/check_trajectories.py.
     weights: dict = field(default_factory=lambda: {
-        "hover": 0.15, "waypoints": 0.35, "figure8": 0.25, "flip": 0.25,
+        "hover": 0.10, "waypoints": 0.16, "figure8": 0.08, "lissajous": 0.11,
+        "orbit": 0.14, "slalom": 0.12, "flip": 0.29,
     })
     max_resample: int = 40
+
+    # Episode length the reference must fit inside, in seconds. The env (train.py:
+    # EPISODE_SECONDS) truncates at this horizon, so a manoeuvre that outlives it gets cut
+    # mid-flight - which would break the "every episode ends in the terminal hover"
+    # property the reward and the truncation bootstrap rely on. The env sets this from its
+    # own episode_seconds at construction; the value here is only the standalone default.
+    # FigureEight and Lissajous derive their duration from their angular frequency, so the
+    # sampler floors that frequency at 2*pi / (episode_seconds - TRAJECTORY_TAIL).
+    episode_seconds: float = 8.0
     # Action-scaling limits of QuadFlipEnv, mirrored here so the sampler never emits a
     # reference the policy is structurally unable to follow. These are POLICY ACTION
     # SCALES, not physical limits; the physical ceilings are much higher (the rate loop
@@ -609,18 +879,19 @@ class TrajectorySampler:
             p0, axis=axis, rotations=k, coast=coast,
             yaw=yaw, mass=mass, max_rate=limit, rate_frac=rate_frac,
         )
-        return fl if fl.is_feasible() else None
+        # Screen against the REAL top of the flight volume, not the old hardcoded 2.40 m.
+        return fl if fl.is_feasible(z_max=self.cfg.z_max) else None
 
     def sample(self, rng: np.random.Generator, mass: float = MASS_NOMINAL,
                kind: Optional[str] = None) -> Trajectory:
         """
         Draw a feasible trajectory.
 
-        `kind` pins the manoeuvre to one of the config weights ("hover", "waypoints",
-        "figure8", "flip") for the high-level command interface; None samples from the
-        mixture. In both cases the result is guaranteed feasible, and every manoeuvre is
-        constructed to END IN A HOVER: hover trivially, waypoints and flips by their zero
-        terminal velocity, figure-8 via its settle envelope.
+        `kind` pins the manoeuvre to one of the config weights (any key of cfg.weights)
+        for the high-level command interface; None samples from the mixture. In both cases
+        the result is guaranteed feasible AND guaranteed to finish inside one episode, so
+        every manoeuvre ENDS IN A HOVER: hover trivially, waypoints and flips by their zero
+        terminal velocity, figure-8 and lissajous via their settle envelope.
         """
         kinds = list(self.cfg.weights.keys())
         probs = np.array([self.cfg.weights[k] for k in kinds], dtype=np.float64)
@@ -628,9 +899,18 @@ class TrajectorySampler:
         if kind is not None and kind not in kinds:
             raise ValueError(f"unknown manoeuvre {kind!r}; expected one of {kinds}")
 
+        # Highest angular frequency whose whole manoeuvre (plus the terminal-hold tail)
+        # still fits the episode. Only the duration-from-w families use it, but the screen
+        # at the bottom of the loop checks every family.
+        min_w = 2.0 * np.pi / max(1e-6, self.cfg.episode_seconds - TRAJECTORY_TAIL)
+
         for _ in range(self.cfg.max_resample):
             chosen = kind if kind is not None else str(rng.choice(kinds, p=probs))
-            z0 = float(rng.uniform(*self.cfg.z_range))
+            # EVERY manoeuvre starts at the same altitude, which is also the CENTRE of the
+            # flight sphere. Starting at the centre is what gives the initial-velocity
+            # randomisation equal room in every direction; starting on the floor of the
+            # volume would make any downward kick an immediate violation.
+            z0 = float(self.cfg.spawn_z)
             p0 = np.array([
                 rng.uniform(-self.cfg.bounds_xy, self.cfg.bounds_xy),
                 rng.uniform(-self.cfg.bounds_xy, self.cfg.bounds_xy),
@@ -639,7 +919,10 @@ class TrajectorySampler:
             yaw = float(rng.uniform(-np.pi, np.pi))
 
             if chosen == "hover":
-                traj = Trajectory(Hover(p0, yaw, duration=float(rng.uniform(1.5, 3.0))))
+                traj = Trajectory(Hover(
+                    p0, yaw, duration=float(rng.uniform(1.5, 3.0)),
+                    yaw_rate=float(rng.uniform(-1.5, 1.5)),
+                ))
             elif chosen == "waypoints":
                 n = int(rng.integers(3, 5))
                 wps = [p0] + [
@@ -652,11 +935,47 @@ class TrajectorySampler:
                 ]
                 traj = Trajectory(WaypointTrajectory(wps, segment_time=float(rng.uniform(0.9, 1.6)), yaw=yaw))
             elif chosen == "figure8":
-                w = float(rng.uniform(0.8, 1.8))
+                w = max(float(rng.uniform(0.8, 1.8)), min_w)
                 traj = Trajectory(FigureEight(
                     A=float(rng.uniform(0.2, 0.4)),
                     B=float(rng.uniform(0.2, 0.4)),
                     w=w, z0=z0, cycles=1.0, yaw=0.0,
+                ))
+            elif chosen == "orbit":
+                # Centred on the world origin (not on the random p0) so the whole circle
+                # stays well inside the flight sphere for ANY radius drawn.
+                traj = Trajectory(Orbit(
+                    center=[0.0, 0.0, z0],
+                    radius=float(rng.uniform(0.25, 0.55)),
+                    w=1.2,
+                    climb=float(rng.uniform(-0.20, 0.30)),
+                    turns=float(rng.choice([1.0, 1.0, 2.0])),
+                    yaw=yaw, yaw_rate=float(rng.uniform(-1.2, 1.2)),
+                    duration=float(rng.uniform(3.5, 7.0)),
+                ))
+            elif chosen == "lissajous":
+                traj = Trajectory(Lissajous(
+                    A=float(rng.uniform(0.15, 0.35)),
+                    B=float(rng.uniform(0.15, 0.35)),
+                    w=max(float(rng.uniform(0.7, 1.7)), min_w), z0=z0,
+                    a=float(rng.choice([1.0, 1.0, 2.0])),
+                    b=float(rng.choice([2.0, 3.0])),
+                    phi=float(rng.uniform(0.0, np.pi)),
+                    C=float(rng.uniform(0.0, 0.12)),
+                    yaw=yaw, yaw_rate=float(rng.uniform(-1.0, 1.0)),
+                ))
+            elif chosen == "slalom":
+                heading = float(rng.uniform(-np.pi, np.pi))
+                dist = float(rng.uniform(0.5, 1.2))
+                u_vec = np.array([np.cos(heading), np.sin(heading), 0.0])
+                # Start offset so the traverse is CENTRED on the origin, which keeps the
+                # whole path inside the flight sphere whatever heading was drawn.
+                traj = Trajectory(Slalom(
+                    start=-u_vec * (dist * 0.5), heading=heading, dist=dist,
+                    A=float(rng.uniform(0.12, 0.30)), w=2.0, z0=z0,
+                    yaw=yaw, yaw_rate=float(rng.uniform(-1.0, 1.0)),
+                    cycles=float(rng.choice([2.0, 2.5, 3.0])),
+                    duration=float(rng.uniform(2.5, 4.0)),
                 ))
             else:
                 fl = self._make_flip(rng, p0, yaw, mass)
@@ -682,6 +1001,19 @@ class TrajectorySampler:
                 rate = max(float(np.linalg.norm(r.omega)) for r in refs)
                 if rate > 0.95 * max(self.cfg.rate_limits.values()):
                     continue
+                # VOLUME SCREEN. The reference must stay inside the flight sphere with
+                # margin, or the policy would be asked to track a path that leaves the
+                # arena - the drone would be terminated for doing exactly what it was told.
+                offset = np.array([0.0, 0.0, self.cfg.spawn_z])
+                furthest = max(float(np.linalg.norm(r.p - offset)) for r in refs)
+                if furthest > 0.85 * self.cfg.flight_radius:
+                    continue
+
+            # EPISODE-LENGTH SCREEN. Checked for every family (the flip branch returns
+            # before the screen above), because a reference that outlives the episode is
+            # truncated mid-manoeuvre and never reaches its terminal hover.
+            if traj.duration > self.cfg.episode_seconds:
+                continue
             return traj
 
         # Fallback: a trivially feasible hold at the nominal altitude.

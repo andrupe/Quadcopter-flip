@@ -29,8 +29,8 @@ from trajectories import Reference, Trajectory, TrajectoryConfig, TrajectorySamp
 # ======================================================================================
 # ENVIRONMENT CONFIGURATION
 # ======================================================================================
-TARGET_ALTITUDE: float = 1.2         # Target hover altitude post-flip (meters)
-TARGET_ALTITUDE_FLIP: float = 1.6   # Target pre-flip climb altitude (meters: +25cm upward punch)
+# Nominal spawn altitude. This is the same quantity as SPAWN_Z below (the centre of the
+# flight volume and the altitude every sampled manoeuvre starts from); keep them equal.
 SPAWN_ALTITUDE: float = 1.2          # Quadcopter spawn altitude (meters)
 SIM_DT: float = 0.01                 # Timestep in seconds (0.01s = 10ms -> 100 Hz)
 
@@ -48,12 +48,13 @@ PITCH_DIRECTION: float = 1.0         # +1.0 for front-flip, -1.0 for back-flip
 FLIP_THRESHOLD: float = 2.0 * np.pi  # Rotation angle required for a full 360° pitch flip
 # ======================================================================================
 # OBSERVATION LAYOUT
-#   env obs vector : [ o_t (17) | aux (4) | privileged (44) ]                  = 65 dims
-#   vec obs vector : [ o_t (17) | z (16) | aux (4) | privileged (44) ]         = 81 dims
+#   env obs vector : [ o_t (29) | aux (4) | privileged (44) ]                  = 77 dims
+#   vec obs vector : [ o_t (29) | z (16) | aux (4) | privileged (44) ]         = 93 dims
 #                    (the z block is injected by LatentObsWrapper, in the trainer process)
-# The actor consumes only the first ACTOR_SINGLE_OBS_DIM + z dims = 33; the critic
-# consumes the whole vector. `aux` carries the encoder-only sensors (specific force,
-# battery voltage) and must NOT be visible to the actor.
+# The actor consumes only the first ACTOR_SINGLE_OBS_DIM (+ z when the encoder is
+# attached) dims = 29 or 45; the critic consumes the whole vector. `aux` carries the
+# encoder-only sensors (specific force, battery voltage) and must NOT be visible to the
+# actor.
 # ======================================================================================
 OBS_HISTORY_LEN: int = 1             # Stacked actor frames. 1 = single frame; the causal history
                                      # encoder subsumes the old 3-frame (30ms) stack.
@@ -150,11 +151,26 @@ OBS_NOISE_ACCEL_RANGE: tuple = (0.02, 0.12)       # m/s^2
 # cannot serve the whole repertoire: 0.12 m of position error is a near-miss in a hover
 # and a rounding error during a 360 deg flip. Keying them on kind keeps one formula while
 # letting the flip be graded on the scale the flip actually operates at.
+#
+# EVERY kind emitted by TrajectorySampler must appear here - a missing key silently falls
+# back to the hover set, which for a flying manoeuvre is the tightest scale in the table.
+# orbit / lissajous / slalom did exactly that until 2026-09-11: the scripted geometric
+# controller scored 60-64% of the per-step maximum on them against the solvability floor,
+# with the position kernel sitting near its saturated flat region for realistic errors.
+# They now take the waypoints/figure8 velocity, attitude and rate tolerances (same
+# dynamic class) with position one notch looser (0.30 m), because they roam over the
+# largest extent of the smooth set (orbit radius up to 0.55 m, slalom traverse up to
+# 1.2 m). Measured with the scripted controller: 77-84%, in band with the other
+# families, vs 74-75% at 0.25 m and 60-64% under the hover fallback.
+# check_env_tracking.py section B asserts the coverage.
 # ======================================================================================
 TRACK_TOL: dict = {
     "hover":     {"pos": 0.12, "vel": 0.25, "att": 0.20, "rate": 1.2},
     "waypoints": {"pos": 0.25, "vel": 0.60, "att": 0.30, "rate": 2.5},
     "figure8":   {"pos": 0.25, "vel": 0.60, "att": 0.30, "rate": 2.5},
+    "orbit":     {"pos": 0.30, "vel": 0.60, "att": 0.30, "rate": 2.5},
+    "lissajous": {"pos": 0.30, "vel": 0.60, "att": 0.30, "rate": 2.5},
+    "slalom":    {"pos": 0.30, "vel": 0.60, "att": 0.30, "rate": 2.5},
     "flip":      {"pos": 0.35, "vel": 1.20, "att": 0.55, "rate": 6.0},
 }
 TRACK_W_POS: float = 3.0
@@ -162,12 +178,27 @@ TRACK_W_VEL: float = 1.0
 TRACK_W_ATT: float = 2.0
 TRACK_W_RATE: float = 0.8
 
-# ARENA. The tracking task is bounded by the trajectories the sampler can build, so the
-# arena only needs to be a generous outer guard against the policy flying away, not a
-# curriculum. It is no longer shrunk over training.
-ARENA_RADIUS: float = 3.0            # meters, hard outer guard
-Z_MIN_SAFE: float = 0.25             # meters, ground-crash threshold for termination
-Z_MAX_SAFE: float = 2.45             # meters, ceiling-breach threshold for termination
+# ======================================================================================
+# FLIGHT VOLUME  (mirror of TrajectoryConfig in trajectories.py - keep in step)
+#
+# A sphere of radius FLIGHT_RADIUS centred on the FIXED world point (0, 0, SPAWN_Z).
+#
+# Everything starts at SPAWN_Z, which is the sphere's CENTRE. That is deliberate and is
+# what makes the initial-state randomisation survivable: the sphere's natural bottom is
+# SPAWN_Z - FLIGHT_RADIUS = -0.8 m, i.e. underground, so it is effectively clipped by the
+# ground at exactly 1.2 m below the start point. Spawning on the floor of the volume
+# instead would make ANY downward component of the initial kick an immediate violation.
+# ======================================================================================
+SPAWN_Z: float = 1.2                 # metres; every manoeuvre starts here
+FLIGHT_RADIUS: float = 2.0           # metres; hard outer boundary, centred on the spawn
+VOLUME_CENTER: tuple = (0.0, 0.0, SPAWN_Z)
+
+# INITIAL KICK. The vehicle starts at the centre of the volume with an arbitrary
+# TRANSLATIONAL and ROTATIONAL velocity, so the policy has to recover from a disturbed
+# start rather than from the trim condition. Both are (dr=0, dr=1) envelopes and are
+# applied per axis, so the kick can point in any direction - including straight down.
+INIT_VEL_RANGE: tuple = (0.10, 0.60)     # m/s per axis
+INIT_RATE_RANGE: tuple = (0.15, 1.50)    # rad/s per axis
 
 # Smoothness and Deadband Parameters
 TOL_ACTION_SMOOTH: float = 0.33      # 1st-order action rate norm tolerance (~1,300 RPM / step)
@@ -179,7 +210,8 @@ TERMINATION_PENALTY: float = 30.0    # reward subtracted on a crash / divergence
 class QuadFlipEnv(gym.Env):
     """
     Quadcopter Gymnasium Environment backed by MuJoCo physics.
-    Task: Execute an acrobatic 360° pitch flip and recover to precision hover.
+    Task: track a sampled reference trajectory (hover / waypoints / figure-8 / orbit /
+    lissajous / slalom / 360 deg flip) and recover to the terminal hover.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -189,7 +221,6 @@ class QuadFlipEnv(gym.Env):
         action_mode: str = ACTION_MODE,
         episode_seconds: float = EPISODE_SECONDS,
         dt: float = SIM_DT,
-        target_altitude: float = TARGET_ALTITUDE,
         spawn_altitude: float = SPAWN_ALTITUDE,
         obs_noise: bool = OBS_NOISE,
         random_wind: bool = RANDOM_WIND,
@@ -201,16 +232,16 @@ class QuadFlipEnv(gym.Env):
         motor_tau: float = MOTOR_TAU,
         pitch_direction: float = PITCH_DIRECTION,
         arena_radius: Optional[float] = None,
-        arena_radius_start: float = ARENA_RADIUS,
-        arena_radius_end: float = ARENA_RADIUS,
+        arena_radius_start: float = FLIGHT_RADIUS,
+        arena_radius_end: float = FLIGHT_RADIUS,
         curriculum_arena: bool = True,
-        hover_gain: float = 1.0,
         trajectory_config: Optional[TrajectoryConfig] = None,
         lighthouse_config: Optional[LighthouseConfig] = None,
         maneuver: Optional[str] = None,
         rate_pid_kp: Optional[Union[np.ndarray, list, float]] = None,
         rate_pid_ki: Optional[Union[np.ndarray, list, float]] = None,
         rate_pid_kd: Optional[Union[np.ndarray, list, float]] = None,
+        telemetry: bool = True,
     ):
         super().__init__()
 
@@ -219,7 +250,6 @@ class QuadFlipEnv(gym.Env):
         self.dt = float(dt)
         self.episode_seconds = float(episode_seconds)
         self.max_steps = int(np.ceil(self.episode_seconds / self.dt))
-        self.target_altitude = float(target_altitude)
         self.spawn_altitude = float(spawn_altitude)
         self.obs_noise = bool(obs_noise)
         self.random_initial_state = bool(random_initial_state)
@@ -235,12 +265,14 @@ class QuadFlipEnv(gym.Env):
         # The tracking task is bounded by the trajectories the sampler can build, so the
         # arena is now a fixed outer guard rather than a shrinking curriculum. The
         # curriculum parameters are still accepted so existing callers keep working, but
-        # they no longer drive anything.
+        # they no longer drive anything, and `arena_radius` is diagnostic only - the
+        # termination test below uses the FIXED flight sphere (flight_radius).
         self.arena_radius_start = float(arena_radius_start)
         self.arena_radius_end = float(arena_radius_end)
         self.curriculum_arena = False
-        self.arena_radius = float(arena_radius) if arena_radius is not None else ARENA_RADIUS
-        self.hover_gain = float(hover_gain)
+        self.arena_radius = float(arena_radius) if arena_radius is not None else FLIGHT_RADIUS
+        self.flight_radius = FLIGHT_RADIUS
+        self.volume_center = np.array(VOLUME_CENTER, dtype=np.float64)
 
         # Trajectory tracking: the reference generator, the Lighthouse sensor model, and
         # the current reference sample. `maneuver` pins a fixed high-level command; None
@@ -271,6 +303,14 @@ class QuadFlipEnv(gym.Env):
         self.obs_history_len: int = OBS_HISTORY_LEN
         self.obs_history_buffer: list[np.ndarray] = []
         self.dr_level: float = 0.0
+        # TRAINING FAST PATH. When False, `step()` returns an empty info dict instead of
+        # the ~35-key telemetry dict. Nothing in the PPO path reads those keys - SB3's
+        # worker adds `terminal_observation` and `TimeLimit.truncated` itself and the
+        # Monitor wrapper adds the `episode` statistics - but building them costs ~40 us
+        # of worker time per step and a 2.7 KB pickle through the worker pipe. Evaluation
+        # and all diagnostics scripts construct the env with the default (True), so no
+        # consumer changes. Set False in train.py's env factory only.
+        self.telemetry = bool(telemetry)
         # Multiplies dr_level for the *randomization samplings only*, so the frozen
         # history encoder can be pretrained on a wider envelope than PPO will ever
         # visit. set_dr_level() clips to [0, 1], so the headroom cannot be expressed
@@ -300,7 +340,11 @@ class QuadFlipEnv(gym.Env):
         #     leaves the rate loop real headroom before the signal saturates;
         #   - available angular acceleration is torque/inertia = 0.01 / 1.43e-5 ~ 700
         #     rad/s^2, so 20 rad/s is reached in ~0.03 s - comfortably inside the 1 kHz
-        #     inner loop, which is therefore never asked to track something it cannot;
+        #     inner loop, which is therefore never asked to track something it cannot.
+        #     That figure is only true while the COMPILED body inertia equals the intended
+        #     diagonal: MuJoCo silently replaces a tensor that violates the rigid-body
+        #     triangle inequality (Ixx+Iyy >= Izz) with an isotropic average, which cost
+        #     ~35% here once. quadFiles/quad_mujoco.py now checks it at construction;
         #   - a 360 deg flip needs >= 2*pi/20 = 0.31 s of rotation, which fits inside the
         #     ballistic coast the altitude budget allows.
         #
@@ -311,8 +355,12 @@ class QuadFlipEnv(gym.Env):
         self.max_rate_pitch: float = 20.0   # Max pitch rate (rad/s)
         self.max_rate_z: float = 4.0        # Max yaw rate (rad/s); yaw authority is far lower
 
-        # Keep the sampler's notion of authority in step with the command scales above.
+        # Keep the sampler's notion of authority in step with the command scales above,
+        # and its notion of an episode with this env's: a reference that outlives the
+        # episode would be truncated mid-manoeuvre, breaking the "every episode ends in
+        # the terminal hover" property the reward and the truncation bootstrap rely on.
         self.traj_cfg.rate_limits = {"roll": self.max_rate_xy, "pitch": self.max_rate_pitch}
+        self.traj_cfg.episode_seconds = float(self.episode_seconds)
 
         # Normalized hover-trim throttle command: a0 = 2*m_nom*g/maxThr - 1 (~ -0.0844).
         # Used as the "prior action" fiction at reset so that pretraining cold-start
@@ -336,6 +384,7 @@ class QuadFlipEnv(gym.Env):
         # part of the objective, which now scores tracking error only.
         self.initial_pos = np.array([0.0, 0.0, self.spawn_altitude], dtype=np.float32)
         self.accumulated_pitch: float = 0.0
+        self.accumulated_roll: float = 0.0
         self.total_pitch_rotated: float = 0.0
         self.reached_90: bool = False
         self.has_inverted: bool = False
@@ -624,7 +673,7 @@ class QuadFlipEnv(gym.Env):
     def get_priv_targets(self) -> np.ndarray:
         """
         Physics regression targets for history-encoder supervision, in SI units and in
-        the order given by PRIV_TARGET_GROUPS (PRIV_TARGET_DIM = 32 dims).
+        the order given by PRIV_TARGET_GROUPS (PRIV_TARGET_DIM = 29 dims).
 
         All quantities are ground truth read straight off the plant, so this must never
         be called on the real vehicle - it exists only for pretraining and for on-policy
@@ -703,7 +752,7 @@ class QuadFlipEnv(gym.Env):
     def get_actor_obs(self) -> np.ndarray:
         return np.concatenate(self.obs_history_buffer, dtype=np.float32)
 
-    def _get_stacked_obs(self) -> np.ndarray:
+    def _get_stacked_obs(self, privileged_critic: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Env observation vector: [ stacked actor frames | delayed encoder aux | privileged ].
 
@@ -714,18 +763,24 @@ class QuadFlipEnv(gym.Env):
         The aux is latency-delayed to match the actor frames - an undelayed
         accelerometer would give the encoder an unrealistic peek at the current
         state that no real airframe provides.
+
+        `privileged_critic` may be supplied by a caller that has already computed this
+        instant's privileged block. `step()` needs it twice (once for the observation and
+        once for the telemetry dict) and it is the most expensive block to assemble, so
+        it is built once there and passed to both.
         """
         stacked_actor = np.concatenate(self.obs_history_buffer, dtype=np.float32)
-        privileged_critic = self._compute_privileged_critic_obs()
+        if privileged_critic is None:
+            privileged_critic = self._compute_privileged_critic_obs()
         return np.concatenate([stacked_actor, self._aux_delayed, privileged_critic], dtype=np.float32)
 
     def get_encoder_frame(self) -> np.ndarray:
         """
-        The single encoder input frame at the current step: [o_t (17) | aux_t (4)].
+        The single encoder input frame at the current step: [o_t (29) | aux_t (4)].
 
         o_t already carries the POST-EMA action applied at t-1 in its prev_action
         slots, so no separate action channel is needed - adding one would be a
-        provable duplicate of obs[12:16] one step earlier.
+        provable duplicate of obs[13:17] one step earlier.
         """
         return np.concatenate([
             self.obs_history_buffer[-1],
@@ -804,15 +859,17 @@ class QuadFlipEnv(gym.Env):
         if not np.all(np.isfinite(self.quad.state)):
             self.termination_reason = "divergent_state"
             return True
-        if float(np.linalg.norm(self.quad.pos[:2])) > self.arena_radius:
-            self.termination_reason = "arena_breach"
+
+        # Outside the flight sphere. Measured against the FIXED world centre, so the volume
+        # is a property of the arena and not of where this episode happened to spawn.
+        d = self.quad.pos - self.volume_center
+        if float(np.dot(d, d)) > self.flight_radius ** 2:
+            self.termination_reason = "out_of_volume"
             return True
-        if self.quad.pos[2] > Z_MAX_SAFE:
-            self.termination_reason = "ceiling_breach"
-            return True
-        if self.quad.pos[2] < Z_MIN_SAFE:
-            self.termination_reason = "ground_crash"
-            return True
+
+        # The ground. Note the sphere alone would NOT catch this: its bottom is at
+        # -0.8 m, below the floor, so ground contact is what actually enforces the
+        # 1.2 m bottom of the operating region.
         if self.quad.check_ground_contact():
             self.termination_reason = "ground_crash"
             return True
@@ -850,6 +907,7 @@ class QuadFlipEnv(gym.Env):
         self.prev_action = self.hover_trim_action.copy()
         self.prev_prev_action = self.hover_trim_action.copy()
         self.accumulated_pitch = 0.0
+        self.accumulated_roll = 0.0
         self.total_pitch_rotated = 0.0
         self.reached_90 = False
         self.has_inverted = False
@@ -986,10 +1044,12 @@ class QuadFlipEnv(gym.Env):
 
         # Spawn at the REFERENCE attitude, not at level.
         #
-        # The reference is level in TILT at t = 0 for every manoeuvre, but its YAW is
-        # randomised per episode. Spawning level therefore starts the episode with a
-        # heading error equal to that yaw - up to 180 deg of attitude error the policy can
-        # do nothing about, charged against the attitude kernel and blamed on the policy.
+        # The reference is level in TILT at t = 0 for some manoeuvres but not all: an
+        # Orbit is already BANKED at t = 0 (a circle needs a constant centripetal
+        # acceleration from the first instant) and a Lissajous with a phase offset is
+        # tilted too. Its YAW is randomised on top of that. Spawning level would therefore
+        # start the episode with a heading and bank error the policy can do nothing about,
+        # charged against the attitude kernel and blamed on the policy.
         base_quat = self._dcm_to_quat(ref0.R)
         if self.random_initial_att:
             att_rp = 0.05 + dr * 0.12
@@ -1009,11 +1069,10 @@ class QuadFlipEnv(gym.Env):
         self.quad.reset(pos=spawn_pos, quat=spawn_quat, thrust_scale=thrust_scale)
 
         if self.random_initial_vel:
-            vel_lin = max(0.08, 0.05 + dr * 0.15)
-            vel_ang = max(0.12, 0.10 + dr * 0.35)
-            # Spawn on the reference VELOCITY too, not at rest. Figure-8 starts at
-            # v = (A*w, B*w, 0) rather than zero, so a rest spawn would inject a large
-            # initial error that has nothing to do with the policy's behaviour.
+            vel_lin = INIT_VEL_RANGE[0] + dr * (INIT_VEL_RANGE[1] - INIT_VEL_RANGE[0])
+            vel_ang = INIT_RATE_RANGE[0] + dr * (INIT_RATE_RANGE[1] - INIT_RATE_RANGE[0])
+            # Spawn on the reference's initial VELOCITY, then add the kick. The reference
+            # has v = 0 at t = 0 for every manoeuvre, so this is the kick alone in practice.
             self.quad.data.qvel[0:3] = ref0.v + self.np_random.uniform(-vel_lin, vel_lin, size=3)
             self.quad.data.qvel[3:6] = ref0.omega + self.np_random.uniform(-vel_ang, vel_ang, size=3)
             mujoco.mj_forward(self.quad.model, self.quad.data)
@@ -1055,7 +1114,7 @@ class QuadFlipEnv(gym.Env):
             "spawn_pos": self.spawn_pos.copy(),
             "spawn_vel": self.spawn_vel.copy(),
             "accumulated_pitch": self.accumulated_pitch,
-            "accumulated_roll": self.accumulated_pitch,
+            "accumulated_roll": self.accumulated_roll,
             "total_pitch_rotated": self.total_pitch_rotated,
             "termination_reason": self.termination_reason,
             "has_inverted": self.has_inverted,
@@ -1095,14 +1154,16 @@ class QuadFlipEnv(gym.Env):
                 action[2] * self.max_rate_pitch,
                 action[3] * self.max_rate_z,
             ], dtype=np.float64)
-            # Step MuJoCo physics with sub-stepping Rate PID
+            # The gyro bias is a hardware property, not a sensor-noise option: the rate
+            # loop must see the same biased measurement the actor does. Gating it on
+            # obs_noise made the two disagree about the vehicle's own body rate.
             self.quad.update(
                 t=self.t,
                 dt=self.dt,
                 wind=self.wind,
                 rate_cmd=(throttle_cmd, omega_des_cmd),
                 rate_pid=self.rate_pid,
-                gyro_bias=self.gyro_bias if self.obs_noise else None,
+                gyro_bias=self.gyro_bias,
             )
             motor_cmd = self.quad.last_motor_cmd.copy()
         elif self.action_mode == "thrust_moment":
@@ -1137,8 +1198,10 @@ class QuadFlipEnv(gym.Env):
         # because the evaluation and benchmark scripts report them as a measure of what
         # the aircraft physically did, which is still the fastest way to see a flip fail.
         delta_pitch = float(self.pitch_direction * self.quad.omega[1] * self.dt)
+        delta_roll = float(self.quad.omega[0] * self.dt)
         self.total_pitch_rotated += max(0.0, delta_pitch)
         self.accumulated_pitch = min(FLIP_THRESHOLD, max(0.0, self.accumulated_pitch + delta_pitch))
+        self.accumulated_roll = min(FLIP_THRESHOLD, max(0.0, self.accumulated_roll + delta_roll))
         if not self.flip_completed and self.accumulated_pitch >= FLIP_THRESHOLD:
             self.flip_completed = True
             self.flip_completed_time = float(self.t)
@@ -1163,7 +1226,11 @@ class QuadFlipEnv(gym.Env):
         self.obs_history_buffer.append(delayed_obs)
         if len(self.obs_history_buffer) > self.obs_history_len:
             self.obs_history_buffer.pop(0)
-        stacked_obs = self._get_stacked_obs()
+        # Assembled once and shared with the telemetry dict below. Both describe the same
+        # instant (nothing in between mutates the plant), and this is the most expensive
+        # block of the observation, so recomputing it would be pure overhead.
+        privileged_critic = self._compute_privileged_critic_obs()
+        stacked_obs = self._get_stacked_obs(privileged_critic)
 
         reward = self._compute_reward(action, delta_pitch)
         terminated = self._check_termination()
@@ -1177,41 +1244,47 @@ class QuadFlipEnv(gym.Env):
         if terminated:
             reward -= TERMINATION_PENALTY
 
-        info = {
-            "t": float(self.t),
-            "target_state": self.target_state.copy(),
-            "position": self.quad.pos.copy(),
-            "velocity": self.quad.vel.copy(),
-            "quat": self.quad.quat.copy(),
-            "omega": self.quad.omega.copy(),
-            "omega_des": omega_des_cmd.copy(),
-            "throttle": float(throttle_cmd),
-            "motor_cmd": motor_cmd.copy(),
-            "spawn_pos": self.spawn_pos.copy(),
-            "spawn_vel": self.spawn_vel.copy(),
-            "accumulated_pitch": self.accumulated_pitch,
-            "accumulated_roll": self.accumulated_pitch,
-            "total_pitch_rotated": self.total_pitch_rotated,
-            "termination_reason": self.termination_reason,
-            "arena_radius": float(self.arena_radius),
-            "reached_90": self.reached_90,
-            "has_inverted": self.has_inverted,
-            "flip_completed": self.flip_completed,
-            "maneuver": (self.traj.maneuver.kind if self.traj is not None else "none"),
-            "reference_position": (self.ref.p.copy() if self.ref is not None else self.quad.pos.copy()),
-            "reference_velocity": (self.ref.v.copy() if self.ref is not None else self.quad.vel.copy()),
-            "lighthouse_fix": bool(self.lighthouse.fix_available),
-            "lighthouse_visible": int(self.lighthouse.n_visible),
-            "lighthouse_outage_s": float(self.lighthouse.outage_t),
-            "lighthouse_drift_m": float(np.linalg.norm(self.lighthouse.p_est - self.quad.pos)),
-            "actor_obs": self.get_actor_obs(),
-            "privileged_obs": self._compute_privileged_critic_obs(),
-            "stock_obs": self._compute_stock_obs(),
-            "single_obs": delayed_obs.copy(),
-            "encoder_frame": self.get_encoder_frame(),
-            "dr_eff": float(self.dr_eff),
-            "active_disturbances": self.active_disturbances,
-        }
+        if self.telemetry:
+            info = {
+                "t": float(self.t),
+                "target_state": self.target_state.copy(),
+                "position": self.quad.pos.copy(),
+                "velocity": self.quad.vel.copy(),
+                "quat": self.quad.quat.copy(),
+                "omega": self.quad.omega.copy(),
+                "omega_des": omega_des_cmd.copy(),
+                "throttle": float(throttle_cmd),
+                "motor_cmd": motor_cmd.copy(),
+                "spawn_pos": self.spawn_pos.copy(),
+                "spawn_vel": self.spawn_vel.copy(),
+                "accumulated_pitch": self.accumulated_pitch,
+                "accumulated_roll": self.accumulated_roll,
+                "total_pitch_rotated": self.total_pitch_rotated,
+                "termination_reason": self.termination_reason,
+                "arena_radius": float(self.arena_radius),
+                "reached_90": self.reached_90,
+                "has_inverted": self.has_inverted,
+                "flip_completed": self.flip_completed,
+                "maneuver": (self.traj.maneuver.kind if self.traj is not None else "none"),
+                "reference_position": (self.ref.p.copy() if self.ref is not None else self.quad.pos.copy()),
+                "reference_velocity": (self.ref.v.copy() if self.ref is not None else self.quad.vel.copy()),
+                "lighthouse_fix": bool(self.lighthouse.fix_available),
+                "lighthouse_visible": int(self.lighthouse.n_visible),
+                "lighthouse_outage_s": float(self.lighthouse.outage_t),
+                "lighthouse_drift_m": float(np.linalg.norm(self.lighthouse.p_est - self.quad.pos)),
+                "actor_obs": self.get_actor_obs(),
+                "privileged_obs": privileged_critic,
+                "stock_obs": self._compute_stock_obs(),
+                "single_obs": delayed_obs.copy(),
+                "encoder_frame": self.get_encoder_frame(),
+                "dr_eff": float(self.dr_eff),
+                "active_disturbances": self.active_disturbances,
+            }
+        else:
+            # Training fast path (see the `telemetry` note in __init__): the PPO path reads
+            # no env info key, and an empty dict is what SB3 fills with
+            # `terminal_observation` / `TimeLimit.truncated` in the worker process.
+            info = {}
 
         # Shift action history for 2nd-order difference
         self.prev_prev_action = self.prev_action.copy()
@@ -1227,7 +1300,7 @@ CustomQuadEnv = QuadFlipEnv
 if __name__ == "__main__":
     env = QuadFlipEnv()
     obs, info = env.reset()
-    print("✓ QuadFlipEnv (Pitch Flip with Two-Phase Exponential Reward) initialized!")
+    print("✓ QuadFlipEnv (trajectory tracking) initialized!")
     print(f"  Observation shape : {obs.shape}")
     print(f"  Action shape      : {env.action_space.shape}")
     print(f"  Target state      : {info['target_state']}")

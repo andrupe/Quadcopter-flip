@@ -198,12 +198,22 @@ class EncoderWithHead(nn.Module):
 # ---------------------------------------------------------------------------------
 # losses
 # ---------------------------------------------------------------------------------
-def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def gaussian_nll(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    y: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     Heteroscedastic Gaussian NLL: 0.5 * [ (mu - y)^2 / sigma^2 + log sigma^2 ].
 
     `logvar` is clamped by the caller (EncoderWithHead.clamp_logvar) so that a target the
     encoder cannot identify cannot drive sigma to infinity and collapse the loss.
+
+    `mask` is [B, T] (1 on real timesteps, 0 on sequence padding). Episode batches are
+    padded to the longest episode in the batch and the targets of the padded frames are
+    zeros, so an unmasked mean fits the variance head to a target value on frames that do
+    not exist. The masked form averages over real (timestep, target) elements only.
 
     CAVEAT, learned the hard way on this project: the loss and R^2 DECOUPLE under this
     objective, because the loss can fall by inflating sigma rather than by improving mu.
@@ -211,7 +221,11 @@ def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor, y: torch.Tensor) -> tor
     encoder looks like a converging one.
     """
     inv_var = torch.exp(-logvar)
-    return (0.5 * (inv_var * (mu - y) ** 2 + logvar)).mean()
+    nll = 0.5 * (inv_var * (mu - y) ** 2 + logvar)
+    if mask is None:
+        return nll.mean()
+    m = mask.unsqueeze(-1).to(nll.dtype)
+    return (nll * m).sum() / m.sum().clamp(min=1.0) / nll.shape[-1]
 
 
 def beta_gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor, y: torch.Tensor, beta: float = 0.5) -> torch.Tensor:

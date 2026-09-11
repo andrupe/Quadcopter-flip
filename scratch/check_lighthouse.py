@@ -155,14 +155,26 @@ check("the fix snaps the estimate back near truth", out["drifted"] < 0.05,
       f"drift {out['drifted']*1000:.1f} mm (was {np.linalg.norm(before - p_true)*1000:.0f} mm)")
 check("outage timer resets on a fix", out["outage_t"] == 0.0, f"outage_t = {out['outage_t']}")
 
-# One visible station is not a pose: a single sweep plane cannot resolve position.
+# One visible station is not a pose: a single sweep plane cannot resolve position, so
+# observe() must refuse to produce a fix. Force that situation by pushing one of the two
+# stations out of range and check BOTH sides of the threshold.
 lh_single = LighthouseModel(LighthouseConfig(station_counts=(2,), min_stations_for_fix=2))
-lh_single.reset([0.0, 0.0, 1.4], np.zeros(3), np.random.default_rng(5), dr=0.0)
-mask = lh_single.visible_mask(np.array([0.0, 0.0, 1.4]), LEVEL_R)
-check("requiring 2 stations is enforced against a single visible station",
-      cfg.min_stations_for_fix >= 2 and mask.sum() >= 1,
-      f"{mask.sum()} visible, threshold {cfg.min_stations_for_fix} -> "
-      f"{'fix' if mask.sum() >= cfg.min_stations_for_fix else 'no fix'}")
+p_here = np.array([0.0, 0.0, 1.4])
+lh_single.reset(p_here, np.zeros(3), np.random.default_rng(5), dr=0.0)
+station_1 = lh_single.stations[1].copy()
+lh_single.stations[1] = station_1 + np.array([0.0, 0.0, 100.0])  # beyond max_range
+vis1 = lh_single.visible_mask(p_here, LEVEL_R)
+out1 = lh_single.observe(p_here, np.zeros(3), LEVEL_R, DT, np.random.default_rng(6))
+check("one visible station produces NO fix",
+      int(vis1.sum()) == 1 and not out1["has_fix"],
+      f"{int(vis1.sum())} visible, threshold {lh_single.cfg.min_stations_for_fix} -> "
+      f"{'fix' if out1['has_fix'] else 'no fix'}")
+lh_single.stations[1] = station_1
+vis2 = lh_single.visible_mask(p_here, LEVEL_R)
+out2 = lh_single.observe(p_here, np.zeros(3), LEVEL_R, DT, np.random.default_rng(7))
+check("two visible stations produce a fix",
+      int(vis2.sum()) >= lh_single.cfg.min_stations_for_fix and out2["has_fix"],
+      f"{int(vis2.sum())} visible -> {'fix' if out2['has_fix'] else 'no fix'}")
 
 print()
 print("=" * 78)

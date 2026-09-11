@@ -197,7 +197,15 @@ class Wind:
             qW1  = self.qW1_a1*sin(self.qW1_f1*t - self.qW1_d1) + self.qW1_a2*sin(self.qW1_f2*t - self.qW1_d2) + self.qW1_med
             qW2  = self.qW2_a1*sin(self.qW2_f1*t - self.qW2_d1) + self.qW2_a2*sin(self.qW2_f2*t - self.qW2_d2) + self.qW2_med
 
-            velW = max(0.0, min(getattr(self, 'velW_max', 2.0), float(velW)))
+            # Ceiling: the live velW_max when the caller maintains one (the env shrinks it
+            # with the ADR level), otherwise the model's own achievable maximum. The old
+            # getattr default of a bare 2.0 silently clipped a legitimate SINE wind to
+            # 2 m/s whenever the attribute happened to be absent.
+            ceiling = float(getattr(
+                self, "velW_max",
+                max(self.velW_med, self.velW_med + self.velW_a1 + self.velW_a2 + self.velW_a3),
+            ))
+            velW = max(0.0, min(ceiling, float(velW)))
 
         elif self.windType == 'PERLIN':
             ts = t * self._time_scale

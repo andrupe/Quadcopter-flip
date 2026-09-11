@@ -220,8 +220,12 @@ class AsymmetricActorCriticPolicy(ActorCriticPolicy):
 
     def get_latent(self, obs: PyTorchObs) -> th.Tensor:
         """
-        Extracts the 64-dimensional latent representation z_t from the feedforward
-        history encoder (Layer 1 + Layer 2).
+        The actor network's penultimate feature vector for this observation.
+
+        Despite the name this is NOT the history encoder's z. The encoder runs in
+        LatentObsWrapper (training) or LatentInjector (evaluation/tuning) and its output
+        arrives as part of the observation; this method just exposes the last hidden layer
+        of `policy_net` (128 dims with the default net_arch) for introspection.
         """
         if isinstance(obs, dict):
             pi_obs = obs["actor"]

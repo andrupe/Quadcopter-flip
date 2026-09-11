@@ -241,7 +241,7 @@ print("=" * 78)
 print("   A high-level command must always leave the vehicle parked in a stable hold,")
 print("   so the terminal reference has to be a genuine hover: v = 0, a = 0, level")
 print("   attitude, zero body rate, and thrust at trim m*g.")
-for name in ("hover", "waypoints", "figure8", "flip"):
+for name in sorted(sampler.cfg.weights):
     rng = np.random.default_rng(7)
     w_v = w_a = w_rate = w_tilt = w_thr = 0.0
     for _ in range(12):

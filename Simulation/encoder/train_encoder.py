@@ -288,7 +288,9 @@ def train(
             se = ((mu - yt) ** 2).sum(dim=-1)          # [B, T]
             denom = mt.sum().clamp(min=1.0)
             loss_mu = (se * mt).sum() / denom / model.n_targets
-            loss_var = gaussian_nll(mu.detach(), model.clamp_logvar(logvar), yt)
+            # Masked as well: `yt` is zero-filled on the padding, so an unmasked NLL would
+            # train the logvar head against frames that do not exist.
+            loss_var = gaussian_nll(mu.detach(), model.clamp_logvar(logvar), yt, mask=mt)
             loss = loss_mu + variance_weight * loss_var
 
         if train_mode:

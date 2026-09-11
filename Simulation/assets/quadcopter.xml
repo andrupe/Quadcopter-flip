@@ -1,5 +1,9 @@
 <mujoco model="crazyflie_2x">
-  <compiler angle="radian" coordinate="local" inertiafromgeom="false" balanceinertia="true"/>
+  <!-- balanceinertia is OFF on purpose. With it on, MuJoCo silently replaces a tensor
+       that violates the triangle inequality with an isotropic average of ALL THREE axes
+       - which is how a 34% error in Izz (and a ~1.5x over-stated yaw authority) hid in
+       this model. An invalid tensor must fail loudly instead. -->
+  <compiler angle="radian" coordinate="local" inertiafromgeom="false" balanceinertia="false"/>
 
   <default>
     <joint damping="0.001"/>
@@ -23,8 +27,16 @@
     <body name="quadcopter" pos="0 0 0">
       <freejoint name="root"/>
 
-      <!-- Inertial Properties (Crazyflie: 28 grams) -->
-      <inertial pos="0 0 0" mass="0.028" diaginertia="1.43e-5 1.43e-5 2.89e-5"/>
+      <!-- Inertial Properties (Crazyflie: 28 grams).
+
+           The principal moments MUST satisfy the triangle inequality (Ixx+Iyy >= Izz and
+           its cyclic permutations). The literature values for this airframe are
+           (1.43e-5, 1.43e-5, 2.89e-5), which violates it by ~1% - so Izz is reduced to
+           2.85e-5 (a 1.4% change, comfortably inside the measurement uncertainty that
+           produced 2.89e-5) rather than letting the compiler average all three axes.
+           Keep these in step with IB in Simulation/quadFiles/quad_mujoco.py and
+           Simulation/quadFiles/initQuad.py; quad_mujoco.py checks them at construction. -->
+      <inertial pos="0 0 0" mass="0.028" diaginertia="1.43e-5 1.43e-5 2.85e-5"/>
 
       <!-- Central Body Geometry -->
       <geom name="chassis" type="box" size="0.02 0.02 0.005" material="chassis_mat"/>

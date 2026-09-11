@@ -1,15 +1,30 @@
 """
-Smoke test for LatentObsWrapper: layout, auto-reset history handling, batched z, and
-measured in-situ overhead.
+RETIRED - superseded by scratch/smoke_train.py and scratch/check_gru_encoder.py.
 
-Uses DummyVecEnv rather than SubprocVecEnv because SB3's DummyVecEnv reproduces the
-SAME auto-reset contract (reset observation returned, terminal observation stashed in
-info), so this exercises exactly the logic that matters while staying debuggable.
+This checker tested the TCN-era LatentObsWrapper: an 81-dim wrapped observation, a
+`history_len` frame stack, per-step `z_update_every` refreshes, and a 100+ tap receptive
+field. None of those exist any more - the encoder became a causal GRU with its own
+recurrent state, the wrapper emits [o_t(29) | z(16) | aux(4) | privileged(44)] = 93 dims,
+and it carries one hidden vector per env.
 
-Run:  .venv/bin/python scratch/check_wrapper.py
+It would now fail on APIs that were deleted rather than on the behaviour it is meant to
+check, so it exits immediately with this notice instead of producing a misleading crash.
+
+Current coverage of the same ground:
+    scratch/smoke_train.py                   wrapper layout, actor slice, per-episode
+                                             state reset, PPO wiring end to end
+    scratch/check_gru_encoder.py             encoder incremental/deployment path,
+                                             causality, checkpoint round-trip
+    scratch/benchmark_training_pipeline.py   per-step overhead and where PPO time goes
+
+Run:  .venv/bin/python scratch/check_wrapper.py   (prints this notice, exits 1)
 """
+import sys
 
-from __future__ import annotations
+print(__doc__)
+sys.exit(1)
+
+from __future__ import annotations  # noqa: E402  (dead body kept for reference)
 
 import os
 import sys

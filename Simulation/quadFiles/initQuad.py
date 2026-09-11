@@ -25,10 +25,13 @@ def sys_params():
     dym = 0.0325    # arm length y (m)
     dzm = 0.01      # motor height (m)
 
-    # Inertia tensor (kg*m^2) [Forster 2015 / Landry 2016 System Identification]
+    # Inertia tensor (kg*m^2) [Forster 2015 / Landry 2016 System Identification].
+    # Izz is 2.85e-5 rather than the measured 2.89e-5 because the measured triple
+    # violates the rigid-body triangle inequality (Ixx + Iyy >= Izz). Must match
+    # assets/quadcopter.xml and Simulation/quadFiles/quad_mujoco.py.
     IB  = np.array([[1.43e-5, 0,       0      ],
                     [0,      1.43e-5, 0      ],
-                    [0,      0,       2.89e-5]]) # Inertial tensor (kg*m^2)
+                    [0,      0,       2.85e-5]]) # Inertial tensor (kg*m^2)
     IRzz = 1.0e-6   # Rotor moment of inertia (kg*m^2)
 
 

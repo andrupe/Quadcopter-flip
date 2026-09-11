@@ -21,7 +21,15 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from quad_flip_env import QuadFlipEnv, ACTOR_TOTAL_DIM, TOTAL_OBS_DIM
+from quad_flip_env import (
+    ACTOR_TOTAL_DIM,
+    TOTAL_OBS_DIM,
+    FLIGHT_RADIUS,
+    SPAWN_Z,
+    INIT_RATE_RANGE,
+    INIT_VEL_RANGE,
+    QuadFlipEnv,
+)
 from asymmetric_policy import AsymmetricActorCriticPolicy
 
 # The frozen history encoder lives in Simulation/encoder/. Imported defensively: the
@@ -63,8 +71,16 @@ Z_DIM: int = 16
 #   Phase 2 (= DR ramp)  adapt while the dynamics are being corrupted
 #   Phase 3 (full DR)    polish
 # LR_WARMUP_STEPS == DR_START_STEPS makes that alignment exact. Change one, change both.
+#
+# REVISION 2026-09-11 - measured, not guessed (previous run: 10M steps, DR 2M -> 7M):
+#   2M was far too early. The per-step reward was still growing at +0.49/step per M steps
+#   (window peak +0.71) when the ramp began, and net growth fell to ~0 once dr passed ~0.2.
+#   A deterministic eval of the 2.5M checkpoint scored 3.48/step clean = 48% of the 7.3
+#   maximum - only ~2/3 of the way to the 75% gate (5.475/step) that the scripted
+#   controller clears at 5.72-6.57. Keep the mixture clean until the policy is CLOSE TO
+#   THE GATE, then corrupt. Budget raised 10M -> 15M so the ramp still has a polish phase.
 # ======================================================================================
-TOTAL_TIMESTEPS: int = 10_000_000      # ~30 min at ~6000 steps/s on 10 workers
+TOTAL_TIMESTEPS: int = 15_000_000      # ~85-90 min at the measured ~2.8-3k steps/s on 10 workers
 NUM_WORKERS: int = 10                  # Parallel CPU worker environments
 MODEL_NAME: str = "quad_flip_model"    # Model output name (.zip saved in root directory)
 DEVICE: str = "cpu"                    # "cpu" (recommended for Apple Silicon) or "mps"
@@ -77,7 +93,7 @@ LR_START: float = 3e-4                 # Phase 1: explore the mixture on clean d
 LR_MID: float = 1.5e-4                 # Phase 2 start, as the ADR ramp begins
 LR_ADR_END: float = 5e-5               # Phase 3 start, at full DR
 LR_FLOOR: float = 3e-5                 # Phase 3 end
-LR_WARMUP_STEPS: int = 2_000_000       # Phase 1 duration. Keep equal to DR_START_STEPS.
+LR_WARMUP_STEPS: int = 6_000_000       # Phase 1 duration. Keep equal to DR_START_STEPS.
 LR_FINAL_STABLE: bool = False          # False: decay to LR_FLOOR in Phase 3; True: hold at LR_ADR_END
 CHECKPOINT_FREQ: int = 250_000         # Timesteps per worker (2.5M total across 10 workers)
 
@@ -95,8 +111,10 @@ ENT_COEF_END: float = 0.001
 
 # Automatic Domain Randomization (ADR):
 DR_ENABLED: bool = True                # Enable progressive domain randomization
-DR_START_STEPS: int = 2_000_000        # Start corrupting dynamics once the mixture is learnt clean
-DR_END_STEPS: int = 7_000_000          # Reach full 100% DR
+DR_START_STEPS: int = 6_000_000        # Start corrupting only once CLEAN skill approaches the gate.
+                                       # 2026-09-11: at the old 2M the policy was at 48% of max
+                                       # and still improving ~+0.5/step per M - the ramp ate it.
+DR_END_STEPS: int = 11_000_000         # Reach full 100% DR (5M ramp, unchanged)
 
 # RMA-STYLE ADAPTIVE LEARNING RATE (Schulman 2017 KL controller, as used by legged_gym/RMA).
 # Off by default so a baseline run has a PREDICTABLE schedule. Turn it on when you would
@@ -113,33 +131,11 @@ FT_LR_FLOOR: float = 1e-5             # Final floor learning rate for fine-tunin
 
 
 
-# Environment options & Curriculum Arena
+# Environment options
 EPISODE_SECONDS: float = 8.0         # Max flight time per episode (seconds)
-TARGET_ALTITUDE: float = 1.2         # Target height for flip & recovery (meters)
-SPAWN_ALTITUDE: float = 1.2          # Spawn height (meters)
-ARENA_RADIUS_START: float = 2.5      # Curriculum arena radius start during nominal warmup (meters)
-ARENA_RADIUS_END: float = 0.8        # Curriculum arena radius at 100% ADR (meters)
-CURRICULUM_ARENA: bool = True        # Dynamically shrink arena boundary from 2.5m down to 0.8m during ADR
-ARENA_RADIUS: float = ARENA_RADIUS_START  # Backwards compatibility
+SPAWN_ALTITUDE: float = 1.2          # Spawn height (meters; must match SPAWN_Z in quad_flip_env.py)
 ACTION_MODE: str = "rate_pid"        # "rate_pid" (thrust + body rate PID), "motor", or "thrust_moment"
 RANDOM_INITIAL_STATE: bool = True    # Randomize spawn position, tilt, and velocity for robustness
-
-# Empirically Validated Reward Tolerances & Weights (Synthesized from 10 Scientific Experiments):
-# Exp 2: tol_xy=0.75m, tol_vel=0.20m/s, tol_so3=0.90, w_vel=3.0 -> Slashed nominal drift from 2.50m to 0.70m (flare braking)
-# Exp 3: w_z=2.5, tol_z=0.08m, tol_z_vel_flip=0.55m/s -> Slashed altitude error to 0.11m under full DR (top score 72.2)
-# Exp 6: w_action=0.70 -> Eliminated motor chatter and actuator saturation, cutting DR 1.0 drift to 2.07m
-TOL_XY_HOVER: float = 0.75           # meters: expanded hover position basin
-TOL_VEL_HOVER: float = 0.20          # m/s: tight velocity target for strong derivative damping
-TOL_Z_HOVER: float = 0.08            # meters: tight vertical target to eliminate 5-7cm payload sag
-TOL_SO3_ATTITUDE: float = 0.90       # SO(3) attitude tolerance (~55°: allows 15°-20° flare braking tilt)
-TOL_Z_VEL_FLIP: float = 0.55         # m/s: climb velocity target during flip initiation
-W_XY: float = 1.8                    # Planar XY lock weight
-W_Z: float = 2.5                     # Vertical altitude lock weight (boosted from 1.5)
-W_VEL: float = 3.0                   # Linear velocity damping weight (boosted from 1.6)
-W_ACTION: float = 0.70               # Action rate-of-change regularizer (boosted from 0.35)
-W_UPRIGHT: float = 0.8               # SO(3) upright attitude weight
-W_HEADING: float = 1.0               # Yaw heading alignment weight
-W_OMEGA: float = 1.2                 # Body rate damping weight
 # ======================================================================================
 
 
@@ -199,22 +195,22 @@ class DomainRandomizationCallback(BaseCallback):
     """
     Automatic Domain Randomization (ADR): linearly ramps dr_level from 0.0 to 1.0
     over training. Starts after start_steps, reaches 1.0 at end_steps.
-    Coordinates progressive arena radius contraction from arena_radius_start down to arena_radius_end.
+
+    dr_level is the ONLY thing this callback drives. It used to also announce a shrinking
+    "curriculum arena", but the env ignores that (the tracking task's difficulty comes
+    from the commanded manoeuvre, and the flight volume is a fixed sphere), so the message
+    was pure decoration and has been removed.
     """
 
     def __init__(
         self,
         start_steps: int = DR_START_STEPS,
         end_steps: int = DR_END_STEPS,
-        arena_radius_start: float = ARENA_RADIUS_START,
-        arena_radius_end: float = ARENA_RADIUS_END,
         verbose: int = 1,
     ):
         super().__init__(verbose)
         self.start_steps = int(start_steps)
         self.end_steps = int(end_steps)
-        self.arena_radius_start = float(arena_radius_start)
-        self.arena_radius_end = float(arena_radius_end)
         self.current_level: float = 0.0
 
     def _on_training_start(self) -> None:
@@ -229,17 +225,14 @@ class DomainRandomizationCallback(BaseCallback):
 
         self.current_level = float(np.clip(init_level, 0.0, 1.0))
         self.training_env.env_method("set_dr_level", self.current_level)
-        curr_arena = self.arena_radius_start - self.current_level * (self.arena_radius_start - self.arena_radius_end)
         if self.verbose > 0:
             print(f"\n{'*'*65}")
             print(f"*** AUTOMATIC DOMAIN RANDOMIZATION (ADR) INITIALIZED ***")
             if self.start_steps == 0 and self.end_steps == 0:
                 print(f"  DR Mode: Fixed 100% full domain randomization throughout (dr_level = 1.0)")
-                print(f"  Curriculum Arena: Fixed at {self.arena_radius_end:.2f}m")
             else:
                 print(f"  DR Ramp: 0.0 -> 1.0 over steps {self.start_steps:,} to {self.end_steps:,}")
                 print(f"  Initial DR Level: {self.current_level:.2f} at start step {self.num_timesteps:,}")
-                print(f"  Curriculum Arena: {self.arena_radius_start:.2f}m -> {self.arena_radius_end:.2f}m (current: {curr_arena:.2f}m)")
             print(f"{'*'*65}\n")
 
     def _on_step(self) -> bool:
@@ -262,10 +255,8 @@ class DomainRandomizationCallback(BaseCallback):
         if abs(level - self.current_level) > 0.005 or (level >= 1.0 and self.current_level < 1.0):
             self.current_level = level
             self.training_env.env_method("set_dr_level", level)
-            curr_arena = self.arena_radius_start - level * (self.arena_radius_start - self.arena_radius_end)
-
             if self.verbose > 0 and (int(level * 100) % 10 == 0 or level >= 1.0):
-                print(f"  [ADR] DR Level = {level:.2f} | Arena Radius = {curr_arena:.2f}m (step {steps:,})")
+                print(f"  [ADR] DR Level = {level:.2f} (step {steps:,})")
 
 
 
@@ -395,13 +386,22 @@ class AdaptiveKLScheduleCallback(BaseCallback):
         self.lr_history: list[float] = []
 
     def _current_lr(self) -> float:
+        """
+        The learning rate the schedule is producing RIGHT NOW.
+
+        SB3 stores `_current_progress_remaining` on the model and feeds it to
+        `lr_schedule` on every update, so that is the argument to evaluate at. This used
+        to call `lr_schedule(1.0)`, which asks for the value at the START of training -
+        wrong for a decaying schedule, and silently so.
+        """
+        progress = getattr(self.model, "_current_progress_remaining", None)
         lr = getattr(self.model, "lr_schedule", None)
         if callable(lr):
-            lr = lr(1.0)
+            lr = lr(float(progress)) if progress is not None else lr(0.0)
         if lr is None:
             lr = self.model.learning_rate
         if callable(lr):
-            lr = lr(1.0)
+            lr = lr(0.0)
         lr = float(lr)
         return lr if np.isfinite(lr) and lr > 0.0 else self.lr_min
 
@@ -523,8 +523,13 @@ class TrainingMetricsCallback(BaseCallback):
         self.last_plot_step: int = 0
 
         os.makedirs(os.path.dirname(os.path.abspath(self.csv_path)), exist_ok=True)
-        with open(self.csv_path, "w", encoding="utf-8") as f:
-            f.write("timestep,walltime_sec,ep_rew_mean,ep_len_mean\n")
+        # APPEND, never truncate. This path is shared with the smoke tests and the
+        # encoder-chain check (they call train() with their own model names), and opening
+        # it with "w" used to wipe a live run's recorded history. The header is written
+        # only for a new/empty file, so rows from separate runs simply accumulate.
+        if not os.path.isfile(self.csv_path) or os.path.getsize(self.csv_path) == 0:
+            with open(self.csv_path, "w", encoding="utf-8") as f:
+                f.write("timestep,walltime_sec,ep_rew_mean,ep_len_mean\n")
 
     def _on_step(self) -> bool:
         return True
@@ -626,12 +631,13 @@ def train(
         return QuadFlipEnv(
             action_mode=ACTION_MODE,
             episode_seconds=EPISODE_SECONDS,
-            target_altitude=TARGET_ALTITUDE,
             spawn_altitude=SPAWN_ALTITUDE,
             random_initial_state=random_initial_state,
-            arena_radius_start=ARENA_RADIUS_START,
-            arena_radius_end=ARENA_RADIUS_END,
-            curriculum_arena=CURRICULUM_ARENA,
+            # Training reads nothing from the env's telemetry info dict (SB3's worker adds
+            # what the PPO path needs), and building + pickling it across 10 workers costs
+            # more than the physics does. Evaluation and the diagnostic scripts construct
+            # QuadFlipEnv directly and still get the full dict.
+            telemetry=False,
         )
 
     vec_env = make_vec_env(make_env, n_envs=num_workers, vec_env_cls=SubprocVecEnv)
@@ -701,8 +707,9 @@ def train(
         total_lifetime_steps = total_timesteps
 
     print(f"\n{'='*65}")
-    print(f"=== Starting PPO Training: Quadcopter Acrobatic Flip (AAC) ===")
-    print(f"  Architecture   : Asymmetric Actor-Critic (Actor: {ACTOR_TOTAL_DIM} dims | Critic: {TOTAL_OBS_DIM} dims)")
+    print(f"=== Starting PPO Training: Quadcopter Trajectory Tracking (AAC) ===")
+    _critic_dim = int(vec_env.observation_space.shape[0])
+    print(f"  Architecture   : Asymmetric Actor-Critic (Actor: {actor_obs_dim} dims | Critic: {_critic_dim} dims)")
     print(f"  Workers        : {num_workers} parallel CPU processes")
     print(f"  Session Steps  : {steps_to_train:,} (Target lifetime: {total_lifetime_steps:,})")
     print(f"  Device         : {device.upper()}")
@@ -712,7 +719,7 @@ def train(
     if model_to_load:
         print(f"  Fine-Tuning LR : {ft_lr_start:.1e} -> {ft_lr_floor:.1e} (Linear decay over {steps_to_train:,} steps)")
     else:
-        print(f"  Task           : TRAJECTORY TRACKING (hover / waypoints / figure-8 / flip mixture)")
+        print(f"  Task           : TRAJECTORY TRACKING (hover / waypoints / figure-8 / lissajous / orbit / slalom / flip)")
         if ADAPTIVE_KL_LR:
             print(f"  LR Schedule    : ADAPTIVE KL (target {ADAPTIVE_KL_DESIRED}, "
                   f"clamped to [{ADAPTIVE_KL_LR_MIN:.0e}, {ADAPTIVE_KL_LR_MAX:.0e}]) - RMA/legged_gym style")
@@ -728,10 +735,13 @@ def train(
             print(f"  ADR Mode       : Fixed 100% full domain randomization throughout (dr_level = 1.0)")
         else:
             print(f"  ADR Schedule   : dr_level 0.0 -> 1.0 over steps {DR_START_STEPS:,} to {DR_END_STEPS:,}")
-    if CURRICULUM_ARENA:
-        print(f"  Curriculum Arena: Radius {ARENA_RADIUS_START:.2f}m -> {ARENA_RADIUS_END:.2f}m (shrinks during ADR)")
-    else:
-        print(f"  Arena Radius   : Fixed at {ARENA_RADIUS:.2f}m")
+    # The arena is no longer a shrinking curriculum: the task's difficulty comes from the
+    # commanded manoeuvre, and the flight volume is the FIXED sphere the reference sampler
+    # is screened against. Report that instead of an arena radius that no longer exists.
+    print(f"  Flight Volume  : sphere r={FLIGHT_RADIUS:.1f}m centred (0,0,{SPAWN_Z:.1f}) "
+          f"-> ceiling {SPAWN_Z + FLIGHT_RADIUS:.1f}m, floor = ground ({SPAWN_Z:.1f}m below start)")
+    print(f"  Initial Kick   : {INIT_VEL_RANGE[0]:.2f}->{INIT_VEL_RANGE[1]:.2f} m/s per axis, "
+          f"{INIT_RATE_RANGE[0]:.2f}->{INIT_RATE_RANGE[1]:.2f} rad/s per axis (scaled by DR)")
     print(f"{'='*65}\n")
 
     if model is not None:
@@ -781,8 +791,12 @@ def train(
     vecnorm_cb = VecNormalizeCheckpointCallback(
         save_freq=checkpoint_freq, save_path=save_dir, root_stats_path=stats_path
     )
-    metrics_csv = os.path.join(save_dir, "training_metrics.csv")
-    metrics_plot = os.path.join(_PROJECT_ROOT, "training_curves.png")
+    # Default runs keep the canonical artifact names (tooling and the tracked CSV depend on
+    # them); auxiliary runs - smoke tests, the encoder-chain check - get their own files so
+    # they cannot overwrite the real run's history or plot.
+    _run_suffix = "" if model_name == MODEL_NAME else f"_{model_name}"
+    metrics_csv = os.path.join(save_dir, f"training_metrics{_run_suffix}.csv")
+    metrics_plot = os.path.join(_PROJECT_ROOT, f"training_curves{_run_suffix}.png")
     metrics_cb = TrainingMetricsCallback(
         csv_path=metrics_csv,
         plot_path=metrics_plot,
@@ -814,28 +828,40 @@ def train(
         dr_cb = DomainRandomizationCallback(
             start_steps=DR_START_STEPS,
             end_steps=DR_END_STEPS,
-            arena_radius_start=ARENA_RADIUS_START,
-            arena_radius_end=ARENA_RADIUS_END,
         )
         callbacks.append(dr_cb)
 
     start_time = time.time()
     reset_timesteps = (model_to_load is None)
+    failure: Optional[BaseException] = None
     try:
         model.learn(total_timesteps=steps_to_train, callback=callbacks, reset_num_timesteps=reset_timesteps)
     except KeyboardInterrupt:
         print("\n\n[Notice] Training interrupted by user (Ctrl+C). Gracefully saving current model and normalization stats...")
+    except BaseException as exc:  # noqa: BLE001 - save before propagating, then re-raise
+        # A crash (dead worker, bad draw, OOM) must not also lose the run: on a 10M-step
+        # job the checkpoint on disk can be hours old. Save first, report, then exit
+        # non-zero so the failure is still visible to whatever launched this.
+        failure = exc
+        import traceback as _tb
+        print("\n\n[Error] Training aborted by an exception. Saving the current model and stats first...")
+        _tb.print_exc()
 
     elapsed = time.time() - start_time
 
     final_model_path = os.path.join(_PROJECT_ROOT, model_name)
-    model.save(final_model_path)
-    vec_env.save(stats_path)
+    try:
+        model.save(final_model_path)
+        vec_env.save(stats_path)
+    except Exception:
+        import traceback as _tb
+        print("[Error] Failed to save the model and/or stats:")
+        _tb.print_exc()
 
     # Final metrics plot generation
     metrics_cb.plot_metrics()
     # Also save a copy inside logs/ directory
-    metrics_cb.plot_path = os.path.join(save_dir, "training_curves.png")
+    metrics_cb.plot_path = os.path.join(save_dir, f"training_curves{_run_suffix}.png")
     metrics_cb.plot_metrics()
 
     fps = max(1, model.num_timesteps - initial_steps) / max(1e-6, elapsed)
@@ -845,6 +871,9 @@ def train(
     print(f"  Saved Model    : {final_model_path}.zip")
     print(f"  Saved Stats    : {stats_path}")
     print(f"{'='*65}\n")
+
+    if failure is not None:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

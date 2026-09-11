@@ -26,6 +26,11 @@ def quatMultiply(q, p):
 
 
 # Inverse quaternion
+#
+# q^-1 = conj(q) / |q|^2. Dividing by |q| (which this did) is only the inverse for a
+# unit quaternion, and silently returns a non-unit "inverse" otherwise.
 def inverse(q):
-    qinv = np.array([q[0], -q[1], -q[2], -q[3]])/norm(q)
-    return qinv
+    n2 = float(norm(q)) ** 2
+    if n2 < 1e-12:
+        raise ValueError("cannot invert a zero quaternion")
+    return np.array([q[0], -q[1], -q[2], -q[3]]) / n2

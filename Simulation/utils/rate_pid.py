@@ -126,33 +126,61 @@ class RatePIDController:
         -------
         torques : np.ndarray
             Commanded body torques [tau_x, tau_y, tau_z] in N*m.
+
+        IMPLEMENTATION NOTE. This runs at the physics substep rate and is called 10x per
+        environment step, so at 3 elements per axis the numpy call overhead (sub, mul,
+        clip, copy - each a dispatch on a 3-vector) dominates the arithmetic by roughly
+        an order of magnitude. The loop below keeps every operation but does it on
+        Python floats: same expressions, same order ((ki*error)*dt, (p+i)+d), same
+        clamping semantics as np.clip, same NaN propagation. `scratch/check_fast_math.py`
+        checks it against the vector formulation.
         """
-        omega_des = np.asarray(omega_des, dtype=np.float64)
-        omega_meas = np.asarray(omega_meas, dtype=np.float64)
+        if not isinstance(omega_des, np.ndarray):
+            omega_des = np.asarray(omega_des, dtype=np.float64)
+        if not isinstance(omega_meas, np.ndarray):
+            omega_meas = np.asarray(omega_meas, dtype=np.float64)
         dt = max(1e-6, float(dt))
 
-        # 1. Error computation
-        error = omega_des - omega_meas
+        kp, ki, kd = self.kp, self.ki, self.kd
+        integral = self.integral
+        max_integral = self.max_integral
+        max_torque = self.max_torque
+        prev_omega = self.prev_omega
+        torque = np.empty(3, dtype=np.float64)
 
-        # 2. Proportional term
-        p_term = self.kp * error
+        for j in range(3):
+            meas = float(omega_meas[j])
+            error = float(omega_des[j]) - meas
 
-        # 3. Integral term with anti-windup clamping
-        self.integral += self.ki * error * dt
-        self.integral = np.clip(self.integral, -self.max_integral, self.max_integral)
-        i_term = self.integral.copy()
+            # 1-2. Error and proportional term
+            p_term = float(kp[j]) * error
 
-        # 4. Derivative term on measurement (prevents derivative kick on step changes)
-        if self.prev_omega is not None:
-            d_omega = (omega_meas - self.prev_omega) / dt
-            d_term = -self.kd * d_omega
-        else:
-            d_term = np.zeros(3, dtype=np.float64)
+            # 3. Integral term with anti-windup clamping. `(ki * error) * dt`, in that
+            # order, is exactly what the vector expression evaluated.
+            i_term = float(integral[j]) + float(ki[j]) * error * dt
+            i_lim = float(max_integral[j])
+            if i_term > i_lim:
+                i_term = i_lim
+            elif i_term < -i_lim:
+                i_term = -i_lim
+            integral[j] = i_term
+
+            # 4. Derivative term on measurement (prevents derivative kick on step changes)
+            if prev_omega is not None:
+                d_term = -float(kd[j]) * ((meas - float(prev_omega[j])) / dt)
+            else:
+                d_term = 0.0
+
+            # 5. Total torque with actuator authority clamping
+            tau = (p_term + i_term) + d_term
+            t_lim = float(max_torque[j])
+            if tau > t_lim:
+                tau = t_lim
+            elif tau < -t_lim:
+                tau = -t_lim
+            torque[j] = tau
+
         self.prev_omega = omega_meas.copy()
+        self.last_torque = torque.copy()
 
-        # 5. Total torque with actuator authority clamping
-        raw_torque = p_term + i_term + d_term
-        clamped_torque = np.clip(raw_torque, -self.max_torque, self.max_torque)
-        self.last_torque = clamped_torque.copy()
-
-        return clamped_torque
+        return torque

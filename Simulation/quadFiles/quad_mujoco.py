@@ -62,10 +62,14 @@ class QuadcopterMuJoCo:
         w_hover = 1767.0 # Hover motor speed (rad/s)
         thr_hover = mB * g / 4.0 # Hover thrust per motor (~0.06867 N)
 
+        # Izz is 2.85e-5, not the literature 2.89e-5: the measured triple violates the
+        # triangle inequality (1.43 + 1.43 < 2.89), and MuJoCo would either reject it or
+        # silently balance all three axes (which is exactly how a 34% error in Izz hid
+        # here). Must match <inertial> in assets/quadcopter.xml - checked below.
         IB = np.array([
             [1.43e-5, 0.0,     0.0    ],
             [0.0,     1.43e-5, 0.0    ],
-            [0.0,     0.0,     2.89e-5],
+            [0.0,     0.0,     2.85e-5],
         ])
 
         self.params: Dict[str, Any] = {
@@ -130,6 +134,26 @@ class QuadcopterMuJoCo:
         self.base_mass = float(self.model.body_mass[self.body_id])
         self.base_ipos = self.model.body_ipos[self.body_id].copy()
         self.base_inertia = self.model.body_inertia[self.body_id].copy()
+
+        # Guard against silent inertia replacement. A tensor that violates the triangle
+        # inequality is either an error or gets balanced to an isotropic average by the
+        # compiler, and BOTH outcomes are silent at runtime: every authority number in
+        # this project (rate limits, flip coast budgets, PID gains) is derived from the
+        # intended diagonal, so a mismatch must stop the simulation rather than quietly
+        # change the plant.
+        _expected_inertia = np.array([IB[0, 0], IB[1, 1], IB[2, 2]], dtype=np.float64)
+        if not np.allclose(self.base_inertia, _expected_inertia, rtol=0.02, atol=1e-12):
+            raise ValueError(
+                "compiled body inertia "
+                f"{np.array2string(self.base_inertia, precision=3)} does not match the "
+                f"intended diagonal {np.array2string(_expected_inertia, precision=3)}.\n"
+                "  The usual cause is an <inertial diaginertia> that violates the "
+                "triangle inequality (Ixx+Iyy >= Izz) combined with "
+                "balanceinertia=\"true\", which makes MuJoCo substitute the isotropic "
+                "average of all three axes.\n"
+                "  Fix assets/quadcopter.xml (and the mirror in this file) instead of "
+                "relaxing this check."
+            )
 
         self.rotor_site_names = ["rotor_fl", "rotor_fr", "rotor_rr", "rotor_rl"]
         self.rotor_site_ids = [self.model.site(name).id for name in self.rotor_site_names]

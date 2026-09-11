@@ -59,13 +59,13 @@ print("=" * 78)
 print("A. observation layout")
 print("=" * 78)
 env = make_env()
-check("ACTOR_SINGLE_OBS_DIM == 17", ACTOR_SINGLE_OBS_DIM == 17, f"= {ACTOR_SINGLE_OBS_DIM}")
+check("ACTOR_SINGLE_OBS_DIM == 29", ACTOR_SINGLE_OBS_DIM == 29, f"= {ACTOR_SINGLE_OBS_DIM}")
 check("ENCODER_AUX_DIM == 4", ENCODER_AUX_DIM == 4, f"= {ENCODER_AUX_DIM}")
-check("ACTOR_TOTAL_DIM == 17", ACTOR_TOTAL_DIM == 17, f"= {ACTOR_TOTAL_DIM}")
+check("ACTOR_TOTAL_DIM == 29", ACTOR_TOTAL_DIM == 29, f"= {ACTOR_TOTAL_DIM}")
 check("PRIVILEGED_OBS_DIM == 44", PRIVILEGED_OBS_DIM == 44, f"= {PRIVILEGED_OBS_DIM}")
 check(
-    "TOTAL_OBS_DIM == 65",
-    TOTAL_OBS_DIM == 17 + 4 + 44,
+    "TOTAL_OBS_DIM == 77",
+    TOTAL_OBS_DIM == 29 + 4 + 44,
     f"= {TOTAL_OBS_DIM}",
 )
 check("PRIV_TARGET_DIM == 32", PRIV_TARGET_DIM == sum(d for _, d in PRIV_TARGET_GROUPS), f"= {PRIV_TARGET_DIM}")
@@ -78,9 +78,9 @@ print("=" * 78)
 env.set_dr_level(0.0)
 obs, info = env.reset(seed=7)
 check("obs dims", obs.shape == (TOTAL_OBS_DIM,), f"= {obs.shape}")
-check("env obs == info actor_obs + aux + priv", obs.shape[0] == 65)
+check("env obs == info actor_obs + aux + priv", obs.shape[0] == 77)
 
-prev = obs[12:16]
+prev = obs[13:17]
 check(
     "prior action at reset == hover trim",
     np.allclose(prev, env.hover_trim_action, atol=1e-6),
@@ -88,18 +88,18 @@ check(
 )
 print(f"        hover trim action          = {np.round(env.hover_trim_action, 4)}")
 
-aux = obs[17:21]
+aux = obs[29:33]
 check("aux accel ~ 9.81 on body +z at rest", abs(aux[2] - 9.81) < 0.5, f"= {np.round(aux[:3], 3)}")
 check("aux accel xy ~ 0", np.abs(aux[:2]).max() < 0.2, f"= {np.round(aux[:2], 3)}")
 check("aux v_batt_norm ~ 1.0 at no DR", abs(aux[3] - 1.0) < 0.05, f"= {aux[3]:.4f}")
 
 check(
-    "obs[:17] matches info['single_obs'] (no stacking)",
-    np.allclose(obs[:17], info["single_obs"], atol=1e-6),
+    "obs[:29] matches info['single_obs'] (no stacking)",
+    np.allclose(obs[:29], info["single_obs"], atol=1e-6),
 )
 check(
-    "obs[21:] matches info['privileged_obs']",
-    np.allclose(obs[21:], info["privileged_obs"], atol=1e-6),
+    "obs[33:] matches info['privileged_obs']",
+    np.allclose(obs[33:], info["privileged_obs"], atol=1e-6),
 )
 
 print()
@@ -254,12 +254,12 @@ if found:
     check("aux_buffer length == latency + 1", len(env4.aux_buffer) == 3, f"= {len(env4.aux_buffer)}")
     check(
         "obs aux block == buffered (delayed) aux",
-        np.allclose(obs[17:21], env4.aux_buffer[0], atol=1e-6),
-        f"{np.round(obs[17:21], 4)}",
+        np.allclose(obs[29:33], env4.aux_buffer[0], atol=1e-6),
+        f"{np.round(obs[29:33], 4)}",
     )
     check(
-        "info['encoder_frame'] == obs[:21]",
-        np.allclose(info["encoder_frame"], obs[:21], atol=1e-6),
+        "info['encoder_frame'] == obs[:33]",
+        np.allclose(info["encoder_frame"], obs[:33], atol=1e-6),
     )
 
     # Excite the plant hard so the delayed and current specific force differ.
@@ -276,7 +276,7 @@ if found:
     )
     check(
         "obs aux block still tracks the delayed value, not the current one",
-        not np.allclose(obs[17:21], current, atol=1e-4),
+        not np.allclose(obs[29:33], current, atol=1e-4),
     )
 
 print()

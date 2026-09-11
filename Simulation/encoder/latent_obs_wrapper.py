@@ -152,6 +152,22 @@ class LatentObsWrapper(VecEnvWrapper):
         priv = env_obs[:, self.aux_offset_in + self.aux_dim :]
         return np.concatenate([actor, self.z, aux, priv], axis=1).astype(np.float32)
 
+    @torch.inference_mode()
+    def _wrap_one(self, raw_obs: np.ndarray, h_in: torch.Tensor) -> np.ndarray:
+        """
+        Wrap a SINGLE observation against a supplied hidden state, without mutating it.
+
+        Needed for the terminal observation: it must be encoded with the state the episode
+        actually ended on, and the live state is about to be zeroed for the next episode.
+        """
+        frame = self._frame(np.asarray(raw_obs, dtype=np.float32)[None, :])
+        x = torch.from_numpy(np.ascontiguousarray(frame, dtype=np.float32)).to(self.device)
+        z, _ = self.encoder.step(x, h_in)
+        z = z.detach().to("cpu").numpy()[0]
+        return np.concatenate(
+            [raw_obs[: self.actor_total_dim], z, raw_obs[self.actor_total_dim:]]
+        ).astype(np.float32)
+
     # -- VecEnv API ---------------------------------------------------------------
     def reset(self) -> np.ndarray:
         env_obs = self.venv.reset()
@@ -164,10 +180,27 @@ class LatentObsWrapper(VecEnvWrapper):
         env_obs, rewards, dones, infos = self.venv.step_wait()
         env_obs = np.asarray(env_obs)
         dones = np.asarray(dones, dtype=bool)
+        done_idx = np.flatnonzero(dones)
+
+        # SB3 bootstraps a truncated episode's value from infos[i]["terminal_observation"],
+        # which the WORKER captured and which is therefore the RAW env observation. This
+        # wrapper's output is wider (it inserts z), so handing the raw vector to the policy
+        # raises "Unexpected observation shape (77,) ... please use (93,)" the first time
+        # ANY environment finishes an episode.
+        #
+        # The terminal obs must be encoded with the hidden state the episode ENDED on, so it
+        # has to be wrapped here - before _reset_state zeroes that state and before _advance
+        # consumes the reset observation.
+        for i in done_idx:
+            term = infos[i].get("terminal_observation")
+            if term is not None:
+                infos[i]["terminal_observation"] = self._wrap_one(
+                    np.asarray(term, dtype=np.float32), self.h[i : i + 1]
+                )
 
         # Order matters: reset first, then step, so a new episode's first frame is
         # processed from a zero state exactly as it would be at takeoff.
-        self._reset_state(np.flatnonzero(dones))
+        self._reset_state(done_idx)
         self._advance(np.arange(self.num_envs), env_obs)
         return self._wrap(env_obs), rewards, dones, infos
 

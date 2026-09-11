@@ -1,32 +1,35 @@
 """
-Identifiability probe: what is the best achievable R^2 per target, ignoring the encoder?
+Identifiability probe: which privileged targets are recoverable from the observation
+stream, and how much of that survives the 16-dim z bottleneck?
 
-This answers the question the gate table cannot: when a target misses its gate, is the
-encoder underfitting, or is the target simply not recoverable from the observation?
+The question the gates cannot answer on their own. When a target misses its gate, either
+the encoder is underfit, or the target is simply not represented in the observations.
 
-Three numbers per target group, in increasing order of squeeze:
+Two numbers per target group, in increasing order of squeeze:
 
-    A. ridge probe on the RAW window      (N, T*C) -> target       <- upper-ish bound
-       No compression at all: 100 steps x 21 channels = 2100 features. If a linear map
-       from the whole window cannot recover a target, no 16-dim encoder will either, and
-       the gate is unachievable and should be revised rather than retrained against.
-    B. ridge probe on z                   (N, z_dim) -> target     <- what the actor can use
-       Reported by train_encoder.py (linear_probe).
-    C. the encoder's own head             (N, z_dim) -> target     <- gated
-       The actual gate metric.
+    A. ridge probe on the RAW standardized frame   (33 dims) -> target
+       No history, no bottleneck: if a linear map from ONE frame cannot recover a target,
+       no 16-dim recurrent encoder will either, and the gate should be revised rather than
+       retrained against.
+    B. ridge probe on z                            (16 dims) -> target
+       The information the ACTOR can actually use.
+    C. the encoder's own mu head                   (16 dims) -> target   <- the gated one
+       Reported with the gate stored in the checkpoint, for reference.
 
 Reading of the three:
-    A high, B low, C low   -> the information exists but the 16-dim z bottleneck discards
-                              it: raise z_dim or drop unidentifiable targets.
-    A high, B high, C low  -> z carries it but the head is underfit: more steps.
-    A low                  -> the target is not recoverable from this observation set at
-                              all. No amount of training helps. Revise the gate.
+    A high, B low, C low   -> the information exists but z discards it: raise z_dim or drop
+                              the target.
+    A high, B high, C low  -> z carries it but the head is underfit: train longer.
+    A low                  -> not recoverable from this observation set at all; no amount
+                              of training helps - revise the gate, not the model.
 
-A caveat on the meaning of A: a LINEAR probe on a raw window is a lower bound on what is
-achievable (the true relationship is nonlinear), but a high A proves identifiability. A
-low A is suggestive, not conclusive.
+Caveats. A is a LINEAR probe, so a low value is suggestive rather than conclusive (the true
+map is nonlinear) while a high value DOES prove recoverability. Both probes are trained on
+standardized targets, which is free here because R^2 is invariant under an affine rescaling
+of the target. The probe is memoryless by construction (single frame): recurrent context
+could in principle recover more, and that difference is exactly what the GRU gate measures.
 
-Run:  .venv/bin/python scratch/probe_identifiability.py --data logs/encoder_data --samples 15000
+Run:  .venv/bin/python scratch/probe_identifiability.py --episodes 150 --samples 20000
 """
 
 from __future__ import annotations
@@ -34,7 +37,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 
 import numpy as np
 
@@ -44,119 +46,138 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "Simulation")]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from quad_flip_env import PRIV_TARGET_GROUPS, PRIV_TARGET_DIM  # noqa: E402
-
-sys.path.insert(0, os.path.join(_PROJECT_ROOT, "Simulation", "encoder"))
+import torch  # noqa: E402
+from quad_flip_env import PRIV_TARGET_GROUPS  # noqa: E402
+from encoder.history_encoder import load_encoder_checkpoint  # noqa: E402
 from encoder.observation_spec import ENCODER_IN_DIM  # noqa: E402
-from encoder.train_encoder import (  # noqa: E402
-    HISTORY_LEN,
-    compute_norm,
-    load_shards,
-    split_episodes,
-    standardize_episodes,
-)
+from encoder.train_encoder import load_episodes, r2_per_group  # noqa: E402
+
+DEFAULT_DATA = os.path.join(_PROJECT_ROOT, "logs", "encoder_data")
+DEFAULT_CKPT = os.path.join(_PROJECT_ROOT, "logs", "encoder_gru.pt")
 
 
-def sample_windows(episodes, rng, n: int, T: int):
-    """Sample n window end-indices, cold-start padded exactly as training does."""
-    ids = rng.integers(0, len(episodes), size=n)
-    X = np.empty((n, T, ENCODER_IN_DIM), dtype=np.float32)
-    Y = np.empty((n, PRIV_TARGET_DIM), dtype=np.float32)
-    for b, ep_i in enumerate(ids):
-        ep = episodes[ep_i]
-        std = ep["sframe"]
-        t = int(rng.integers(0, std.shape[0]))
-        lo = t - T + 1
-        if lo < 0:
-            X[b, : -lo] = std[0]
-            X[b, -lo :] = std[0 : t + 1]
-        else:
-            X[b] = std[lo : t + 1]
-        Y[b] = ep["starget"][t]
-    return X, Y
+def ridge(X: np.ndarray, Y: np.ndarray, Xv: np.ndarray, alpha: float = 1.0) -> np.ndarray:
+    """Closed-form ridge regression (features are already standardized)."""
+    A = X.T @ X + alpha * np.eye(X.shape[1], dtype=np.float64)
+    W = np.linalg.solve(A, X.T @ Y)
+    return Xv @ W
 
 
-def ridge_r2(X: np.ndarray, Y: np.ndarray, lam: float, n_val: int):
-    """Fit ridge on the first len-n_val rows, score on the rest. Returns per-col R^2."""
-    Xtr, Ytr = X[:-n_val], Y[:-n_val]
-    Xva, Yva = X[-n_val:], Y[-n_val:]
-
-    # Bias term, so the fit is affine.
-    Xtr = np.concatenate([Xtr, np.ones((Xtr.shape[0], 1), dtype=Xtr.dtype)], axis=1)
-    Xva = np.concatenate([Xva, np.ones((Xva.shape[0], 1), dtype=Xva.dtype)], axis=1)
-
-    d = Xtr.shape[1]
-    XtX = Xtr.T.astype(np.float64) @ Xtr.astype(np.float64)
-    XtY = Xtr.T.astype(np.float64) @ Ytr.astype(np.float64)
-    W = np.linalg.solve(XtX + lam * np.eye(d), XtY)
-
-    pred = Xva.astype(np.float64) @ W
-    ss_res = ((pred - Yva) ** 2).sum(axis=0)
-    ss_tot = ((Yva - Yva.mean(axis=0, keepdims=True)) ** 2).sum(axis=0)
-    r2 = np.where(ss_tot > 1e-12, 1.0 - ss_res / ss_tot, 0.0)
-    return r2, pred, Yva
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default=os.path.join(_PROJECT_ROOT, "logs", "encoder_data"))
-    ap.add_argument("--samples", type=int, default=15000)
-    ap.add_argument("--raw-lam", type=float, default=1e4, help="ridge strength for the raw-window probe")
-    ap.add_argument("--z-lam", type=float, default=1e-2)
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Per-target identifiability on the current corpus.")
+    ap.add_argument("--data", default=DEFAULT_DATA)
+    ap.add_argument("--checkpoint", default=DEFAULT_CKPT)
+    ap.add_argument("--episodes", type=int, default=150, help="episodes to load (subsample)")
+    ap.add_argument("--samples", type=int, default=20_000, help="timesteps to probe on")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    if not os.path.isdir(args.data):
+        print(f"No corpus at {args.data}. Collect it first:\n"
+              "  .venv/bin/python Simulation/encoder/collect_data.py --frames 1200000")
+        return 1
+    if not os.path.isfile(args.checkpoint):
+        print(f"No encoder checkpoint at {args.checkpoint}. Train it first:\n"
+              "  .venv/bin/python Simulation/encoder/train_encoder.py")
+        return 1
+
     rng = np.random.default_rng(args.seed)
-    print("=" * 78)
-    print("target identifiability probe (no encoder bottleneck)")
-    print("=" * 78)
+    encoder, norm, ckpt = load_encoder_checkpoint(args.checkpoint)
+    gates = dict(ckpt.get("extra", {}).get("gates", {}))
 
-    t_load = time.perf_counter()
-    episodes = load_shards(args.data)
-    train, val = split_episodes(episodes, 0.05, args.seed)
-    norm = compute_norm(train)
-    standardize_episodes(episodes, norm)
-    print(f"  loaded + standardized in {time.perf_counter() - t_load:.0f}s")
+    episodes = load_episodes(args.data)
+    order = rng.permutation(len(episodes))[: max(1, args.episodes)]
+    episodes = [episodes[i] for i in order]
+    n_frames = sum(len(f) for f, _ in episodes)
+    print(f"Loaded {len(episodes)} episodes / {n_frames:,} frames from {args.data}")
+    print(f"Encoder: {os.path.basename(args.checkpoint)} "
+          f"(f_in={encoder.f_in}, z={encoder.z_dim}, targets={ckpt['config']['n_targets']})")
 
-    n_targets = sum(d for _, d in PRIV_TARGET_GROUPS)
-    assert n_targets == PRIV_TARGET_DIM, (n_targets, PRIV_TARGET_DIM)
-    X, Y = sample_windows(episodes, rng, args.samples, HISTORY_LEN)
-    X = X.reshape(len(X), -1)                     # flatten the window: (N, T*C)
-    n_val = max(500, len(X) // 5)
-    print(f"  sampled {len(X)} windows -> raw feature dim {X.shape[1]} (T={HISTORY_LEN} x C={ENCODER_IN_DIM})")
-    print(f"  ridge lambda={args.raw_lam:g}, val rows={n_val}")
+    # --- z for every frame of the sampled episodes (causal, from the true episode start) --
+    Z_all, X_all, Y_all = [], [], []
+    for frames, targets in episodes:
+        x = torch.from_numpy(norm.standardize_frame(frames))[None, :, :]
+        with torch.no_grad():
+            z = encoder.forward_sequence(x)[0].numpy()          # [T, z]
+        Z_all.append(z)
+        X_all.append(norm.standardize_frame(frames))
+        Y_all.append(norm.standardize_targets(targets))
+    X = np.concatenate(X_all).astype(np.float64)
+    Z = np.concatenate(Z_all).astype(np.float64)
+    Y = np.concatenate(Y_all).astype(np.float64)
 
-    t0 = time.perf_counter()
-    r2_raw, _, _ = ridge_r2(X, Y, args.raw_lam, n_val)
-    print(f"  fit in {time.perf_counter() - t0:.1f}s")
+    # Train/test split by TIMESTEP here, not by episode: this is a probe of what is
+    # extractable from a given frame, not of generalisation to new flights, so leakage
+    # through neighbouring frames is not the failure mode (the encoder gate itself does
+    # split by episode).
+    n = min(args.samples, X.shape[0])
+    idx = rng.permutation(X.shape[0])[:n]
+    n_tr = int(0.7 * n)
+    tr, va = idx[:n_tr], idx[n_tr:]
+    if len(va) < 100:
+        print("Too few validation frames; raise --samples.")
+        return 1
 
-    # Group-level R^2, computed on the pooled squared error (not the mean of per-dim
-    # R^2), so a group with one high-variance dim is not hidden by low-variance dims.
-    start = 0
-    print()
-    print(f"  {'target group':<20}{'dims':>5}{'raw-window R2':>15}   {'per-dim':>8}")
-    print("  " + "-" * 62)
-    results = {}
-    for name, dim in PRIV_TARGET_GROUPS:
-        sl = slice(start, start + dim)
-        sub = r2_raw[sl]
-        results[name] = float(np.mean(sub))
-        print(f"  {name:<20}{dim:>5}{np.mean(sub):>15.3f}   {np.round(sub, 2)}")
-        start += dim
+    pred_raw = ridge(X[tr], Y[tr], X[va])
+    pred_z = ridge(Z[tr], Y[tr], Z[va])
 
-    print()
-    print("=" * 78)
-    print("how to read this")
+    xa = torch.from_numpy(norm.standardize_frame(
+        np.concatenate([f for f, _ in episodes])[va].astype(np.float32)))
+    # The mu head was trained on whole sequences; single frames at arbitrary points are
+    # fine for a memoryless linear comparison, but z from forward_sequence is the honest
+    # input, so the head is fed the sequence-z instead.
+    mu_head = ckpt["config"]["n_targets"]
+    encoder_with_head_state = None
+    try:
+        from encoder.history_encoder import EncoderWithHead
+        ewh = EncoderWithHead(
+            n_targets=mu_head, f_in=encoder.f_in, width=encoder.width, z_dim=encoder.z_dim
+        )
+        ewh.load_state_dict({
+            **{f"encoder.{k}": v for k, v in ckpt["encoder_state"].items()},
+            **{f"mu_head.{k}": v for k, v in ckpt["mu_head_state"].items()},
+            **{f"logvar_head.{k}": v for k, v in ckpt["logvar_head_state"].items()},
+        })
+        ewh.eval()
+        with torch.no_grad():
+            pred_head = ewh.mu_head(torch.from_numpy(Z[va].astype(np.float32))).numpy()
+    except Exception as exc:  # pragma: no cover - diagnostic script
+        print(f"Note: could not rebuild the mu head ({exc}); skipping column C.")
+        pred_head = None
+
+    r2_raw = r2_per_group(pred_raw, Y[va], PRIV_TARGET_GROUPS)
+    r2_z = r2_per_group(pred_z, Y[va], PRIV_TARGET_GROUPS)
+    r2_head = r2_per_group(pred_head, Y[va], PRIV_TARGET_GROUPS) if pred_head is not None else {}
+
+    print(f"\nProbed on {len(va):,} held-out frames "
+          f"({len(tr):,} train). Targets are standardized; R^2 is scale-invariant.\n")
+    print(f"{'target':>20} {'A raw(33)':>10} {'B z(16)':>9} {'C head':>8} {'gate':>7}  reading")
     print("-" * 78)
-    print("  A target whose raw-window linear R^2 is LOW cannot be recovered by any")
-    print("  16-dim encoder, and its gate should be revised rather than retrained against.")
-    print("  A target with HIGH raw-window R^2 but a low encoder R^2 means the information")
-    print("  is present and the bottleneck is the encoder (z_dim, steps, or the loss).")
-    print("  Caveat: a linear probe inside a 100-step window is a LOWER bound on what is")
-    print("  achievable, so high values prove identifiability while low values only")
-    print("  suggest its absence.")
-    print("=" * 78)
+    for name, _dim in PRIV_TARGET_GROUPS:
+        a = r2_raw.get(name, float("nan"))
+        b = r2_z.get(name, float("nan"))
+        c = r2_head.get(name, float("nan"))
+        g = gates.get(name, float("nan"))
+        if np.isnan(a):
+            reading = "-"
+        elif a < 0.10:
+            reading = "not in the observations"
+        elif a < 0.30:
+            reading = "weak signal only"
+        elif b < 0.40:
+            reading = "lost in the z bottleneck"
+        elif not np.isnan(c) and c < b - 0.10:
+            reading = "head underfit vs its own z"
+        else:
+            reading = "identifiable"
+        gate_s = f"{g:7.2f}" if not np.isnan(g) else "      -"
+        c_s = f"{c:8.3f}" if not np.isnan(c) else "       -"
+        print(f"{name:>20} {a:>10.3f} {b:>9.3f} {c_s} {gate_s}  {reading}")
+    print("-" * 78)
+    print("A = memoryless ridge probe on one standardized frame (upper-ish bound without")
+    print("    any bottleneck). B = ridge probe on the encoder's z. C = the trained head.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
