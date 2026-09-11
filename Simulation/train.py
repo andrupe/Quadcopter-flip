@@ -134,6 +134,10 @@ FT_LR_FLOOR: float = 1e-5             # Final floor learning rate for fine-tunin
 # Environment options
 EPISODE_SECONDS: float = 8.0         # Max flight time per episode (seconds)
 SPAWN_ALTITUDE: float = 1.2          # Spawn height (meters; must match SPAWN_Z in quad_flip_env.py)
+# Horizontal footprint: the sampler keeps every suggested reference inside a 1.5 m x 1.5 m
+# square (bounds_xy = 0.75 m in TrajectoryConfig, enforced by a screen at sample time). It
+# is a fixed property of the task rather than a knob here on purpose - evaluation builds
+# the same config, so training and evaluation cannot silently disagree about it.
 ACTION_MODE: str = "rate_pid"        # "rate_pid" (thrust + body rate PID), "motor", or "thrust_moment"
 RANDOM_INITIAL_STATE: bool = True    # Randomize spawn position, tilt, and velocity for robustness
 # ======================================================================================

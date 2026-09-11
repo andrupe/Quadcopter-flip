@@ -17,6 +17,8 @@ if sys.platform == "darwin":
     except Exception:
         pass
 import matplotlib.pyplot as plt
+import gymnasium as gym
+from gymnasium import spaces
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import mujoco
 import mujoco.viewer
@@ -34,14 +36,34 @@ from actor_input import ActorInput, load_checkpoint, read_checkpoint_arch
 import utils
 
 
+class _StatsSpaceEnv(gym.Env):
+    """Space-only stand-in used to load VecNormalize statistics.
+
+    `VecNormalize.load` verifies that the venv it is handed has the SAME observation
+    space as the saved statistics. Those statistics were collected INSIDE the training
+    wrapper chain (LatentObsWrapper -> raw env), i.e. over the raw env observation plus
+    the latent, so a DummyVecEnv around the raw env is rejected with a shape mismatch and
+    the statistics would be skipped. This stub carries the right width and is never
+    stepped or reset - it exists only to pass that check.
+    """
+
+    def __init__(self, obs_dim: int):
+        super().__init__()
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(int(obs_dim),), dtype=np.float32
+        )
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
+
+
 # ======================================================================================
 # EVALUATION CONFIGURATION (Edit parameters directly here, then click Run in VS Code)
-# NOTE: the top-level evaluate.py at the project root is a thin CLI wrapper around this
-# module and is the recommended entry point (it exposes --viewer / --plot / --dr /
-# --episodes and auto-selects the newest checkpoint).
+# This module is the entry point: run it directly (VS Code Run button, or
+# `.venv/bin/python Simulation/evaluate.py`).
 # ======================================================================================
-MODEL_NAME: str = "latest"                          # "latest" auto-selects newest checkpoint in logs/
-EPISODE_SECONDS: float = 10.0         # Duration of each flight test (seconds)
+MODEL_NAME: str = "latest"            # "latest" auto-selects newest checkpoint in logs/
+EPISODE_SECONDS: float = 8.0          # Must match the training horizon (quad_flip_env.EPISODE_SECONDS):
+                                      # it caps the episode AND bounds the references the sampler may draw.
+MANEUVER: Optional[str] = None        # Pin one family (hover/waypoints/figure8/lissajous/orbit/slalom/flip); None = sample the mixture
 NUM_EPISODES: int = 1                 # Number of test episodes to run before showing plots
 SHOW_VIEWER: bool = True              # Launch interactive 3D MuJoCo viewer window
 SHOW_PLOTS: bool = True               # Display 2D telemetry matplotlib plots after run
@@ -50,7 +72,10 @@ EVAL_ACTOR_ONLY: bool = True          # True = pass ONLY the onboard sensor obse
 
 # The frozen encoder AND the [o_t | z] assembly now live in Simulation/actor_input.py and
 # Simulation/encoder/latent_injector.py, so train-time, eval-time and tune-time cannot
-# disagree about the observation layout.
+# disagree about the observation layout. This is the SAME checkpoint train.py loads: a
+# 45-dim [o_t | z] policy needs it, a 29-dim policy ignores it. Read at call time, so
+# validation scripts can repoint it.
+ENCODER_CHECKPOINT: str = os.path.join(_PROJECT_ROOT, "logs", "encoder_gru.pt")
 
 RANDOM_INITIAL_POS: bool = True      # False = ALWAYS spawn at fixed [0.0, 0.0, 1.2] meters
 RANDOM_INITIAL_VEL: bool = True       # True = randomize initial linear and angular velocities
@@ -66,6 +91,7 @@ def evaluate(
     episode_seconds: float = EPISODE_SECONDS,
     num_episodes: int = NUM_EPISODES,
     dr_level: float = DR_LEVEL,
+    maneuver: Optional[str] = MANEUVER,
     show_viewer: bool = SHOW_VIEWER,
     show_plots: bool = SHOW_PLOTS,
     loop: bool = LOOP,
@@ -121,7 +147,7 @@ def evaluate(
     # else is a pre-migration checkpoint whose weights cannot be evaluated against this
     # environment (slicing them would produce a wrong result with no error).
     try:
-        actor_input = ActorInput(detected_actor_dim)
+        actor_input = ActorInput(detected_actor_dim, encoder_path=ENCODER_CHECKPOINT)
     except ValueError as exc:
         raise SystemExit(f"\n[Error] {exc}\n")
 
@@ -132,21 +158,44 @@ def evaluate(
     # silently slicing it wrong.
     print(f"History Encoder    : {actor_input.describe()}")
 
+    # Rebuild the policy from the WEIGHTS (read out of policy.pth and re-applied as
+    # policy_kwargs), not from the saved policy_kwargs metadata, so a checkpoint stays
+    # loadable even when the stored metadata is stale or incomplete.
+    model = load_checkpoint(model_path)
+
+    # Telemetry stays ON here: the evaluation loop reads the ~35-key info dict that the
+    # training fast path skips (train.py sets telemetry=False in its workers only).
+    env = QuadFlipEnv(
+        episode_seconds=episode_seconds,
+        random_initial_state=random_initial_state,
+        random_initial_pos=random_initial_pos,
+        random_initial_vel=random_initial_vel,
+        random_initial_att=random_initial_att,
+        maneuver=maneuver,
+    )
+    env.set_dr_level(dr_level)
+    print(f"Manoeuvre          : "
+          f"{maneuver if maneuver else 'sampled from the training mixture at every reset'}")
+
     obs, info = env.reset()
     actor_input.reset()
 
-    # Load observation normalization statistics if available
+    # Load observation normalization statistics if available. Candidates are keyed on the
+    # checkpoint's own stem first: train.py writes <model>_vecnormalize.pkl next to the
+    # final model and one per checkpoint in logs/.
+    stem = os.path.splitext(os.path.basename(model_path))[0]
     stats_candidates = [
-        os.path.join(_PROJECT_ROOT, f"{model_name}_vecnormalize.pkl"),
-        os.path.join(_PROJECT_ROOT, model_name.replace(".zip", "_vecnormalize.pkl")),
-        os.path.join(os.path.dirname(model_path), f"{os.path.splitext(os.path.basename(model_path))[0]}_vecnormalize.pkl"),
+        os.path.join(os.path.dirname(model_path), f"{stem}_vecnormalize.pkl"),
+        os.path.join(_PROJECT_ROOT, f"{stem}_vecnormalize.pkl"),
         os.path.join(_PROJECT_ROOT, "quad_flip_model_vecnormalize.pkl"),
     ]
     vec_norm = None
     for sp in stats_candidates:
         if os.path.isfile(sp):
             try:
-                dummy_vec = DummyVecEnv([lambda: env])
+                # The dummy venv only has to carry the SPACE the statistics were collected
+                # on (raw env observation + latent when the encoder is attached).
+                dummy_vec = DummyVecEnv([lambda: _StatsSpaceEnv(actor_input.training_obs_dim)])
                 vec_norm = VecNormalize.load(sp, dummy_vec)
                 vec_norm.training = False
                 print(f"Loaded VecNormalize statistics from: {sp} "
@@ -157,9 +206,8 @@ def evaluate(
 
     if vec_norm is None:
         # Not a problem by default: train.py runs with norm_obs=False / norm_reward=False,
-        # so raw observations are exactly what the policy expects. (The old blanket
-        # "CRITICAL WARNING" here was wrong for that configuration - and normalize_obs()
-        # would have been a no-op even if the statistics had been found.)
+        # so raw observations are exactly what the policy expects. (normalize_obs() would
+        # have been a no-op even if the statistics had been found.)
         print("Note: no VecNormalize statistics found for this checkpoint; running on the "
               "raw observation (correct when training used norm_obs=False).")
 
@@ -183,7 +231,6 @@ def evaluate(
 
     episode_idx = 1
     total_reward = 0.0
-    max_pitch_deg = 0.0
     max_tilt_deg = 0.0
     batch_results = []
 
@@ -204,7 +251,6 @@ def evaluate(
             action, _ = model.predict(obs_input, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
-            max_pitch_deg = max(max_pitch_deg, abs(float(np.degrees(env.quad.euler[1]))))
             tilt_deg = float(np.degrees(np.arccos(np.clip(env.quad.dcm[2, 2], -1.0, 1.0))))
             max_tilt_deg = max(max_tilt_deg, tilt_deg)
 
@@ -252,12 +298,25 @@ def evaluate(
                     else:
                         status = f"Terminated ({term_reason})"
                 else:
-                    status = "Completed (Terminal Hover)"
+                    # Truncation is the normal ending under tracking: the reference reaches
+                    # its terminal hover (or, rarely, the step cap is hit first).
+                    traj_done = env.traj is not None and env.t >= env.traj.duration
+                    status = "Completed (Terminal Hover)" if traj_done else "Completed (Time Limit)"
 
                 dist = info.get("active_disturbances", {})
-                flip_deg = np.rad2deg(getattr(env, "accumulated_pitch", getattr(env, "accumulated_roll", 0.0)))
                 wind_spd = getattr(env.wind, "velW_max", 0.0) if env.random_wind else 0.0
-                print(f"[Episode {episode_idx}] Steps: {env.steps:4d} ({info['t']:.2f}s) | Rew: {total_reward:7.1f} | Flip: {str(env.flip_completed):5s} (Progress: {flip_deg:3.0f}°, PeakTilt: {max_tilt_deg:3.0f}°) | {status}")
+                # Final tracking error against the REFERENCE actually flown (env.target_state
+                # follows the reference sample; it is no longer a fixed setpoint).
+                ref_pos = np.asarray(info.get("reference_position", env.target_state), dtype=np.float64)
+                ref_vel = np.asarray(info.get("reference_velocity", env.quad.vel), dtype=np.float64)
+                pos_err = float(np.linalg.norm(env.quad.pos - ref_pos))
+                vel_err = float(np.linalg.norm(env.quad.vel - ref_vel))
+                print(
+                    f"[Episode {episode_idx}] {str(info.get('maneuver', 'n/a')):>9s} | "
+                    f"Steps: {env.steps:4d} ({info['t']:.2f}s) | Rew: {total_reward:7.1f} | "
+                    f"Final err: pos {pos_err:.2f}m vel {vel_err:.2f}m/s | "
+                    f"PeakTilt: {max_tilt_deg:3.0f}° | {status}"
+                )
                 sp = getattr(env, "spawn_pos", env.quad.pos)
                 sv = getattr(env, "spawn_vel", env.quad.vel)
                 print(f"             Spawn State : pos=[{sp[0]:+.2f}, {sp[1]:+.2f}, {sp[2]:+.2f}]m | vel=[{sv[0]:+.2f}, {sv[1]:+.2f}, {sv[2]:+.2f}]m/s")
@@ -286,13 +345,13 @@ def evaluate(
                     print(f"             Disturbances: {dr_str}")
 
                 batch_results.append({
-                    "flip": env.flip_completed,
+                    "maneuver": info.get("maneuver", "n/a"),
                     "status": status,
                     "rew": total_reward,
                     "steps": env.steps,
                     "peak_tilt": max_tilt_deg,
-                    "xy_drift": float(np.linalg.norm(env.quad.pos[:2] - env.target_state[:2])),
-                    "z_err": float(abs(env.quad.pos[2] - env.target_state[2])),
+                    "pos_err": pos_err,
+                    "vel_err": vel_err,
                 })
 
                 if not loop and episode_idx >= num_episodes:
@@ -302,7 +361,6 @@ def evaluate(
                 obs, info = env.reset()
                 actor_input.reset()
                 total_reward = 0.0
-                max_pitch_deg = 0.0
                 max_tilt_deg = 0.0
                 episode_idx += 1
     finally:
@@ -310,19 +368,18 @@ def evaluate(
             viewer.close()
 
     if not loop and len(batch_results) > 1:
-        flips = sum(1 for r in batch_results if r["flip"])
-        hovers = sum(1 for r in batch_results if "Terminal Hover" in r["status"])
-        mean_rew = np.mean([r["rew"] for r in batch_results])
-        mean_xy = np.mean([r["xy_drift"] for r in batch_results])
-        mean_z = np.mean([r["z_err"] for r in batch_results])
-        mean_tilt = np.mean([r["peak_tilt"] for r in batch_results])
+        rews = np.array([r["rew"] for r in batch_results], dtype=np.float64)
+        steps = np.array([r["steps"] for r in batch_results], dtype=np.float64)
+        completed = sum(1 for r in batch_results if r["status"].startswith("Completed"))
+        mean_pos = float(np.mean([r["pos_err"] for r in batch_results]))
+        mean_vel = float(np.mean([r["vel_err"] for r in batch_results]))
+        mean_tilt = float(np.mean([r["peak_tilt"] for r in batch_results]))
         print(f"\n{'='*70}")
         print(f"BATCH EVALUATION SUMMARY ({len(batch_results)} episodes | DR={dr_level:.2f}):")
-        print(f"  Flip Success Rate : {flips}/{len(batch_results)} ({flips/len(batch_results)*100:.0f}%)")
-        print(f"  Hover Recovery    : {hovers}/{len(batch_results)} ({hovers/len(batch_results)*100:.0f}%)")
-        print(f"  Mean Return       : {mean_rew:.1f}")
+        print(f"  Mean Return       : {rews.mean():.1f}  ({rews.sum() / steps.sum():.2f} reward/step)")
+        print(f"  Completed         : {completed}/{len(batch_results)} finished the trajectory without a safety termination")
+        print(f"  Mean Final Error  : pos = {mean_pos:.2f} m | vel = {mean_vel:.2f} m/s")
         print(f"  Mean Peak Tilt    : {mean_tilt:.0f}°")
-        print(f"  Mean Hover Drift  : XY = {mean_xy:.2f}m | Z = {mean_z:.2f}m")
         print(f"{'='*70}\n")
 
     # Telemetry plotting

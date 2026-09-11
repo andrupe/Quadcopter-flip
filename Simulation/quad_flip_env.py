@@ -188,6 +188,12 @@ TRACK_W_RATE: float = 0.8
 # SPAWN_Z - FLIGHT_RADIUS = -0.8 m, i.e. underground, so it is effectively clipped by the
 # ground at exactly 1.2 m below the start point. Spawning on the floor of the volume
 # instead would make ANY downward component of the initial kick an immediate violation.
+#
+# The REFERENCES are held to a much tighter bound than the sphere: TrajectorySampler
+# enforces a 1.5 m x 1.5 m square footprint on every path it emits
+# (|x|, |y| <= TrajectoryConfig.bounds_xy = 0.75 m), so training never proposes a
+# reference outside that square - it screens 96 points along every candidate rather than
+# trusting the draw ranges. The sphere is the VEHICLE's outer termination guard.
 # ======================================================================================
 SPAWN_Z: float = 1.2                 # metres; every manoeuvre starts here
 FLIGHT_RADIUS: float = 2.0           # metres; hard outer boundary, centred on the spawn

@@ -19,7 +19,8 @@ The claims that matter here are physical, not stylistic:
      difference used for omega, which is otherwise easy to get subtly wrong.
 
   E. FEASIBILITY IS ENFORCED. Every sampled trajectory respects the thrust and rate
-     authority, and the sampler reports what it rejected.
+     authority AND fits the 1.5 m x 1.5 m training footprint (|x|, |y| <=
+     TrajectoryConfig.bounds_xy), and the sampler reports what it rejected.
 
 Run:  .venv/bin/python scratch/check_trajectories.py
 """
@@ -199,6 +200,7 @@ kinds: dict = {}
 bad = 0
 max_thr_seen = 0.0
 max_rate_seen = 0.0
+max_xy_seen = 0.0
 N = 300
 for _ in range(N):
     tr = sampler.sample(rng, mass=MASS_NOMINAL)
@@ -207,8 +209,10 @@ for _ in range(N):
     refs = [tr.sample(float(t)) for t in ts]
     thr = max(r.thrust_ff for r in refs)
     rate = max(float(np.linalg.norm(r.omega)) for r in refs)
+    xy = max(float(np.max(np.abs(r.p[:2]))) for r in refs)
     max_thr_seen = max(max_thr_seen, thr)
     max_rate_seen = max(max_rate_seen, rate)
+    max_xy_seen = max(max_xy_seen, xy)
     if thr > MAX_THRUST_TOTAL + 1e-9:
         bad += 1
     if any(flatness_error(r) > 1e-9 for r in refs):
@@ -220,6 +224,11 @@ print(f"        mixture over {N} draws: {kinds}")
 check("no infeasible or inconsistent trajectory sampled", bad == 0, f"{bad} violations")
 check("thrust never exceeds authority", max_thr_seen <= MAX_THRUST_TOTAL, f"max {max_thr_seen:.3f} N")
 check("reference rate stays within the pitch limit", max_rate_seen <= 20.0 + 1e-6, f"max {max_rate_seen:.1f} rad/s")
+check(
+    "every path fits the 1.5 m x 1.5 m training footprint",
+    max_xy_seen <= cfg.bounds_xy + 1e-9,
+    f"max |x|,|y| = {max_xy_seen:.3f} m (limit {cfg.bounds_xy:.2f} m)",
+)
 
 # The pitch/roll asymmetry is a real constraint, so verify the sampler's behaviour.
 roll_traj = 0

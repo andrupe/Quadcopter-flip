@@ -137,8 +137,8 @@ class ActorInput:
             self.encoder_path = encoder_path or ENCODER_CHECKPOINT
             if not os.path.isfile(self.encoder_path):
                 raise ValueError(
-                    f"checkpoint expects a {Z_DIM}-dim latent, but no encoder checkpoint "
-                    f"was found at {self.encoder_path}.\n"
+                    f"checkpoint expects a {Z_DIM}-dim latent, but no encoder was found "
+                    f"at {self.encoder_path}.\n"
                     "Rebuild it:\n"
                     "  .venv/bin/python Simulation/encoder/collect_data.py\n"
                     "  .venv/bin/python Simulation/encoder/train_encoder.py"
@@ -191,6 +191,17 @@ class ActorInput:
                 f"observation has {obs.shape[-1]} dims, checkpoint needs {self.actor_dim}"
             )
         return obs
+
+    @property
+    def training_obs_dim(self) -> int:
+        """Width of the observation the training-time VecNormalize statistics cover.
+
+        LatentObsWrapper sits INSIDE VecNormalize, so with the encoder attached the
+        statistics describe [o_t | z | aux | privileged], not the raw env observation.
+        This is the width a stand-in venv must carry to load those statistics
+        successfully (`VecNormalize.load` checks the observation space shape).
+        """
+        return TOTAL_OBS_DIM + (Z_DIM if self.injector is not None else 0)
 
     def describe(self) -> str:
         if self.injector is not None:
