@@ -38,21 +38,23 @@ import utils
 
 # ======================================================================================
 # EVALUATION CONFIGURATION (Edit parameters directly here, then click Run in VS Code)
+# NOTE: For the newly trained multi-phase Adaptive Architecture (Phase 1 PPO + Phase 2
+# Estimator), run the top-level `evaluate.py` at the project root!
 # ======================================================================================
-MODEL_NAME: str = "logs/rl_model_11850000_steps"   # Model name to evaluate (e.g. "quad_flip_model" or path in logs/)
+MODEL_NAME: str = "latest"                          # "latest" auto-selects newest checkpoint in logs/
 EPISODE_SECONDS: float = 10.0         # Duration of each flight test (seconds)
-NUM_EPISODES: int = 5                 # Number of test episodes to run when LOOP = False
+NUM_EPISODES: int = 1                 # Number of test episodes to run before showing plots
 SHOW_VIEWER: bool = True              # Launch interactive 3D MuJoCo viewer window
-SHOW_PLOTS: bool = True              # Display 2D telemetry matplotlib plots after run
-LOOP: bool = True                     # Loop replay continuously (set False to evaluate NUM_EPISODES)
+SHOW_PLOTS: bool = True               # Display 2D telemetry matplotlib plots after run
+LOOP: bool = True                    # Set True to loop continuously; False to show plots after 1 episode
 EVAL_ACTOR_ONLY: bool = True          # True = pass ONLY the 51-dim onboard sensor observation to model.predict
-RANDOM_INITIAL_POS: bool = False      # False = ALWAYS spawn at fixed [0.0, 0.0, 1.2] meters
+RANDOM_INITIAL_POS: bool = True      # False = ALWAYS spawn at fixed [0.0, 0.0, 1.2] meters
 RANDOM_INITIAL_VEL: bool = True       # True = randomize initial linear and angular velocities
 RANDOM_INITIAL_ATT: bool = True       # True = slight random orientation tilt (roll/pitch/yaw)
 RANDOM_INITIAL_STATE: bool = True     # Master flag (used for compatibility)
-PLAYBACK_SPEED: float = 1.0           # Playback speed (0.25 = 4x slow-motion, 0.5 = 2x slow-mo, 1.0 = real-time)
-DR_LEVEL: float = 0.0               # Domain Randomization intensity: 0.0 = nominal clean sim, 1.0 = full sim-to-real stress
-HOVER_GAIN: float = 1             # Hover authority scale: 1.0 = unattenuated, 0.5 = 50% calm hover authority
+PLAYBACK_SPEED: float = 1           # Playback speed (0.25 = 4x slow-motion, 0.5 = 2x slow-mo, 1.0 = real-time)
+DR_LEVEL: float = 1                # Domain Randomization intensity: 0.0 = nominal clean sim, 1.0 = full sim-to-real stress
+HOVER_GAIN: float = 1.0               # Hover authority scale: 1.0 = unattenuated, 0.5 = 50% calm hover authority
 # ======================================================================================
 
 
@@ -84,6 +86,18 @@ def evaluate(
     else:
         model_path = os.path.join(_PROJECT_ROOT, f"{model_name}.zip")
 
+    if model_name.lower() in ("latest", "auto") or not os.path.isfile(model_path):
+        logs_dir = os.path.join(_PROJECT_ROOT, "logs")
+        if os.path.isdir(logs_dir):
+            zips = [os.path.join(logs_dir, f) for f in os.listdir(logs_dir) if f.endswith(".zip")]
+            if zips:
+                import re
+                def _step_key(p: str):
+                    m = re.search(r"(\d+)_steps", os.path.basename(p))
+                    return int(m.group(1)) if m else os.path.getmtime(p)
+                zips.sort(key=_step_key, reverse=True)
+                model_path = zips[0]
+
     if not os.path.isfile(model_path):
         print(f"\n[Error] Model file not found at: {model_path}")
         print("Please train the model first by running train.py!\n")
@@ -94,6 +108,7 @@ def evaluate(
     print(f"Hover Gain Scale   : {hover_gain:.2f} ({'Unattenuated (100% authority)' if hover_gain >= 1.0 else f'{int((1.0 - hover_gain)*100)}% attenuated'})")
     print(f"Initial State      : Pos={'[0.0, 0.0, 1.2] (fixed)' if not random_initial_pos else 'Randomized'} | Vel={'Randomized' if random_initial_vel else 'Zero'}")
     detected_actor_dim = ACTOR_TOTAL_DIM
+    detected_net_arch = None
     try:
         import zipfile
         import io
@@ -103,17 +118,39 @@ def evaluate(
                     sd = torch.load(io.BytesIO(f.read()), map_location="cpu")
                     if "mlp_extractor.policy_net.0.weight" in sd:
                         detected_actor_dim = int(sd["mlp_extractor.policy_net.0.weight"].shape[1])
+                    pi_dims = []
+                    idx = 0
+                    while f"mlp_extractor.policy_net.{idx}.weight" in sd:
+                        pi_dims.append(int(sd[f"mlp_extractor.policy_net.{idx}.weight"].shape[0]))
+                        idx += 2
+                    vf_dims = []
+                    idx = 0
+                    while f"mlp_extractor.value_net.{idx}.weight" in sd:
+                        vf_dims.append(int(sd[f"mlp_extractor.value_net.{idx}.weight"].shape[0]))
+                        idx += 2
+                    if pi_dims:
+                        detected_net_arch = dict(pi=pi_dims, vf=vf_dims if vf_dims else [512, 256, 128])
     except Exception:
         pass
 
     coord_desc = "with XYZ coordinates" if detected_actor_dim == ACTOR_TOTAL_DIM else "legacy (no coordinates)"
     print(f"Inference Mode     : {'Actor Only (' + str(detected_actor_dim) + ' dims, ' + coord_desc + ')' if eval_actor_only else f'Full Observation Vector ({TOTAL_OBS_DIM} dims)'}")
+
+    custom_objs = dict(
+        policy_class=AsymmetricActorCriticPolicy,
+        actor_obs_dim=detected_actor_dim,
+    )
+    if detected_net_arch:
+        custom_objs["net_arch"] = detected_net_arch
+        custom_objs["policy_kwargs"] = dict(
+            actor_obs_dim=detected_actor_dim,
+            activation_fn=torch.nn.Tanh,
+            net_arch=detected_net_arch,
+        )
+
     model = PPO.load(
         model_path,
-        custom_objects=dict(
-            policy_class=AsymmetricActorCriticPolicy,
-            actor_obs_dim=detected_actor_dim,
-        ),
+        custom_objects=custom_objs,
     )
     env = QuadFlipEnv(
         episode_seconds=episode_seconds,
@@ -164,7 +201,7 @@ def evaluate(
             print(f"Note: Could not launch interactive viewer window ({e}). Running headless.")
 
     # Telemetry storage (only populated if plotting is enabled)
-    telemetry = {k: [] for k in ["t", "pos", "vel", "quat", "omega", "euler", "w_cmd", "wMotor", "thr", "tor"]} if show_plots else None
+    telemetry = {k: [] for k in ["t", "pos", "vel", "quat", "omega", "omega_des", "throttle", "euler", "w_cmd", "wMotor", "thr", "tor"]} if show_plots else None
 
     episode_idx = 1
     total_reward = 0.0
@@ -180,8 +217,10 @@ def evaluate(
             step_start = time.time()
             obs_normalized = vec_norm.normalize_obs(obs) if vec_norm else obs
             if eval_actor_only:
-                # Pass strictly the actor observation slice
+                # Pass strictly the actor observation slice matching model's expected dimension
                 obs_input = obs_normalized[:detected_actor_dim]
+                if len(obs_input) < detected_actor_dim:
+                    obs_input = np.pad(obs_input, (0, detected_actor_dim - len(obs_input)))
             else:
                 obs_input = obs_normalized
 
@@ -198,6 +237,8 @@ def evaluate(
                 telemetry["vel"].append(info["velocity"])
                 telemetry["quat"].append(info["quat"])
                 telemetry["omega"].append(info["omega"])
+                telemetry["omega_des"].append(info.get("omega_des", np.zeros(3)))
+                telemetry["throttle"].append(info.get("throttle", 0.0))
                 telemetry["euler"].append(env.quad.euler.copy())
                 telemetry["w_cmd"].append(info["motor_cmd"])
                 telemetry["wMotor"].append(env.quad.wMotor.copy())
@@ -318,6 +359,28 @@ def evaluate(
             sDes, sDes,
             save_path=pdf_path,
         )
+
+        # Rate tracking diagnostic plot
+        if "omega_des" in telemetry and len(telemetry["omega_des"]) > 0:
+            omega_meas_arr = np.array(telemetry["omega"])
+            omega_des_arr = np.array(telemetry["omega_des"])
+            t_arr = np.array(telemetry["t"])
+            fig, axes = plt.subplots(3, 1, figsize=(9, 6), sharex=True)
+            axis_names = ["Roll Rate ωx (rad/s)", "Pitch Rate ωy (rad/s)", "Yaw Rate ωz (rad/s)"]
+            for ax_idx in range(3):
+                axes[ax_idx].plot(t_arr, omega_des_arr[:, ax_idx], "r--", label="Commanded (Policy)", linewidth=1.5)
+                axes[ax_idx].plot(t_arr, omega_meas_arr[:, ax_idx], "b-", label="Measured (Gyro)", linewidth=1.0)
+                axes[ax_idx].set_ylabel(axis_names[ax_idx])
+                axes[ax_idx].grid(True, alpha=0.3)
+                if ax_idx == 0:
+                    axes[ax_idx].legend(loc="upper right")
+            axes[-1].set_xlabel("Time (s)")
+            fig.suptitle("Inner-Loop Rate PID Tracking Performance")
+            fig.tight_layout()
+            rate_plot_path = os.path.join(_PROJECT_ROOT, "rate_tracking_plot.png")
+            fig.savefig(rate_plot_path, dpi=150)
+            plt.close(fig)
+            print(f"Rate tracking diagnostic plot saved to: {rate_plot_path}")
 
 
 if __name__ == "__main__":

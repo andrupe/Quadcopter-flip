@@ -24,6 +24,7 @@ if _SIM_DIR not in sys.path:
 import utils
 import config
 from quadFiles.initQuad import makeMixerFM
+from utils.mixer import mixerFM
 
 
 class QuadcopterMuJoCo:
@@ -129,6 +130,7 @@ class QuadcopterMuJoCo:
 
         self.t: float = float(Ti)
         self.wMotor: np.ndarray = np.ones(4) * w_hover
+        self.last_motor_cmd: np.ndarray = np.ones(4) * w_hover
         self.thr: np.ndarray = np.ones(4) * thr_hover
         self.tor: np.ndarray = np.ones(4) * (kTo * (w_hover**2))
         self.vel_dot: np.ndarray = np.zeros(3)
@@ -272,21 +274,33 @@ class QuadcopterMuJoCo:
         self,
         t: float,
         dt: float,
-        motor_cmd: np.ndarray,
+        motor_cmd: Optional[np.ndarray] = None,
         wind: Any = None,
+        rate_cmd: Optional[Tuple[float, np.ndarray]] = None,
+        rate_pid: Optional[Any] = None,
+        gyro_bias: Optional[np.ndarray] = None,
     ):
         """
-        Step simulation by mapping motor angular speeds (rad/s) or
-        thrusts to MuJoCo actuator controls.
+        Step simulation by mapping motor angular speeds (rad/s),
+        or by executing inner-loop Rate PID sub-stepping from [throttle, omega_des].
         """
         prev_vel = self.vel.copy()
         prev_omega = self.omega.copy()
 
-        w_motor_target = np.clip(
-            np.asarray(motor_cmd, dtype=np.float64),
-            self.params["minWmotor"],
-            self.params["maxWmotor"],
-        )
+        if rate_cmd is not None and rate_pid is not None:
+            throttle, omega_des = rate_cmd
+            throttle = float(throttle)
+            omega_des = np.asarray(omega_des, dtype=np.float64)
+            w_motor_target = self.last_motor_cmd.copy()
+        elif motor_cmd is not None:
+            w_motor_target = np.clip(
+                np.asarray(motor_cmd, dtype=np.float64),
+                self.params["minWmotor"],
+                self.params["maxWmotor"],
+            )
+            self.last_motor_cmd = w_motor_target.copy()
+        else:
+            w_motor_target = self.last_motor_cmd.copy()
 
         # Dynamic wind injection
         if wind is not None and hasattr(wind, "randomWind"):
@@ -306,6 +320,16 @@ class QuadcopterMuJoCo:
         torques = np.zeros(4, dtype=np.float64)
 
         for _ in range(n_substeps):
+            # 0. Inner-loop Rate PID closed-loop update at physics sub-step rate
+            if rate_cmd is not None and rate_pid is not None:
+                curr_omega = self.data.qvel[3:6].copy()
+                if gyro_bias is not None:
+                    curr_omega += gyro_bias
+                moments = rate_pid.update(omega_des, curr_omega, sub_dt)
+                w_motor_target = mixerFM(self, throttle, moments)
+                w_motor_target = np.clip(w_motor_target, self.params["minWmotor"], self.params["maxWmotor"])
+                self.last_motor_cmd = w_motor_target.copy()
+
             # 1. Evolve directional 1st-order motor dynamics low-pass filter at physical timestep
             for i in range(4):
                 tau_i = self.tau_up if w_motor_target[i] >= self.wMotor[i] else self.tau_down

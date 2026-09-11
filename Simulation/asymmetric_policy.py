@@ -8,7 +8,14 @@ import torch as th
 import torch.nn as nn
 from gymnasium import spaces
 
-from stable_baselines3.common.distributions import Distribution
+from stable_baselines3.common.distributions import (
+    Distribution,
+    DiagGaussianDistribution,
+    CategoricalDistribution,
+    MultiCategoricalDistribution,
+    BernoulliDistribution,
+    StateDependentNoiseDistribution,
+)
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from stable_baselines3.common.utils import get_device, is_vectorized_observation
@@ -40,7 +47,7 @@ class AsymmetricMlpExtractor(nn.Module):
         device = get_device(device)
 
         if isinstance(net_arch, dict):
-            pi_layers_dims = net_arch.get("pi", [128, 128])
+            pi_layers_dims = net_arch.get("pi", [128, 64])
             vf_layers_dims = net_arch.get("vf", [512, 256, 128])
         else:
             pi_layers_dims = vf_layers_dims = net_arch
@@ -95,15 +102,17 @@ class AsymmetricActorCriticPolicy(ActorCriticPolicy):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         lr_schedule: Schedule,
-        actor_obs_dim: int = ACTOR_TOTAL_DIM,
+        actor_obs_dim: Optional[int] = None,
         net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
         activation_fn: Type[nn.Module] = nn.Tanh,
         *args: Any,
         **kwargs: Any,
     ) -> None:
+        if actor_obs_dim is None:
+            actor_obs_dim = kwargs.pop("actor_obs_dim", ACTOR_TOTAL_DIM)
         self.actor_obs_dim = int(actor_obs_dim)
         if net_arch is None:
-            net_arch = dict(pi=[128, 128], vf=[512, 256, 128])
+            net_arch = kwargs.pop("net_arch", dict(pi=[128, 64], vf=[512, 256, 128]))
 
         super().__init__(
             observation_space=observation_space,
@@ -161,6 +170,27 @@ class AsymmetricActorCriticPolicy(ActorCriticPolicy):
         latent_pi = self.mlp_extractor.forward_actor(pi_obs)
         return self._get_action_dist_from_latent(latent_pi)
 
+    MIN_LOG_STD: float = -2.5   # Ultimate floor: std >= exp(-2.5) ≈ 0.08 (callback schedules active floor above this)
+    MAX_LOG_STD: float = 0.0    # Corresponds to std <= exp(0.0) = 1.0 (prevents noise explosion)
+
+    def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
+        """Constructs action distribution with guaranteed minimum exploration floor."""
+        mean_actions = self.action_net(latent_pi)
+
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            clamped_log_std = th.clamp(self.log_std, min=self.MIN_LOG_STD, max=self.MAX_LOG_STD)
+            return self.action_dist.proba_distribution(mean_actions, clamped_log_std)
+        elif isinstance(self.action_dist, CategoricalDistribution):
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, MultiCategoricalDistribution):
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, BernoulliDistribution):
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std, latent_pi)
+        else:
+            raise ValueError("Invalid action distribution")
+
     def predict_values(self, obs: PyTorchObs) -> th.Tensor:
         """Computes value estimation using the full privileged observation vector."""
         if isinstance(obs, dict):
@@ -184,3 +214,19 @@ class AsymmetricActorCriticPolicy(ActorCriticPolicy):
             return obs_tensor, is_vectorized
 
         return super().obs_to_tensor(observation)
+
+    def get_latent(self, obs: PyTorchObs) -> th.Tensor:
+        """
+        Extracts the 64-dimensional latent representation z_t from the feedforward
+        history encoder (Layer 1 + Layer 2).
+        """
+        if isinstance(obs, dict):
+            pi_obs = obs["actor"]
+        elif obs.shape[-1] == self.actor_obs_dim:
+            pi_obs = obs
+        else:
+            pi_obs = obs[..., :self.actor_obs_dim]
+
+        if not isinstance(pi_obs, th.Tensor):
+            pi_obs = th.as_tensor(pi_obs, dtype=th.float32, device=self.device)
+        return self.mlp_extractor.forward_actor(pi_obs)

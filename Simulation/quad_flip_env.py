@@ -20,6 +20,7 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
 from quadFiles.quad_mujoco import QuadcopterMuJoCo
 from utils.windModel import Wind
 from utils.mixer import mixerFM
+from utils.rate_pid import RatePIDController
 import utils
 import config
 
@@ -27,12 +28,12 @@ import config
 # ENVIRONMENT CONFIGURATION
 # ======================================================================================
 TARGET_ALTITUDE: float = 1.2         # Target hover altitude post-flip (meters)
-TARGET_ALTITUDE_FLIP: float = 1.45   # Target pre-flip climb altitude (meters: +25cm upward punch)
+TARGET_ALTITUDE_FLIP: float = 1.6   # Target pre-flip climb altitude (meters: +25cm upward punch)
 SPAWN_ALTITUDE: float = 1.2          # Quadcopter spawn altitude (meters)
 SIM_DT: float = 0.01                 # Timestep in seconds (0.01s = 10ms -> 100 Hz)
 
 EPISODE_SECONDS: float = 8.0         # Episode duration in seconds
-ACTION_MODE: str = "motor"           # "motor" (direct rotor rad/s) or "thrust_moment"
+ACTION_MODE: str = "rate_pid"        # "rate_pid" (thrust + body rate PID), "motor", or "thrust_moment"
 OBS_NOISE: bool = True               # Add Gaussian sensor noise (sim-to-real domain randomization)
 RANDOM_WIND: bool = True             # Add dynamic wind disturbances
 MAX_WIND_SPEED: float = 1.0          # Maximum wind speed in m/s
@@ -66,20 +67,24 @@ OBS_NOISE_VEL_RANGE: tuple = (0.020, 0.060)       # ±2cm/s to ±6cm/s
 OBS_NOISE_OMEGA_RANGE: tuple = (0.030, 0.150)     # ±1.7°/s to ±8.6°/s
 OBS_NOISE_ATT_DEG_RANGE: tuple = (0.5, 2.0)       # ±0.5° to ±2.0°
 
-# Physical tolerances for Cauchy kernels: 1 / (1 + (error / tol)^2)
-TOL_PITCH_RATE: float = 14.0         # rad/s (pitch rate tracking bandwidth)
-TOL_ALT_DOWN: float = 0.30           # meters (tolerated dip during flip)
-TOL_ALT_UP: float = 0.70             # meters (upward altitude tolerance)
-ALT_PRE_CLIMB_BUFFER: float = 0.15   # meters (zero-penalty pre-climb ceiling buffer)
+# Physical tolerances
+TOL_PITCH_RATE: float = 20.0         # rad/s (pitch rate tracking bandwidth)
+TOL_FLIP_ANGLE: float = 1.4          # rad (remaining angle tolerance for rotation completion progress)
+TOL_ALT_DOWN: float = 0.40           # meters (tolerated dip during flip)
+TOL_ALT_UP: float = 0.80             # meters (upward altitude tolerance)
+ALT_PRE_CLIMB_BUFFER: float = 0.3   # meters (zero-penalty pre-climb ceiling buffer)
 TOL_PARASITIC: float = 5.0           # rad/s (off-axis roll/yaw rate tolerance)
 TOL_XY_DRIFT: float = 0.40           # meters (horizontal drift tolerance during flip)
-TOL_XY_HOVER: float = 0.50           # meters (planar XY drift basin in hover)
+TOL_POS_HOVER: float = 0.3          # meters (3D position error tolerance during hover)
+TOL_XY_HOVER: float = 0.6          # meters (planar XY drift basin in hover)
 TOL_Z_HOVER: float = 0.08            # meters (vertical altitude error tolerance in hover)
 TOL_SO3_ATTITUDE: float = 0.70       # SO(3) attitude error (1 - R33) tolerance
-TOL_HEADING: float = 0.80            # rad (~20° heading alignment tolerance)
+TOL_HEADING: float = 0.5           # rad (~20° heading alignment tolerance)
 TOL_VEL_HOVER: float = 0.25          # m/s (linear velocity damping tolerance)
-TOL_Z_VEL_FLIP: float = 0.55         # m/s (target climb velocity during flip initiation)
+TOL_Z_VEL_FLIP: float = 0.9       # m/s (target climb velocity during flip initiation)
 TOL_OMEGA_HOVER: float = 3.0         # rad/s (angular velocity damping tolerance)
+ARENA_RADIUS_START: float = 2.5      # Starting arena radius for curriculum learning (meters)
+ARENA_RADIUS_END: float = 0.8        # Final arena radius at full domain randomization (meters)
 
 # Smoothness and Deadband Parameters
 TOL_ACTION_SMOOTH: float = 0.33      # 1st-order action rate norm tolerance (~1,300 RPM / step)
@@ -116,7 +121,10 @@ class QuadFlipEnv(gym.Env):
         random_battery: bool = RANDOM_BATTERY,
         motor_tau: float = MOTOR_TAU,
         pitch_direction: float = PITCH_DIRECTION,
-        arena_radius: float = 2.5,
+        arena_radius: Optional[float] = None,
+        arena_radius_start: float = ARENA_RADIUS_START,
+        arena_radius_end: float = ARENA_RADIUS_END,
+        curriculum_arena: bool = True,
         hover_gain: float = ACTION_HOVER_GAIN,
         tol_xy_hover: Optional[float] = None,
         tol_vel_hover: Optional[float] = None,
@@ -134,6 +142,9 @@ class QuadFlipEnv(gym.Env):
         w_omega: Optional[float] = None,
         w_action: Optional[float] = None,
         w_progress: Optional[float] = None,
+        rate_pid_kp: Optional[Union[np.ndarray, list, float]] = None,
+        rate_pid_ki: Optional[Union[np.ndarray, list, float]] = None,
+        rate_pid_kd: Optional[Union[np.ndarray, list, float]] = None,
     ):
         super().__init__()
 
@@ -152,7 +163,15 @@ class QuadFlipEnv(gym.Env):
         self.random_battery = bool(random_battery)
         self.motor_tau = float(motor_tau)
         self.pitch_direction = float(pitch_direction)
-        self.arena_radius = float(arena_radius)
+        self.arena_radius_start = float(arena_radius_start)
+        self.arena_radius_end = float(arena_radius_end)
+        self.curriculum_arena = bool(curriculum_arena)
+        if arena_radius is not None:
+            self.arena_radius = float(arena_radius)
+            if arena_radius_start == ARENA_RADIUS_START and arena_radius_end == ARENA_RADIUS_END and curriculum_arena:
+                self.curriculum_arena = False
+        else:
+            self.arena_radius = self.arena_radius_start
         self.hover_gain = float(hover_gain)
 
         # Configurable reward tolerances
@@ -173,7 +192,7 @@ class QuadFlipEnv(gym.Env):
         self.w_vel = float(w_vel if w_vel is not None else 3.0)
         self.w_omega = float(w_omega if w_omega is not None else 1.2)
         self.w_action = float(w_action if w_action is not None else 0.70)
-        self.w_progress = float(w_progress if w_progress is not None else 20.0)  # PBRS full potential scale
+        self.w_progress = float(w_progress if w_progress is not None else 2.0)  # Legacy progress weight compatibility
 
         # MuJoCo physics model
         self.quad = QuadcopterMuJoCo(motor_tau=self.motor_tau)
@@ -201,6 +220,16 @@ class QuadFlipEnv(gym.Env):
         self.hover_w = float(self.quad.params["w_hover"])
         self.max_torque_xy = 0.01
         self.max_torque_z = 0.003
+        self.max_rate_xy: float = 6.0       # Max roll rate (rad/s)
+        self.max_rate_pitch: float = 20.0   # Max pitch rate (rad/s) for flip
+        self.max_rate_z: float = 4.0        # Max yaw rate (rad/s)
+        self.rate_pid = RatePIDController(
+            kp=rate_pid_kp,
+            ki=rate_pid_ki,
+            kd=rate_pid_kd,
+            max_torque_xy=self.max_torque_xy,
+            max_torque_z=self.max_torque_z,
+        )
 
         # Task targets & flight progress tracking
         self.initial_pos = np.array([0.0, 0.0, self.spawn_altitude], dtype=np.float32)
@@ -210,6 +239,7 @@ class QuadFlipEnv(gym.Env):
         self.target_flip_state = np.array([0.0, 0.0, self.target_altitude_flip], dtype=np.float32)
         self.accumulated_pitch: float = 0.0
         self.total_pitch_rotated: float = 0.0
+        self.reached_90: bool = False
         self.has_inverted: bool = False
         self.flip_completed: bool = False
         self.flip_completed_time: Optional[float] = None
@@ -227,13 +257,27 @@ class QuadFlipEnv(gym.Env):
     def target_state(self) -> np.ndarray:
         return self.target_hover_state if self.flip_completed else self.target_flip_state
 
-    @staticmethod
-    def _cauchy(error: float, tol: float) -> float:
-        """Heavy-tailed Lorentzian/Cauchy kernel: 1 / (1 + (e / tol)^2)."""
-        return float(1.0 / (1.0 + (error / tol) ** 2))
+
+    def set_arena_radius(self, radius: float) -> None:
+        """Manually sets the arena boundary radius."""
+        self.arena_radius = float(radius)
 
     def set_dr_level(self, level: float) -> None:
+        """Sets the Domain Randomization level [0.0, 1.0] and updates curriculum arena radius."""
         self.dr_level = float(np.clip(level, 0.0, 1.0))
+        if self.curriculum_arena:
+            self.arena_radius = float(
+                self.arena_radius_start - self.dr_level * (self.arena_radius_start - self.arena_radius_end)
+            )
+
+    def set_rate_pid_gains(
+        self,
+        kp: Optional[Union[np.ndarray, list, float]] = None,
+        ki: Optional[Union[np.ndarray, list, float]] = None,
+        kd: Optional[Union[np.ndarray, list, float]] = None,
+    ) -> None:
+        """Dynamically update inner-loop Rate PID controller gains."""
+        self.rate_pid.set_gains(kp=kp, ki=ki, kd=kd)
 
     def _compute_actor_obs(self) -> np.ndarray:
         pos = self.quad.pos.copy().astype(np.float32)
@@ -363,145 +407,111 @@ class QuadFlipEnv(gym.Env):
             np.array([flip_progress], dtype=np.float32),
         ], dtype=np.float32)
 
-    def _compute_flip_envelope(self) -> float:
-        """Evaluates physical containment during the dynamic flip maneuver."""
-        pos = self.quad.pos
-        vel = self.quad.vel
-        omega = self.quad.omega
-
-        # 1. Dynamic pitch rate tracking guidance
-        target_pitch_rate = 18.0 * self.pitch_direction
-        if self.accumulated_pitch > 4.7:
-            blend_rate = float(np.clip((FLIP_THRESHOLD - self.accumulated_pitch) / (FLIP_THRESHOLD - 4.7), 0.0, 1.0))
-            target_pitch_rate *= blend_rate
-        pitch_rate_err = float(abs(omega[1] - target_pitch_rate))
-        r_pitch_rate = self._cauchy(pitch_rate_err, TOL_PITCH_RATE)
-
-        # 2. Asymmetric altitude preservation
-        alt_drop = max(0.0, self.target_flip_state[2] - pos[2])
-        alt_climb = max(0.0, pos[2] - (self.target_flip_state[2] + ALT_PRE_CLIMB_BUFFER))
-        r_alt_down = self._cauchy(alt_drop, TOL_ALT_DOWN)
-        r_alt_up = self._cauchy(alt_climb, TOL_ALT_UP)
-        r_altitude = 0.5 * r_alt_down + 0.5 * r_alt_up
-
-        # 3. Off-axis parasitic rate damping & yaw suppression (prevents coning precession)
-        parasitic_rate = float(np.sqrt(omega[0] ** 2 + omega[2] ** 2))
-        r_parasitic = self._cauchy(parasitic_rate, 3.0)
-        p_yaw = -0.5 * float((abs(omega[2]) - 4.0) / 4.0) if abs(omega[2]) > 4.0 else 0.0
-
-        # 4. Planar XY drift containment
-        xy_dist = float(np.linalg.norm(pos[:2] - self.target_flip_state[:2]))
-        r_xy = self._cauchy(xy_dist, TOL_XY_DRIFT)
-
-        # 5. Upward velocity pop
-        vz = float(vel[2])
-        if vz >= self.tol_z_vel_flip:
-            r_z_vel = self._cauchy(vz - self.tol_z_vel_flip, 0.35)
-        else:
-            r_z_vel = self._cauchy(self.tol_z_vel_flip - vz, 0.20)
-
-        return (
-            1.2 * r_pitch_rate
-            + 1.0 * r_altitude
-            + 0.8 * r_z_vel
-            + 1.2 * r_parasitic
-            + 0.5 * r_xy
-            + p_yaw
-        )
-
-    def _compute_hover_envelope(self) -> float:
-        """Evaluates steady-state station keeping with Cauchy fat-tails and sensor deadbands."""
+    def _compute_reward(self, action: np.ndarray, delta_pitch: float) -> float:
+        """
+        - Phase 1 (Flip): Exponential pitch rate tracking, rotation progress, altitude lock, parasitic rate damping.
+        - Phase 2 (Recovery): Exponential position lock, upright orientation (SO3), velocity & angular rate damping.
+        """
         pos = self.quad.pos
         vel = self.quad.vel
         omega = self.quad.omega
         dcm = self.quad.dcm
 
-        # 1. Upright attitude on SO(3)
-        so3_error = float(1.0 - dcm[2, 2])
-        r_upright = self._cauchy(so3_error, self.tol_so3_attitude) if dcm[2, 2] > 0.0 else 0.0
+        # Control smoothness exponential: peaks at 1.0 when motor changes remain within tolerance
+        delta_action_norm = float(np.linalg.norm(action - self.prev_action))
+        r_action = float(np.exp(-((delta_action_norm / TOL_ACTION_SMOOTH) ** 2)))
 
-        # Upright gate: position, velocity, and alive rewards require right-side up flight
-        upright_gate = float(np.clip((dcm[2, 2] - 0.2) / 0.6, 0.0, 1.0))
-        r_alive = 1.0 * upright_gate
+        if not self.flip_completed:
+            # 1. Dynamic pitch rate tracking guidance (drives aggressive flip discovery)
+            target_pitch_rate = 18.0 * self.pitch_direction
+            if self.accumulated_pitch > 4.7:
+                blend_rate = float(np.clip((FLIP_THRESHOLD - self.accumulated_pitch) / (FLIP_THRESHOLD - 4.7), 0.0, 1.0))
+                target_pitch_rate *= blend_rate
+            pitch_rate_err = float(abs(omega[1] - target_pitch_rate))
+            r_pitch_rate = float(np.exp(-((pitch_rate_err / 5.0) ** 2)))
 
-        # 2. Planar XY position lock with 1 cm deadband
-        xy_error = float(np.linalg.norm(pos[:2] - self.target_hover_state[:2]))
-        xy_err_eff = max(0.0, xy_error - POS_DEADBAND)
-        r_xy = self._cauchy(xy_err_eff, self.tol_xy_hover)
+            # 2. Rotation completion progress: strictly monotonic linear progress [0.0, 1.0]
+            r_progress = float(np.clip(self.accumulated_pitch / FLIP_THRESHOLD, 0.0, 1.0))
 
-        # 3. Vertical altitude lock with 1 cm deadband
-        z_error = float(abs(pos[2] - self.target_hover_state[2]))
-        z_err_eff = max(0.0, z_error - POS_DEADBAND)
-        r_z = self._cauchy(z_err_eff, self.tol_z_hover)
+            # 3. Asymmetric Altitude: allow pre-climb up to +0.30m (1.50m) during flip with zero penalty.
+            # When inverted (dcm[2, 2] < 0), naturally allow ballistic drop without panicking the policy.
+            inversion = float(max(0.0, -dcm[2, 2]))
+            tol_down_eff = TOL_ALT_DOWN * (1.0 + 1.5 * inversion)
+            alt_drop = max(0.0, self.target_state[2] - pos[2])
+            alt_climb = max(0.0, pos[2] - (self.target_state[2] + ALT_PRE_CLIMB_BUFFER))
+            r_alt_down = float(np.exp(-((alt_drop / tol_down_eff) ** 2)))
+            r_alt_up = float(np.exp(-((alt_climb / TOL_ALT_UP) ** 2)))
+            r_altitude = 0.5 * r_alt_down + 0.5 * r_alt_up
 
-        # 4. Heading alignment
-        heading_error = float(abs(np.arctan2(dcm[1, 0], dcm[0, 0])))
-        r_heading = self._cauchy(heading_error, self.tol_heading)
+            # 4. Parasitic off-axis damping (roll omega[0] and yaw omega[2])
+            parasitic_rate = float(np.sqrt(omega[0] ** 2 + omega[2] ** 2))
+            r_parasitic = float(np.exp(-((parasitic_rate / TOL_PARASITIC) ** 2)))
 
-        # 5. Linear and angular velocity damping
-        vel_norm = float(np.linalg.norm(vel))
-        r_vel = self._cauchy(vel_norm, self.tol_vel_hover)
+            # 5. Planar containment relative to target (stay near commanded XY)
+            xy_dist = float(np.linalg.norm(pos[:2] - self.target_state[:2]))
+            r_xy = float(np.exp(-((xy_dist / TOL_XY_DRIFT) ** 2)))
 
-        omega_norm = float(np.linalg.norm(omega))
-        r_omega = self._cauchy(omega_norm, self.tol_omega_hover)
+            # 6. Gentle upward pop during flip (+Z in ENU frame):
+            # Target is ~+0.4 m/s climb to counteract inverted altitude drop.
+            # Downward velocity (falling, vz < 0) is steeply penalized to prevent ground contact.
+            vz = float(vel[2])
+            if vz >= TOL_Z_VEL_FLIP:
+                # Climbing at or above target (+0.4 m/s): gentle decay to avoid ceiling breach
+                r_z_vel = float(np.exp(-(((vz - TOL_Z_VEL_FLIP) / 0.35) ** 2)))
+            else:
+                # Slower climb or falling: tight tolerance drops sharply to ~0 for vz <= 0
+                r_z_vel = float(np.exp(-(((TOL_Z_VEL_FLIP - vz) / 0.20) ** 2)))
 
-        # Residual spin penalty
-        p_spin = -0.5 * float((omega_norm - 3.0) / 3.0) if omega_norm > 3.0 else 0.0
+            # 7. Inverted Throttle Management (Acrobatic Ballistic Flip):
+            # When upside down (inversion > 0, dcm[2, 2] < 0), rotor thrust points straight at the ground.
+            # Reward cutting throttle to near-zero (< 20%) while inverted so the drone doesn't blast into the floor.
+            norm_throttle = float(0.5 * (action[0] + 1.0))  # [0.0 = zero thrust, 1.0 = max thrust]
+            r_cut_throttle = float(np.exp(-((norm_throttle / 0.25) ** 2)))
+            r_inverted_throttle = inversion * r_cut_throttle
 
-        return (
-            r_alive
-            + upright_gate * (
-                self.w_xy * r_xy
-                + self.w_z * r_z
-                + self.w_heading * r_heading
-                + self.w_vel * r_vel
+            reward = (
+                0.5 * r_pitch_rate
+                + 2.0 * r_progress
+                + 1.0 * r_altitude
+                + 1.0 * r_z_vel
+                + 0.5 * r_parasitic
+                + 0.5 * r_xy
+                + 0.5 * r_action
             )
-            + self.w_upright * r_upright
-            + self.w_omega * r_omega
-            + p_spin
-        )
-
-    def _compute_reward(self, action: np.ndarray, delta_pitch_potential: float) -> float:
-        """
-        Computes the blended reward combining:
-        - Telescoping potential-based progress (PBRS)
-        - Sigmoidally blended flip & hover task envelopes
-        - First-order rate and second-order jerk actuator regularization
-        """
-        # 1. High-order actuator regularization (rate + jerk)
-        delta_action = action - self.prev_action
-        delta2_action = action - 2.0 * self.prev_action + self.prev_prev_action
-        norm_delta1 = float(np.linalg.norm(delta_action))
-        norm_delta2 = float(np.linalg.norm(delta2_action))
-
-        r_act_rate = self._cauchy(norm_delta1, TOL_ACTION_SMOOTH)
-        r_act_jerk = self._cauchy(norm_delta2, TOL_ACTION_JERK)
-        r_action_smooth = 0.6 * r_act_rate + 0.4 * r_act_jerk
-
-        # 2. Potential-Based Pitch Progress (strictly bounded telescoping sum)
-        r_potential = self.w_progress * delta_pitch_potential
-
-        # 3. Continuous Sigmoid Phase Blending
-        # Centered at 88% completion (~315°) with width k=16 (smooth over [0.75, 1.0])
-        progress_ratio = float(np.clip(self.accumulated_pitch / FLIP_THRESHOLD, 0.0, 1.0))
-        raw_blend = float(1.0 / (1.0 + np.exp(-16.0 * (progress_ratio - 0.88))))
-
-        if self.flip_completed and self.flip_completed_time is not None:
-            # Glides seamlessly to 1.0 over 200ms post-flip to eliminate any transition bump
-            t_post = self.t - self.flip_completed_time
-            blend = float(np.clip(raw_blend + (1.0 - raw_blend) * (t_post / 0.20), 0.0, 1.0))
         else:
-            blend = raw_blend
+            # --- PHASE 2: RECOVER & PRECISION HOVER ---
+            # Post-flip living bonus: reduced to 1.0 to balance Phase 2 vs Phase 1 economics
+            r_alive = 2.0
 
-        r_flip_envelope = self._compute_flip_envelope()
-        r_hover_envelope = self._compute_hover_envelope()
+            # 1. 3D Position lock to target setpoint
+            pos_error = float(np.linalg.norm(pos - self.target_state))
+            r_pos = float(np.exp(-((pos_error / TOL_POS_HOVER) ** 2)))
 
-        reward = (
-            r_potential
-            + (1.0 - blend) * r_flip_envelope
-            + blend * r_hover_envelope
-            + self.w_action * r_action_smooth
-        )
+            # 2. Upright attitude on SO(3): (1 - R33) is 0 when upright, 2 when upside down
+            so3_error = float(1.0 - max(0.0, dcm[2, 2]))
+            r_upright = float(np.exp(-(so3_error / TOL_SO3_ATTITUDE)))
+
+            # 3. Heading lock (yaw alignment): x_body projected onto world forward x-axis
+            heading_error = float(np.abs(np.arctan2(dcm[1, 0], dcm[0, 0])))
+            r_heading = float(np.exp(-((heading_error / TOL_HEADING) ** 2)))
+
+            # 4. Linear velocity damping (peaks at zero velocity)
+            vel_norm = float(np.linalg.norm(vel))
+            r_vel = float(np.exp(-((vel_norm / TOL_VEL_HOVER) ** 2)))
+
+            # 5. Angular velocity damping (peaks at zero body rates)
+            omega_norm = float(np.linalg.norm(omega))
+            r_omega = float(np.exp(-((omega_norm / TOL_OMEGA_HOVER) ** 2)))
+
+            reward = (
+                r_alive
+                + 2.5 * r_pos 
+                + 2.0 * r_upright
+                + 1.3 * r_heading
+                + 0.5 * r_vel
+                + 1.2 * r_omega
+                + 0.5 * r_action
+            )
 
         return float(reward)
 
@@ -517,15 +527,6 @@ class QuadFlipEnv(gym.Env):
             return True
         if self.quad.check_ground_contact():
             self.termination_reason = "ground_crash"
-            return True
-        if not self.flip_completed and self.accumulated_pitch > FLIP_THRESHOLD + 1.2:
-            self.termination_reason = "phase1_overrotation"
-            return True
-        if not self.flip_completed and self.t > 1.0:
-            self.termination_reason = "phase1_timeout"
-            return True
-        if self.flip_completed and self.quad.dcm[2, 2] < -0.1:
-            self.termination_reason = "phase2_reinversion"
             return True
         return False
 
@@ -549,10 +550,12 @@ class QuadFlipEnv(gym.Env):
         super().reset(seed=seed)
         self.t = 0.0
         self.steps = 0
+        self.rate_pid.reset()
         self.prev_action = np.zeros(4, dtype=np.float32)
         self.prev_prev_action = np.zeros(4, dtype=np.float32)
         self.accumulated_pitch = 0.0
         self.total_pitch_rotated = 0.0
+        self.reached_90 = False
         self.has_inverted = False
         self.flip_completed = False
         self.flip_completed_time = None
@@ -706,6 +709,8 @@ class QuadFlipEnv(gym.Env):
             "velocity": self.quad.vel.copy(),
             "quat": self.quad.quat.copy(),
             "omega": self.quad.omega.copy(),
+            "omega_des": np.zeros(3, dtype=np.float32),
+            "throttle": 0.0,
             "motor_cmd": np.zeros(4, dtype=np.float32),
             "spawn_pos": self.spawn_pos.copy(),
             "spawn_vel": self.spawn_vel.copy(),
@@ -736,42 +741,74 @@ class QuadFlipEnv(gym.Env):
         ema_alpha = ACTION_EMA_ALPHA_HOVER if self.flip_completed else ACTION_EMA_ALPHA_FLIP
         action = ema_alpha * action + (1.0 - ema_alpha) * self.prev_action
 
-        # Motor mapping
-        if self.action_mode == "thrust_moment":
-            throttle = 0.5 * (action[0] + 1.0) * self.quad.params["maxThr"]
+        # Action execution mapping
+        omega_des_cmd = np.zeros(3, dtype=np.float32)
+        throttle_cmd = 0.0
+
+        if self.action_mode == "rate_pid":
+            throttle_cmd = float(0.5 * (action[0] + 1.0) * self.quad.params["maxThr"])
+            omega_des_cmd = np.array([
+                action[1] * self.max_rate_xy,
+                action[2] * self.max_rate_pitch,
+                action[3] * self.max_rate_z,
+            ], dtype=np.float64)
+            # Step MuJoCo physics with sub-stepping Rate PID
+            self.quad.update(
+                t=self.t,
+                dt=self.dt,
+                wind=self.wind,
+                rate_cmd=(throttle_cmd, omega_des_cmd),
+                rate_pid=self.rate_pid,
+                gyro_bias=self.gyro_bias if self.obs_noise else None,
+            )
+            motor_cmd = self.quad.last_motor_cmd.copy()
+        elif self.action_mode == "thrust_moment":
+            throttle_cmd = float(0.5 * (action[0] + 1.0) * self.quad.params["maxThr"])
             moments = np.array([
                 action[1] * self.max_torque_xy,
                 action[2] * self.max_torque_xy,
                 action[3] * self.max_torque_z,
             ])
-            motor_cmd = mixerFM(self.quad, throttle, moments)
+            motor_cmd = mixerFM(self.quad, throttle_cmd, moments)
+            self.quad.update(self.t, self.dt, motor_cmd, self.wind)
         else:
             motor_cmd = np.where(
                 action >= 0.0,
                 self.hover_w + action * (self.max_w - self.hover_w),
                 self.hover_w + action * (self.hover_w - self.min_w),
             )
+            self.quad.update(self.t, self.dt, motor_cmd, self.wind)
 
-        # MuJoCo physics step
-        self.quad.update(self.t, self.dt, motor_cmd, self.wind)
         self.t += self.dt
         self.steps += 1
 
-        # Track PBRS potential delta: record pre-step potential
-        prev_pitch_norm = float(np.clip(self.accumulated_pitch / FLIP_THRESHOLD, 0.0, 1.0))
-
-        # Net rotation along pitch axis
-        net_pitch_delta = float(self.pitch_direction * self.quad.omega[1] * self.dt)
+        # Net rotation along pitch axis (signed delta: forward pitching adds, backward pitching subtracts)
+        delta_pitch = float(self.pitch_direction * self.quad.omega[1] * self.dt)
+        milestone_bonus = 0.0
 
         if not self.flip_completed:
-            self.accumulated_pitch = max(0.0, self.accumulated_pitch + net_pitch_delta)
-            self.total_pitch_rotated += max(0.0, net_pitch_delta)
+            self.total_pitch_rotated += max(0.0, delta_pitch)
+            # Accumulate net pitch progress (signed, bounded in [0, FLIP_THRESHOLD])
+            self.accumulated_pitch = min(FLIP_THRESHOLD, max(0.0, self.accumulated_pitch + delta_pitch))
+
+            # Milestone 1: Reaching vertical (90 deg / 1.57 rad)
+            if not self.reached_90 and self.accumulated_pitch >= 0.5 * np.pi:
+                self.reached_90 = True
+                milestone_bonus += 5.0
 
             # Inversion milestone check (R33 < -0.2)
             if not self.has_inverted:
+                # Cap rotation progress at 180° until drone physically crosses into inverted flight
                 self.accumulated_pitch = min(float(np.pi), self.accumulated_pitch)
+                # Anti-ratchet: if the drone is upright (R33 > 0.7), accumulated pitch cannot exceed physical tilt.
+                # This prevents normal hover wobbles from ratcheting false progress up to 180°.
+                if self.quad.dcm[2, 2] > 0.7:
+                    phys_tilt = float(np.arccos(np.clip(self.quad.dcm[2, 2], -1.0, 1.0)))
+                    self.accumulated_pitch = min(self.accumulated_pitch, phys_tilt)
+
                 if self.quad.dcm[2, 2] < -0.2:
                     self.has_inverted = True
+                    milestone_bonus += 10.0
             else:
                 # Completion milestone check (360° rotation + upright attitude R33 > 0.6)
                 if self.accumulated_pitch >= FLIP_THRESHOLD and self.quad.dcm[2, 2] > 0.6:
@@ -779,10 +816,7 @@ class QuadFlipEnv(gym.Env):
                     self.flip_completed_time = float(self.t)
                     self.accumulated_pitch = FLIP_THRESHOLD
                     self.quad.set_target_marker(self.target_state)
-
-        # True Potential Difference: Phi(s') - Phi(s)
-        curr_pitch_norm = float(np.clip(self.accumulated_pitch / FLIP_THRESHOLD, 0.0, 1.0))
-        delta_pitch_potential = curr_pitch_norm - prev_pitch_norm
+                    milestone_bonus += 20.0
 
         obs_current = self._compute_actor_obs()
         self.obs_buffer.append(obs_current)
@@ -795,7 +829,7 @@ class QuadFlipEnv(gym.Env):
             self.obs_history_buffer.pop(0)
         stacked_obs = self._get_stacked_obs()
 
-        reward = self._compute_reward(action, delta_pitch_potential)
+        reward = self._compute_reward(action, delta_pitch) + milestone_bonus
         terminated = self._check_termination()
         truncated = bool(self.steps >= self.max_steps)
 
@@ -809,6 +843,8 @@ class QuadFlipEnv(gym.Env):
             "velocity": self.quad.vel.copy(),
             "quat": self.quad.quat.copy(),
             "omega": self.quad.omega.copy(),
+            "omega_des": omega_des_cmd.copy(),
+            "throttle": float(throttle_cmd),
             "motor_cmd": motor_cmd.copy(),
             "spawn_pos": self.spawn_pos.copy(),
             "spawn_vel": self.spawn_vel.copy(),
@@ -816,8 +852,11 @@ class QuadFlipEnv(gym.Env):
             "accumulated_roll": self.accumulated_pitch,
             "total_pitch_rotated": self.total_pitch_rotated,
             "termination_reason": self.termination_reason,
+            "arena_radius": float(self.arena_radius),
+            "reached_90": self.reached_90,
             "has_inverted": self.has_inverted,
             "flip_completed": self.flip_completed,
+            "milestone_bonus": float(milestone_bonus),
             "actor_obs": self.get_actor_obs(),
             "privileged_obs": self._compute_privileged_critic_obs(),
             "stock_obs": self._compute_stock_obs(),
@@ -839,7 +878,7 @@ CustomQuadEnv = QuadFlipEnv
 if __name__ == "__main__":
     env = QuadFlipEnv()
     obs, info = env.reset()
-    print("✓ QuadFlipEnv (Pitch Flip with PBRS & Cauchy Kernels) initialized!")
+    print("✓ QuadFlipEnv (Pitch Flip with Two-Phase Exponential Reward) initialized!")
     print(f"  Observation shape : {obs.shape}")
     print(f"  Action shape      : {env.action_space.shape}")
     print(f"  Target state      : {info['target_state']}")

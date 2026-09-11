@@ -92,8 +92,7 @@ def makeMixerFM(params):
         mixerFM = np.array([[     kTh,      kTh,      kTh,     kTh],
                             [ dym*kTh, -dym*kTh, -dym*kTh, dym*kTh],
                             [-dxm*kTh, -dxm*kTh,  dxm*kTh, dxm*kTh],
-                            [     kTo,     -kTo,      kTo,    -kTo]])
-    
+                            [    -kTo,      kTo,     -kTo,     kTo]])
     
     return mixerFM
 

@@ -42,15 +42,15 @@ LR_START: float = 3e-4                # Phase 1 start: Initial high exploration 
 LR_MID: float = 1.5e-4                # Phase 2 start: Target learning rate at 3,000,000 steps (ADR ramp start)
 LR_ADR_END: float = 5e-5              # Phase 3 start: Target learning rate at 12,000,000 steps (full DR reached)
 LR_FLOOR: float = 3e-5                # Phase 3 end: Fine-tuning floor learning rate at 16,000,000 steps
-LR_WARMUP_STEPS: int = 4_500_000      # Phase 1 duration: Nominal flip learning on clean sim before ADR (aligned with DR_START_STEPS)
+LR_WARMUP_STEPS: int = 7_000_000      # Phase 1 duration: Extended nominal flip mastering before ADR
 LR_FINAL_STABLE: bool = False         # False: decay from LR_ADR_END to LR_FLOOR in Phase 3; True: hold at LR_FLOOR
-ENT_COEF: float = 0.01                # Entropy coefficient (encourages exploration)
+ENT_COEF: float = 0.01                 # Entropy coefficient start (scheduled: 0.01 → 0.001 over training)
 CHECKPOINT_FREQ: int = 50_000         # Checkpoint interval (timesteps per worker = 500,000 total steps)
 
 # Automatic Domain Randomization (ADR):
 DR_ENABLED: bool = True               # Enable progressive domain randomization
-DR_START_STEPS: int = 4_500_000       # Start ADR after nominal flip is mastered (3.0M steps)
-DR_END_STEPS: int = 14_500_000        # Reach full 100% DR at 12.0M steps (9.0M step ramp)
+DR_START_STEPS: int = 7_000_000       # Start ADR after nominal flip is mastered (7.0M steps)
+DR_END_STEPS: int = 16_000_000        # Reach full 100% DR at 16.0M steps (9.0M step ramp)
 
 # Fine-Tuning Settings (Used only when LOAD_PREVIOUS_MODEL = True):
 FT_LR_START: float = 3e-5             # Initial learning rate for fine-tuning
@@ -58,12 +58,15 @@ FT_LR_FLOOR: float = 1e-5             # Final floor learning rate for fine-tunin
 
 
 
-# Environment options
+# Environment options & Curriculum Arena
 EPISODE_SECONDS: float = 8.0         # Max flight time per episode (seconds)
 TARGET_ALTITUDE: float = 1.2         # Target height for flip & recovery (meters)
 SPAWN_ALTITUDE: float = 1.2          # Spawn height (meters)
-ARENA_RADIUS: float = 2.5            # Arena radius during training (meters)
-ACTION_MODE: str = "motor"           # "motor" or "thrust_moment"
+ARENA_RADIUS_START: float = 2.5      # Curriculum arena radius start during nominal warmup (meters)
+ARENA_RADIUS_END: float = 0.8        # Curriculum arena radius at 100% ADR (meters)
+CURRICULUM_ARENA: bool = True        # Dynamically shrink arena boundary from 2.5m down to 0.8m during ADR
+ARENA_RADIUS: float = ARENA_RADIUS_START  # Backwards compatibility
+ACTION_MODE: str = "rate_pid"        # "rate_pid" (thrust + body rate PID), "motor", or "thrust_moment"
 RANDOM_INITIAL_STATE: bool = True    # Randomize spawn position, tilt, and velocity for robustness
 
 # Empirically Validated Reward Tolerances & Weights (Synthesized from 10 Scientific Experiments):
@@ -141,17 +144,22 @@ class DomainRandomizationCallback(BaseCallback):
     """
     Automatic Domain Randomization (ADR): linearly ramps dr_level from 0.0 to 1.0
     over training. Starts after start_steps, reaches 1.0 at end_steps.
+    Coordinates progressive arena radius contraction from arena_radius_start down to arena_radius_end.
     """
 
     def __init__(
         self,
         start_steps: int = DR_START_STEPS,
         end_steps: int = DR_END_STEPS,
+        arena_radius_start: float = ARENA_RADIUS_START,
+        arena_radius_end: float = ARENA_RADIUS_END,
         verbose: int = 1,
     ):
         super().__init__(verbose)
         self.start_steps = int(start_steps)
         self.end_steps = int(end_steps)
+        self.arena_radius_start = float(arena_radius_start)
+        self.arena_radius_end = float(arena_radius_end)
         self.current_level: float = 0.0
 
     def _on_training_start(self) -> None:
@@ -166,14 +174,17 @@ class DomainRandomizationCallback(BaseCallback):
 
         self.current_level = float(np.clip(init_level, 0.0, 1.0))
         self.training_env.env_method("set_dr_level", self.current_level)
+        curr_arena = self.arena_radius_start - self.current_level * (self.arena_radius_start - self.arena_radius_end)
         if self.verbose > 0:
             print(f"\n{'*'*65}")
             print(f"*** AUTOMATIC DOMAIN RANDOMIZATION (ADR) INITIALIZED ***")
             if self.start_steps == 0 and self.end_steps == 0:
                 print(f"  DR Mode: Fixed 100% full domain randomization throughout (dr_level = 1.0)")
+                print(f"  Curriculum Arena: Fixed at {self.arena_radius_end:.2f}m")
             else:
                 print(f"  DR Ramp: 0.0 -> 1.0 over steps {self.start_steps:,} to {self.end_steps:,}")
                 print(f"  Initial DR Level: {self.current_level:.2f} at start step {self.num_timesteps:,}")
+                print(f"  Curriculum Arena: {self.arena_radius_start:.2f}m -> {self.arena_radius_end:.2f}m (current: {curr_arena:.2f}m)")
             print(f"{'*'*65}\n")
 
     def _on_step(self) -> bool:
@@ -196,9 +207,10 @@ class DomainRandomizationCallback(BaseCallback):
         if abs(level - self.current_level) > 0.005 or (level >= 1.0 and self.current_level < 1.0):
             self.current_level = level
             self.training_env.env_method("set_dr_level", level)
+            curr_arena = self.arena_radius_start - level * (self.arena_radius_start - self.arena_radius_end)
 
             if self.verbose > 0 and (int(level * 100) % 10 == 0 or level >= 1.0):
-                print(f"  [ADR] DR Level = {level:.2f} (step {steps:,})")
+                print(f"  [ADR] DR Level = {level:.2f} | Arena Radius = {curr_arena:.2f}m (step {steps:,})")
 
 
 
@@ -220,6 +232,78 @@ class VecNormalizeCheckpointCallback(BaseCallback):
                 self.training_env.save(ckpt_stats)
                 self.training_env.save(self.root_stats_path)
         return True
+
+
+class StdFloorCallback(BaseCallback):
+    """
+    Scheduled exploration bounds: decays min_log_std from start_floor to end_floor
+    over training. Early training forces broad exploration (std >= 0.37) to escape
+    hover-only local optima; late training relaxes the floor (std >= 0.08) so the
+    policy can converge to precise hover control.
+
+    References:
+      - Andrychowicz et al. (2020): free log_std learning is optimal for continuous control
+      - Kaufmann et al. (2020) 'Deep Drone Acrobatics': no std clamping, relies on reward shaping
+    We use a decaying floor as a compromise: prevents early collapse while allowing late precision.
+    """
+
+    def __init__(
+        self,
+        min_log_std_start: float = -1.0,
+        min_log_std_end: float = -2.5,
+        max_log_std: float = 0.0,
+        total_timesteps: int = TOTAL_TIMESTEPS,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.min_log_std_start = float(min_log_std_start)
+        self.min_log_std_end = float(min_log_std_end)
+        self.max_log_std = float(max_log_std)
+        self.total_timesteps = int(total_timesteps)
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if hasattr(self.model, "policy") and hasattr(self.model.policy, "log_std"):
+            progress = min(1.0, self.num_timesteps / max(1, self.total_timesteps))
+            current_floor = self.min_log_std_start + progress * (self.min_log_std_end - self.min_log_std_start)
+            with torch.no_grad():
+                self.model.policy.log_std.data.clamp_(min=current_floor, max=self.max_log_std)
+
+
+class EntCoefScheduleCallback(BaseCallback):
+    """
+    Linearly decays PPO entropy coefficient from start_value to end_value over training.
+
+    Academic rationale:
+      - Andrychowicz et al. (2020) 'What Matters in On-Policy RL': ent_coef = 0.0 is
+        optimal for most continuous control, but our task has a strong local optimum
+        (hover without flipping) that requires exploration pressure early.
+      - PPO (Schulman 2017): used 0.01 for discrete Atari; continuous control uses lower.
+      - Schedule: start at 0.01 (upper bound for continuous PPO) to escape hover trap,
+        decay to 0.001 for precision hover convergence.
+    """
+
+    def __init__(
+        self,
+        start_value: float = 0.01,
+        end_value: float = 0.001,
+        total_timesteps: int = TOTAL_TIMESTEPS,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.start_value = float(start_value)
+        self.end_value = float(end_value)
+        self.total_timesteps = int(total_timesteps)
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        progress = min(1.0, self.num_timesteps / max(1, self.total_timesteps))
+        new_ent = self.start_value + progress * (self.end_value - self.start_value)
+        self.model.ent_coef = float(new_ent)
 
 
 def plot_training_curves(
@@ -404,7 +488,9 @@ def train(
             target_altitude=TARGET_ALTITUDE,
             spawn_altitude=SPAWN_ALTITUDE,
             random_initial_state=random_initial_state,
-            arena_radius=ARENA_RADIUS,
+            arena_radius_start=ARENA_RADIUS_START,
+            arena_radius_end=ARENA_RADIUS_END,
+            curriculum_arena=CURRICULUM_ARENA,
             tol_xy_hover=TOL_XY_HOVER,
             tol_vel_hover=TOL_VEL_HOVER,
             tol_z_hover=TOL_Z_HOVER,
@@ -490,6 +576,10 @@ def train(
             print(f"  ADR Mode       : Fixed 100% full domain randomization throughout (dr_level = 1.0)")
         else:
             print(f"  ADR Schedule   : dr_level 0.0 -> 1.0 over steps {DR_START_STEPS:,} to {DR_END_STEPS:,}")
+    if CURRICULUM_ARENA:
+        print(f"  Curriculum Arena: Radius {ARENA_RADIUS_START:.2f}m -> {ARENA_RADIUS_END:.2f}m (shrinks during ADR)")
+    else:
+        print(f"  Arena Radius   : Fixed at {ARENA_RADIUS:.2f}m")
     print(f"{'='*65}\n")
 
     if model is not None:
@@ -548,12 +638,25 @@ def train(
         dr_end_steps=DR_END_STEPS,
         plot_freq=100_000,
     )
-    callbacks = [checkpoint_cb, vecnorm_cb, metrics_cb]
+    std_floor_cb = StdFloorCallback(
+        min_log_std_start=-1.0,   # Early: std >= 0.37 (forces flip exploration)
+        min_log_std_end=-2.5,     # Late: std >= 0.08 (allows precision hover)
+        max_log_std=0.0,
+        total_timesteps=total_lifetime_steps,
+    )
+    ent_schedule_cb = EntCoefScheduleCallback(
+        start_value=ent_coef,     # 0.01 (escape hover trap)
+        end_value=0.001,          # Precision convergence
+        total_timesteps=total_lifetime_steps,
+    )
+    callbacks = [checkpoint_cb, vecnorm_cb, metrics_cb, std_floor_cb, ent_schedule_cb]
 
     if DR_ENABLED:
         dr_cb = DomainRandomizationCallback(
             start_steps=DR_START_STEPS,
             end_steps=DR_END_STEPS,
+            arena_radius_start=ARENA_RADIUS_START,
+            arena_radius_end=ARENA_RADIUS_END,
         )
         callbacks.append(dr_cb)
 
