@@ -1,0 +1,45 @@
+{
+  "generated": "2026-09-16T13:38:10+00:00",
+  "model": "logs/deploy_probe_model.zip",
+  "encoder": "logs/encoder_gru.pt",
+  "onnx": "Simulation/deploy/models/policy_step.onnx",
+  "gelu": "erf",
+  "compat": false,
+  "exporter": "torchscript",
+  "graph": {
+    "opset": [
+      17
+    ],
+    "ops": {
+      "Add": 12,
+      "Clip": 2,
+      "Concat": 1,
+      "Constant": 34,
+      "Div": 2,
+      "Erf": 1,
+      "Identity": 1,
+      "MatMul": 7,
+      "Mul": 5,
+      "Sigmoid": 2,
+      "Slice": 7,
+      "Sub": 2,
+      "Tanh": 4
+    },
+    "n_nodes": 80,
+    "params": 38328,
+    "flash_bytes_fp32": 153312,
+    "file_bytes": 159718,
+    "sha256": "7a08822a16145dce855bda0a7ed6ae3c42e52bec4b07679e06a74d7c8df11b3a"
+  },
+  "verify": {
+    "ok": true,
+    "frames": 3000,
+    "z_tol": 2e-05,
+    "action_tol": 2e-05,
+    "max_z_err": 1.2814998626708984e-06,
+    "max_action_err": 4.76837158203125e-07,
+    "mean_z_err": 1.7041239175341616e-07,
+    "mean_action_err": 8.015659602733649e-08,
+    "action_saturation_frac": 0.0
+  }
+}

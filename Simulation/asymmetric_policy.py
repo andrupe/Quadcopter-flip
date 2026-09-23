@@ -50,7 +50,7 @@ class AsymmetricMlpExtractor(nn.Module):
         device = get_device(device)
 
         if isinstance(net_arch, dict):
-            pi_layers_dims = net_arch.get("pi", [128, 64])
+            pi_layers_dims = net_arch.get("pi", [32])
             vf_layers_dims = net_arch.get("vf", [512, 256, 128])
         else:
             pi_layers_dims = vf_layers_dims = net_arch
@@ -115,7 +115,7 @@ class AsymmetricActorCriticPolicy(ActorCriticPolicy):
             actor_obs_dim = kwargs.pop("actor_obs_dim", ACTOR_TOTAL_DIM)
         self.actor_obs_dim = int(actor_obs_dim)
         if net_arch is None:
-            net_arch = kwargs.pop("net_arch", dict(pi=[128, 64], vf=[512, 256, 128]))
+            net_arch = kwargs.pop("net_arch", dict(pi=[32], vf=[512, 256, 128]))
 
         super().__init__(
             observation_space=observation_space,
@@ -173,7 +173,15 @@ class AsymmetricActorCriticPolicy(ActorCriticPolicy):
         latent_pi = self.mlp_extractor.forward_actor(pi_obs)
         return self._get_action_dist_from_latent(latent_pi)
 
-    MIN_LOG_STD: float = -2.5   # Ultimate floor: std >= exp(-2.5) ≈ 0.08 (callback schedules active floor above this)
+    # ABSOLUTE SAFETY FLOOR, not the working floor. The working floor is per-channel and
+    # is owned by train.StdFloorCallback (it decays each channel separately, because the
+    # channels' authority and their tolerances do not scale together). This value only
+    # stops the std from collapsing when NO callback is driving it - evaluation, PID
+    # tuning, checkpoint benchmarking - and it must therefore sit BELOW the tightest value
+    # the callback ever applies (currently -3.0), or it would silently undo it: the clamp
+    # here runs on every forward pass, after the callback has already written log_std.
+    # -4.0 is std 0.018 = ~0.37 rad/s on roll/pitch, still far above numerical zero.
+    MIN_LOG_STD: float = -4.0
     MAX_LOG_STD: float = 0.0    # Corresponds to std <= exp(0.0) = 1.0 (prevents noise explosion)
 
     def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
@@ -225,7 +233,8 @@ class AsymmetricActorCriticPolicy(ActorCriticPolicy):
         Despite the name this is NOT the history encoder's z. The encoder runs in
         LatentObsWrapper (training) or LatentInjector (evaluation/tuning) and its output
         arrives as part of the observation; this method just exposes the last hidden layer
-        of `policy_net` (128 dims with the default net_arch) for introspection.
+        of `policy_net` (its width is the last entry of net_arch, 32 by default) for
+        introspection.
         """
         if isinstance(obs, dict):
             pi_obs = obs["actor"]

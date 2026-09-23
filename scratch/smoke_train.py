@@ -50,10 +50,13 @@ def main() -> int:
         AUX_DIM,
         ENCODER_IN_DIM,
         NormStats,
+        frame_from_env_obs,
     )
     from quad_flip_env import (
+        ACTOR_FRAME_MODE,
         ACTOR_TOTAL_DIM,
         PRIVILEGED_OBS_DIM,
+        REF_FF_DIM,
         TOTAL_OBS_DIM,
         QuadFlipEnv,
     )
@@ -75,7 +78,10 @@ def main() -> int:
         clip=10.0,
         degenerate_dims=[],
     )
-    save_encoder_checkpoint(CKPT, model, norm)
+    # The marker every real checkpoint carries, so this synthetic one represents a valid
+    # artifact (see ACTOR_FRAME_MODE): train.py refuses an encoder trained for the other
+    # frame convention rather than silently conditioning z on the wrong frame.
+    save_encoder_checkpoint(CKPT, model, norm, extra={"frame_mode": ACTOR_FRAME_MODE})
 
     print("=" * 78)
     print("A. shape agreement")
@@ -84,16 +90,16 @@ def main() -> int:
           f"spec {ACTOR_FRAME_DIM}, env {ACTOR_TOTAL_DIM}")
     check("encoder input is actor frame + aux", ENCODER_IN_DIM == ACTOR_TOTAL_DIM + AUX_DIM == 33,
           f"ENCODER_IN_DIM = {ENCODER_IN_DIM}")
-    check("env vector is actor + aux + privileged",
-          TOTAL_OBS_DIM == ACTOR_TOTAL_DIM + AUX_DIM + PRIVILEGED_OBS_DIM == 77,
+    check("env vector is actor + ref_ff + aux + privileged",
+          TOTAL_OBS_DIM == ACTOR_TOTAL_DIM + REF_FF_DIM + AUX_DIM + PRIVILEGED_OBS_DIM,
           f"TOTAL_OBS_DIM = {TOTAL_OBS_DIM}")
 
     raw = make_vec_env(lambda: QuadFlipEnv(), n_envs=N_ENVS, vec_env_cls=SubprocVecEnv)
     check("raw vec env observation matches the env declaration",
           raw.observation_space.shape == (TOTAL_OBS_DIM,), f"{raw.observation_space.shape}")
 
-    wrapped = LatentObsWrapper(raw, encoder_path=CKPT, z_dim=Z_DIM)
-    expected = ACTOR_TOTAL_DIM + Z_DIM + AUX_DIM + PRIVILEGED_OBS_DIM
+    wrapped = LatentObsWrapper(raw, encoder_path=CKPT, z_dim=Z_DIM, ref_ff_dim=REF_FF_DIM)
+    expected = ACTOR_TOTAL_DIM + Z_DIM + REF_FF_DIM + AUX_DIM + PRIVILEGED_OBS_DIM
     check("wrapper output is actor + z + aux + privileged",
           wrapped.observation_space.shape == (expected,),
           f"{wrapped.observation_space.shape}, expected ({expected},)")
@@ -113,18 +119,42 @@ def main() -> int:
     print("B. block layout")
     print("=" * 78)
     a0 = ACTOR_TOTAL_DIM
-    aux0 = a0 + Z_DIM
+    ff0 = a0 + Z_DIM
+    aux0 = ff0 + REF_FF_DIM
     priv0 = aux0 + AUX_DIM
 
     o_t = obs[:, :a0]
-    z_blk = obs[:, a0:aux0]
+    z_blk = obs[:, a0:ff0]
+    ff_blk = obs[:, ff0:aux0]
     aux_blk = obs[:, aux0:priv0]
     priv_blk = obs[:, priv0:]
     check("o_t block is 29 wide", o_t.shape[1] == 29, f"{o_t.shape}")
     check("z block is 16 wide", z_blk.shape[1] == 16, f"{z_blk.shape}")
+    check("ref_ff block is 3 wide", ff_blk.shape[1] == REF_FF_DIM, f"{ff_blk.shape}")
     check("aux block is 4 wide", aux_blk.shape[1] == 4, f"{aux_blk.shape}")
     check("privileged block is 44 wide", priv_blk.shape[1] == PRIVILEGED_OBS_DIM, f"{priv_blk.shape}")
     check("z is finite", bool(np.all(np.isfinite(z_blk))), "")
+    check("ref_ff block is finite and carries a real command",
+          bool(np.all(np.isfinite(ff_blk))) and float(np.abs(ff_blk).max()) > 1.0,
+          f"block {np.round(ff_blk[0], 4)}")
+    # THE BLOCK THE ENCODER MUST NOT SEE. frame_from_env_obs is a pure slicing function, so
+    # probe it with a SYNTHETIC vector carrying one distinct value per dim - and note the
+    # wrapped `obs` cannot be used for this at all, because z is inserted and its offsets are
+    # therefore not the env's.
+    #
+    # What this guards: the encoder's contract is [o_t | aux] and is frozen, so the slicer
+    # must SKIP the ref_ff block. If it did not, the frame would silently become
+    # [o_t | ref_ff], every pretrained encoder would be fed the wrong 33 dims, and the f_in
+    # guard would NOT catch it because the WIDTH is unchanged.
+    _probe = np.arange(TOTAL_OBS_DIM, dtype=np.float32)
+    _frame = frame_from_env_obs(_probe, ACTOR_TOTAL_DIM, AUX_DIM, REF_FF_DIM)
+    _want = np.concatenate([
+        _probe[:ACTOR_TOTAL_DIM],
+        _probe[ACTOR_TOTAL_DIM + REF_FF_DIM:ACTOR_TOTAL_DIM + REF_FF_DIM + AUX_DIM],
+    ])
+    check("encoder frame is [o_t | aux] and skips ref_ff",
+          _frame.shape[0] == ENCODER_IN_DIM == 33 and np.array_equal(_frame, _want),
+          f"frame {_frame.shape[0]} dims, block-exact match: {np.array_equal(_frame, _want)}")
     check("the actor slice contains no privileged ground truth",
           not np.allclose(o_t[:, :3], priv_blk[:, :3], atol=1e-7),
           "o_t position is the Lighthouse estimate; privileged holds ground truth")
@@ -136,7 +166,7 @@ def main() -> int:
     print("=" * 78)
     single = LatentObsWrapper(
         DummyVecEnv([lambda: QuadFlipEnv()]),
-        encoder_path=CKPT, z_dim=Z_DIM,
+        encoder_path=CKPT, z_dim=Z_DIM, ref_ff_dim=REF_FF_DIM,
     )
     single.reset()
     h0 = float(np.abs(single.get_histories()).max())
@@ -164,7 +194,7 @@ def main() -> int:
     from asymmetric_policy import AsymmetricActorCriticPolicy
 
     vec = VecNormalize(wrapped, norm_obs=False, norm_reward=False, clip_obs=10.0)
-    actor_obs_dim = ACTOR_TOTAL_DIM + Z_DIM
+    actor_obs_dim = ACTOR_TOTAL_DIM + Z_DIM + REF_FF_DIM
     model = PPO(
         policy=AsymmetricActorCriticPolicy,
         env=vec,
@@ -178,7 +208,7 @@ def main() -> int:
         policy_kwargs=dict(
             actor_obs_dim=actor_obs_dim,
             activation_fn=torch.nn.Tanh,
-            net_arch=dict(pi=[128, 128], vf=[512, 256, 128]),
+            net_arch=dict(pi=[32], vf=[512, 256, 128]),
             log_std_init=-0.5,
         ),
         verbose=0,

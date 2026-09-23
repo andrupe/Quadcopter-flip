@@ -1,0 +1,42 @@
+{
+  "generated": "2026-09-14T11:09:56+00:00",
+  "model": "logs/rl_model_15000000_steps.zip",
+  "encoder": "logs/encoder_gru.pt",
+  "onnx": "Simulation/deploy/models/policy_step_gelu_tanh.onnx",
+  "gelu": "tanh",
+  "exporter": "torchscript",
+  "graph": {
+    "opset": [
+      17
+    ],
+    "ops": {
+      "Add": 13,
+      "Clip": 2,
+      "Concat": 1,
+      "Constant": 35,
+      "Div": 1,
+      "MatMul": 7,
+      "Mul": 9,
+      "Sigmoid": 2,
+      "Slice": 7,
+      "Sub": 2,
+      "Tanh": 5
+    },
+    "n_nodes": 84,
+    "params": 38072,
+    "flash_bytes_fp32": 152288,
+    "file_bytes": 158995,
+    "sha256": "032ea8cb0759f62539cf11a166ba69ce517fdcffa3103f263058b5329b78d441"
+  },
+  "verify": {
+    "ok": false,
+    "frames": 1500,
+    "z_tol": 2e-05,
+    "action_tol": 2e-05,
+    "max_z_err": 0.0005259215831756592,
+    "max_action_err": 0.00016005337238311768,
+    "mean_z_err": 5.760132262366824e-05,
+    "mean_action_err": 1.651563070481643e-05,
+    "action_saturation_frac": 0.18683333333333332
+  }
+}

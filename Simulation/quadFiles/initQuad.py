@@ -17,7 +17,7 @@ def sys_params():
     # --------------------------------------------------------------------------
     # Bitcraze Crazyflie 2.0 / 2.1 Physical Parameters
     # --------------------------------------------------------------------------
-    mB  = 0.028     # mass (kg) (~28g with battery)
+    mB  = 0.033     # mass (kg) (~33g with battery & deck)
     g   = 9.81      # gravity (m/s/s)
     # Rotor-to-rotor diagonal is 92mm (arm length ~46mm). In 'X' configuration:
     # dxm = dym = 0.046 / sqrt(2) ≈ 0.0325 m
@@ -25,13 +25,12 @@ def sys_params():
     dym = 0.0325    # arm length y (m)
     dzm = 0.01      # motor height (m)
 
-    # Inertia tensor (kg*m^2) [Forster 2015 / Landry 2016 System Identification].
-    # Izz is 2.85e-5 rather than the measured 2.89e-5 because the measured triple
-    # violates the rigid-body triangle inequality (Ixx + Iyy >= Izz). Must match
+    # Inertia tensor (kg*m^2) scaled for 33g baseline (~1.1786x).
+    # Satisfies the rigid-body triangle inequality (Ixx + Iyy >= Izz). Must match
     # assets/quadcopter.xml and Simulation/quadFiles/quad_mujoco.py.
-    IB  = np.array([[1.43e-5, 0,       0      ],
-                    [0,      1.43e-5, 0      ],
-                    [0,      0,       2.85e-5]]) # Inertial tensor (kg*m^2)
+    IB  = np.array([[1.685e-5, 0,        0       ],
+                    [0,       1.685e-5, 0       ],
+                    [0,       0,        3.359e-5]]) # Inertial tensor (kg*m^2)
     IRzz = 1.0e-6   # Rotor moment of inertia (kg*m^2)
 
 

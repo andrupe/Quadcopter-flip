@@ -1,0 +1,30 @@
+obj-y += controller_app.o
+obj-y += reference.o
+obj-y += generated/
+
+# --- backend selection -----------------------------------------------------------------
+# `legacy`   (default) : the hand-written float net (policy_net.c + generated/policy_weights.c),
+#                        verified against torch step by step.
+# `stedgeai`           : the ST Edge AI Core generated network (generated/stedgeai/) plus the
+#                        ST runtime archive, behind the same policy_reset()/policy_step() API.
+# Chosen by the APP_BACKEND make variable (`build_app.sh --stedgeai`). A plain make variable
+# on purpose, NOT a CONFIG_ symbol: the app has no Kconfig file, so a CONFIG_ added to
+# app-config would be dropped by `make oldconfig` and this test would silently be false -
+# the same class of silent failure as the macOS merge_config trap.
+ifeq ($(APP_BACKEND),stedgeai)
+obj-y += policy_net_stedgeai.o
+
+# The ST runtime ships as a prebuilt archive and kbuild has no hook for one, so merge it
+# into a single relocatable object. --whole-archive is required because nothing references
+# it yet at partial-link time; the final link's --gc-sections then drops the kernels this
+# model does not use.
+STAI_RUNTIME_A := $(STEDGEAI_DIR)/Middlewares/ST/AI/Lib/GCC/ARMCortexM4/NetworkRuntime1201_CM4_GCC.a
+
+$(obj)/stai_runtime.o: $(STAI_RUNTIME_A)
+	$(LD) -nostdlib -Wl,-r -Wl,--whole-archive -o $@ $< -Wl,--no-whole-archive
+
+obj-y += stai_runtime.o
+targets += stai_runtime.o
+else
+obj-y += policy_net.o
+endif

@@ -10,8 +10,8 @@ need the same `[o_t | z]` assembly done by hand, which is what this class is for
 
 It is deliberately the SAME contract as the wrapper:
 
-    in  (raw env) : [ o_t (29) | aux (4) | privileged (44) ]
-    out           : [ o_t (29) | z (16) | aux (4) | privileged (44) ]
+    in  (raw env) : [ o_t (29) | ref_ff (3) | aux (4) | privileged (44) ]
+    out           : [ o_t (29) | z (16) | ref_ff (3) | aux (4) | privileged (44) ]
 
 and it drives the encoder through its incremental `step()` - the deployment path a flight
 controller would use - not through a batch API that only exists offline. Keeping one
@@ -47,6 +47,7 @@ class LatentInjector:
         encoder_path: str,
         actor_dim: int = ACTOR_FRAME_DIM,
         aux_dim: int = AUX_DIM,
+        ref_ff_dim: int = 0,
         z_dim: int = 16,
         device: str = "cpu",
     ):
@@ -62,8 +63,13 @@ class LatentInjector:
             )
         self.encoder = encoder
         self.norm = norm
+        # The checkpoint's `extra` block (frame_mode, gates, training metadata). Consumers
+        # that must refuse a mismatched encoder need it; LatentObsWrapper already exposes
+        # it under the same name.
+        self.trained_meta = dict(_ckpt.get("extra", {}) or {})
         self.actor_dim = int(actor_dim)
         self.aux_dim = int(aux_dim)
+        self.ref_ff_dim = int(ref_ff_dim)
         self.z_dim = int(z_dim)
         self.z = np.zeros((1, self.z_dim), dtype=np.float32)
         self.h = self.encoder.init_state(1)
@@ -76,15 +82,16 @@ class LatentInjector:
 
     @torch.no_grad()
     def inject(self, env_obs: np.ndarray) -> np.ndarray:
-        """Raw env observation -> [o_t | z | aux | privileged], same as the training wrapper."""
+        """Raw env observation -> [o_t | z | ref_ff | aux | privileged], as the wrapper does."""
         env_obs = np.asarray(env_obs, dtype=np.float32)
-        raw = frame_from_env_obs(env_obs, self.actor_dim, self.aux_dim)
+        raw = frame_from_env_obs(env_obs, self.actor_dim, self.aux_dim, self.ref_ff_dim)
         frame = self.norm.standardize_frame(raw)[None, :]
         x = torch.from_numpy(np.ascontiguousarray(frame, dtype=np.float32))
         z, self.h = self.encoder.step(x, self.h)
         self.z = z.numpy()
+        a, f = self.actor_dim, self.actor_dim + self.ref_ff_dim
         return np.concatenate(
-            [env_obs[: self.actor_dim], self.z[0], env_obs[self.actor_dim :]]
+            [env_obs[:a], self.z[0], env_obs[a:f], env_obs[f:]]
         ).astype(np.float32)
 
     def get_history(self) -> Optional[np.ndarray]:

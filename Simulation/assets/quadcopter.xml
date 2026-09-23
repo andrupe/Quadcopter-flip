@@ -27,16 +27,15 @@
     <body name="quadcopter" pos="0 0 0">
       <freejoint name="root"/>
 
-      <!-- Inertial Properties (Crazyflie: 28 grams).
+      <!-- Inertial Properties (Crazyflie: 33 grams with battery & deck).
 
            The principal moments MUST satisfy the triangle inequality (Ixx+Iyy >= Izz and
-           its cyclic permutations). The literature values for this airframe are
-           (1.43e-5, 1.43e-5, 2.89e-5), which violates it by ~1% - so Izz is reduced to
-           2.85e-5 (a 1.4% change, comfortably inside the measurement uncertainty that
-           produced 2.89e-5) rather than letting the compiler average all three axes.
+           its cyclic permutations). Scaled from nominal CF2.1 baseline (28g -> 33g, ratio ~1.1786):
+           (1.685e-5, 1.685e-5, 3.359e-5) kg*m^2.
+           1.685e-5 + 1.685e-5 = 3.370e-5 >= 3.359e-5 (triangle inequality satisfied).
            Keep these in step with IB in Simulation/quadFiles/quad_mujoco.py and
            Simulation/quadFiles/initQuad.py; quad_mujoco.py checks them at construction. -->
-      <inertial pos="0 0 0" mass="0.028" diaginertia="1.43e-5 1.43e-5 2.85e-5"/>
+      <inertial pos="0 0 0" mass="0.033" diaginertia="1.685e-5 1.685e-5 3.359e-5"/>
 
       <!-- Central Body Geometry -->
       <geom name="chassis" type="box" size="0.02 0.02 0.005" material="chassis_mat"/>

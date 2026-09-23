@@ -1,0 +1,10 @@
+obj-y += reference_tables.o
+
+# policy_weights.c is 152 KB of float arrays and only policy_net.c references them, so in an
+# ST Edge AI build it is not compiled at all (belt and braces: --gc-sections would drop it
+# anyway, but this way the size is never spent and the object is never linked).
+ifeq ($(APP_BACKEND),stedgeai)
+obj-y += stedgeai/
+else
+obj-y += policy_weights.o
+endif

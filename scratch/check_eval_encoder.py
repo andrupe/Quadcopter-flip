@@ -83,9 +83,9 @@ def main() -> int:
     with zipfile.ZipFile(model_zip) as z:
         sd = torch.load(io.BytesIO(z.read("policy.pth")), map_location="cpu")
     width = int(sd["mlp_extractor.policy_net.0.weight"].shape[1])
-    from quad_flip_env import ACTOR_TOTAL_DIM
-    expected = ACTOR_TOTAL_DIM + 16
-    check("saved policy expects [o_t | z]", width == expected, f"{width} vs {expected}")
+    from quad_flip_env import ACTOR_TOTAL_DIM, REF_FF_DIM
+    expected = ACTOR_TOTAL_DIM + 16 + REF_FF_DIM
+    check("saved policy expects [o_t | z | ref_ff]", width == expected, f"{width} vs {expected}")
 
     # --- evaluate it --------------------------------------------------------------------
     print()

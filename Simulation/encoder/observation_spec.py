@@ -49,8 +49,77 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 
 ACTOR_FRAME_DIM: int = 29          # o_t (must equal ACTOR_SINGLE_OBS_DIM in quad_flip_env.py)
+REF_FF_DIM: int = 3                # reference feed-forward block that sits between o_t and aux
 AUX_DIM: int = 4                   # specific force (3) + v_batt_norm (1)
 ENCODER_IN_DIM: int = ACTOR_FRAME_DIM + AUX_DIM   # 33
+
+# Physical state channels intrinsic to vehicle dynamics (invariant to reference trajectory):
+# pos (0:3), quat (3:7), omega (7:10), vel (10:13), specific_force_b (29:32), v_batt_norm (32:33)
+PHYS_STATE_INDICES: Tuple[int, ...] = (
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 29, 30, 31, 32
+)
+PHYS_STATE_DIM: int = len(PHYS_STATE_INDICES)  # 17
+
+# Applied action channel (stored as prev_action in o_t[13:17])
+ACTION_INDICES: Tuple[int, ...] = (13, 14, 15, 16)
+ACTION_DIM: int = len(ACTION_INDICES)  # 4
+
+PHYS_STATE_GROUPS: Tuple[Tuple[str, int], ...] = (
+    ("delta_p", 3),
+    ("delta_q", 4),
+    ("delta_w", 3),
+    ("delta_v", 3),
+    ("delta_f_b", 3),
+    ("delta_v_batt", 1),
+)
+
+# NOTE the encoder's input is [o_t | aux] and does NOT include the reference feed-forward
+# block. That is deliberate and is the reason the block was placed BETWEEN o_t and aux in
+# the env vector rather than appended: it lets the actor gain a feed-forward command while
+# the frozen 33-dim encoder contract (and every pretrained encoder checkpoint) is unchanged.
+
+# ---------------------------------------------------------------------------------
+# ESTIMATOR-DRIFT TARGET GROUPS
+#
+# Names of the self-supervised targets that measure the estimator's OWN error, in the
+# order quad_flip_env.get_priv_targets() appends them. They live here (rather than only in
+# the environment) because a second consumer needs to know WHERE they are in the target
+# vector: the corrupted-estimate augmentation has to move them in lockstep with the frame
+# it corrupts, and it must not guess an offset.
+#
+# `group_slice()` resolves them by NAME against the environment's declared group list, so
+# reordering PRIV_TARGET_GROUPS cannot silently point the augmentation at the wrong dims.
+# ---------------------------------------------------------------------------------
+EST_DRIFT_GROUPS: Tuple[str, ...] = ("est_drift_p", "est_drift_v")
+
+
+def group_slice(groups, names: Sequence[str]) -> Optional[Tuple[int, int]]:
+    """
+    (start, stop) of `names`, in order and adjacent, inside a (name, dim) group list.
+
+    Returns None when the groups are absent (a corpus collected before the drift targets
+    existed), so every caller can degrade to "no drift handling" instead of failing.
+    """
+    names = tuple(names)
+    if not names or not groups:
+        return None
+    idx: Dict[str, Tuple[int, int]] = {}
+    off = 0
+    for name, dim in groups:
+        dim = int(dim)
+        idx[str(name)] = (off, off + dim)
+        off += dim
+    if any(n not in idx for n in names):
+        return None
+    spans = [idx[n] for n in names]
+    start, stop = spans[0][0], spans[-1][1]
+    # Must be adjacent and in order, or the returned slice would sweep up other targets.
+    if any(spans[i][1] != spans[i + 1][0] for i in range(len(spans) - 1)):
+        return None
+    if stop - start != sum(s[1] - s[0] for s in spans):
+        return None
+    return start, stop
+
 
 DEFAULT_CLIP: float = 10.0
 _EPS: float = 1e-8
@@ -61,27 +130,34 @@ def frame_from_env_obs(
     env_obs: np.ndarray,
     actor_total_dim: int = ACTOR_FRAME_DIM,
     aux_dim: int = AUX_DIM,
+    ref_ff_dim: int = 0,
 ) -> np.ndarray:
     """
     Slice the encoder input frame out of an env observation vector.
 
-        env obs : [ actor stack (29*H) | aux (4) | privileged (44) ]
+        env obs : [ actor stack (29*H) | ref_ff (3) | aux (4) | privileged (44) ]
         frame   : [ newest actor frame (29) | aux (4) ]  -> 33 dims
 
     The newest actor frame is the LAST frame of the stack, so this is correct for
     any OBS_HISTORY_LEN and supports a "keep the 3-frame stack + z" ablation without
     changes.
 
-    Accepts a single observation or a batched leading axis, e.g. (N, 77) or (77,).
+    `ref_ff_dim` is skipped, not consumed: the feed-forward block is actor-facing and the
+    encoder's contract is frozen at 33 dims. Getting this offset wrong is not subtle -
+    the frame would silently become [o_t | ref_ff] and the checkpoint's f_in guard would
+    fire - but the point is that the encoder never sees it.
+
+    Accepts a single observation or a batched leading axis, e.g. (N, 80) or (80,).
     """
     env_obs = np.asarray(env_obs)
-    if env_obs.shape[-1] < actor_total_dim + aux_dim:
+    aux_start = actor_total_dim + int(ref_ff_dim)
+    if env_obs.shape[-1] < aux_start + aux_dim:
         raise ValueError(
             f"env observation has {env_obs.shape[-1]} dims, need at least "
-            f"actor_total_dim({actor_total_dim}) + aux_dim({aux_dim})"
+            f"actor_total_dim({actor_total_dim}) + ref_ff_dim({int(ref_ff_dim)}) + aux_dim({aux_dim})"
         )
     actor_stack = env_obs[..., :actor_total_dim]
-    aux = env_obs[..., actor_total_dim:actor_total_dim + aux_dim]
+    aux = env_obs[..., aux_start:aux_start + aux_dim]
     newest = actor_stack[..., -ACTOR_FRAME_DIM:] if actor_total_dim > ACTOR_FRAME_DIM else actor_stack
     return np.concatenate([newest, aux], axis=-1)
 

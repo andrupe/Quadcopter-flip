@@ -40,13 +40,24 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from quad_flip_env import ACTOR_TOTAL_DIM, ENCODER_AUX_DIM, TOTAL_OBS_DIM  # noqa: E402
+from quad_flip_env import (  # noqa: E402
+    ACTOR_FRAME_MODE,
+    ACTOR_TOTAL_DIM,
+    ENCODER_AUX_DIM,
+    REF_FF_DIM,
+    TOTAL_OBS_DIM,
+)
 from asymmetric_policy import AsymmetricActorCriticPolicy  # noqa: E402
 from encoder.latent_injector import LatentInjector  # noqa: E402
 
 Z_DIM: int = 16
+# The two valid actor widths. Both include the reference feed-forward block; the difference
+# is z, which only exists when the frozen encoder is attached. Keep in step with train.py
+# and with LatentObsWrapper's output prefix.
+ACTOR_DIM_NO_ENCODER: int = ACTOR_TOTAL_DIM + REF_FF_DIM              # 32
+ACTOR_DIM_WITH_ENCODER: int = ACTOR_TOTAL_DIM + Z_DIM + REF_FF_DIM    # 48
 ENCODER_CHECKPOINT: str = os.path.join(_PROJECT_ROOT, "logs", "encoder_gru.pt")
-DEFAULT_NET_ARCH: Dict[str, list] = {"pi": [128, 128], "vf": [512, 256, 128]}
+DEFAULT_NET_ARCH: Dict[str, list] = {"pi": [32], "vf": [512, 256, 128]}
 
 
 def read_checkpoint_arch(model_path: str) -> Tuple[Optional[int], Optional[Dict[str, list]]]:
@@ -114,8 +125,8 @@ class ActorInput:
     """
     Turns raw `QuadFlipEnv` observations into the exact vector to pass to `model.predict`.
 
-    :param actor_dim: width the checkpoint expects (29, or 45 with the encoder)
-    :param encoder_path: frozen encoder checkpoint; only used when actor_dim == 45
+    :param actor_dim: width the checkpoint expects (32, or 48 with the encoder)
+    :param encoder_path: frozen encoder checkpoint; only used when actor_dim includes z
     :param device: torch device for the encoder
 
     Raises ValueError for any other width: a pre-migration checkpoint's weights are
@@ -133,7 +144,7 @@ class ActorInput:
         self.encoder_path: Optional[str] = None
         self.injector: Optional[LatentInjector] = None
 
-        if self.actor_dim == ACTOR_TOTAL_DIM + Z_DIM:
+        if self.actor_dim == ACTOR_DIM_WITH_ENCODER:
             self.encoder_path = encoder_path or ENCODER_CHECKPOINT
             if not os.path.isfile(self.encoder_path):
                 raise ValueError(
@@ -144,15 +155,37 @@ class ActorInput:
                     "  .venv/bin/python Simulation/encoder/train_encoder.py"
                 )
             self.injector = LatentInjector(
-                self.encoder_path, ACTOR_TOTAL_DIM, ENCODER_AUX_DIM, Z_DIM, device=device
+                self.encoder_path,
+                actor_dim=ACTOR_TOTAL_DIM,
+                aux_dim=ENCODER_AUX_DIM,
+                z_dim=Z_DIM,
+                ref_ff_dim=REF_FF_DIM,
+                device=device,
             )
-        elif self.actor_dim != ACTOR_TOTAL_DIM:
+            # The encoder's INPUT contains o_t, whose x,y channels changed meaning with
+            # quad_flip_env.ACTOR_FRAME_MODE. A checkpoint trained under the other
+            # convention still loads and still produces a plausible-looking z, so nothing
+            # downstream would notice - it is refused here instead. Checkpoints written
+            # before this key existed predate the anchoring change.
+            extra = getattr(self.injector, "trained_meta", None) or {}
+            got_mode = str(extra.get("frame_mode", "absolute_xy (pre-2026-09-16)"))
+            if got_mode != str(ACTOR_FRAME_MODE):
+                raise ValueError(
+                    f"the encoder at {self.encoder_path} was trained for actor-frame mode "
+                    f"{got_mode!r}, but this build uses {ACTOR_FRAME_MODE!r}.\n"
+                    f"  z would be conditioned on a frame the pipeline no longer "
+                    f"produces. Retrain the encoder, then PPO:\n"
+                    f"    .venv/bin/python Simulation/encoder/collect_data.py\n"
+                    f"    .venv/bin/python Simulation/encoder/train_encoder.py"
+                )
+        elif self.actor_dim != ACTOR_DIM_NO_ENCODER:
             raise ValueError(
                 f"checkpoint expects a {self.actor_dim}-dim actor input, but this build "
-                f"produces {ACTOR_TOTAL_DIM} (no encoder) or {ACTOR_TOTAL_DIM + Z_DIM} "
+                f"produces {ACTOR_DIM_NO_ENCODER} (no encoder) or {ACTOR_DIM_WITH_ENCODER} "
                 f"(with the encoder).\n"
-                "  This checkpoint predates the trajectory-tracking migration - its "
-                "observation layout no longer exists, so its weights cannot be evaluated.\n"
+                "  This checkpoint predates a change to the observation layout (the "
+                "reference feed-forward block, which shifted the aux and privileged "
+                "offsets), so its weights cannot be evaluated against this environment.\n"
                 "  Retrain with:  .venv/bin/python Simulation/train.py"
             )
 
@@ -190,6 +223,20 @@ class ActorInput:
             raise ValueError(
                 f"observation has {obs.shape[-1]} dims, checkpoint needs {self.actor_dim}"
             )
+        # EXACT width, not "at least". A layout slip (a block injected at the wrong offset, or
+        # an assembler built without one of the blocks) produces an observation that is
+        # merely the wrong SHAPE but still wide enough to slice, so a `<` test passes and the
+        # policy is fed the wrong channels with no error at all. That failure mode has already
+        # bitten this project once, so the width is pinned here.
+        if self.injector is not None:
+            expected = TOTAL_OBS_DIM + Z_DIM
+            if obs.shape[-1] != expected:
+                raise ValueError(
+                    f"assembled observation has {obs.shape[-1]} dims; with the encoder attached "
+                    f"it must be exactly {expected} "
+                    f"([o_t | z | ref_ff | aux | privileged]). Check that the injector was "
+                    f"built with ref_ff_dim={REF_FF_DIM}."
+                )
         return obs
 
     @property
@@ -206,7 +253,7 @@ class ActorInput:
     def describe(self) -> str:
         if self.injector is not None:
             return (
-                f"actor input = [o_t({ACTOR_TOTAL_DIM}) | z({Z_DIM})] via "
+                f"actor input = [o_t({ACTOR_TOTAL_DIM}) | z({Z_DIM}) | ref_ff({REF_FF_DIM})] via "
                 f"{os.path.basename(self.encoder_path or '')}"
             )
-        return f"actor input = o_t({ACTOR_TOTAL_DIM}) (no encoder)"
+        return f"actor input = [o_t({ACTOR_TOTAL_DIM}) | ref_ff({REF_FF_DIM})] (no encoder)"

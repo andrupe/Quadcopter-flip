@@ -1,0 +1,2 @@
+timestep,steps,overall_per_step,pct_of_ceiling,hover,waypoints,figure8,lissajous,orbit,slalom,flip,v8,chain,err_pos,err_vel,err_att,err_rate,kern_pos,kern_vel,kern_att,kern_rate
+2048000,9365,2.0755,28.43,1.0363,2.0176,2.0640,1.9040,1.9189,1.8148,2.7211,2.7546,2.4443,,,,,,,,

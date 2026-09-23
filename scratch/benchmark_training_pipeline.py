@@ -36,7 +36,7 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from quad_flip_env import ACTOR_TOTAL_DIM, TOTAL_OBS_DIM, QuadFlipEnv  # noqa: E402
+from quad_flip_env import ACTOR_TOTAL_DIM, REF_FF_DIM, TOTAL_OBS_DIM, QuadFlipEnv  # noqa: E402
 
 N_WORKERS = 10
 N_STEPS = 2048  # SB3 PPO n_steps from train.py
@@ -136,7 +136,7 @@ def build_vec(use_encoder: bool):
     if use_encoder:
         from encoder.latent_obs_wrapper import LatentObsWrapper
 
-        venv = LatentObsWrapper(venv, encoder_path=ENCODER_PATH, z_dim=16)
+        venv = LatentObsWrapper(venv, encoder_path=ENCODER_PATH, z_dim=16, ref_ff_dim=REF_FF_DIM)
     venv = VecNormalize(venv, norm_obs=False, norm_reward=False, clip_obs=10.0)
     return venv
 
@@ -220,7 +220,7 @@ def part_c() -> None:
     torch.set_num_threads(1)  # same as train.py
 
     venv = build_vec(use_encoder=os.path.isfile(ENCODER_PATH))
-    actor_dim = ACTOR_TOTAL_DIM + (16 if os.path.isfile(ENCODER_PATH) else 0)
+    actor_dim = ACTOR_TOTAL_DIM + REF_FF_DIM + (16 if os.path.isfile(ENCODER_PATH) else 0)
 
     model = PPO(
         policy=AsymmetricActorCriticPolicy,
@@ -236,7 +236,7 @@ def part_c() -> None:
         policy_kwargs=dict(
             actor_obs_dim=actor_dim,
             activation_fn=torch.nn.Tanh,
-            net_arch=dict(pi=[128, 128], vf=[512, 256, 128]),
+            net_arch=dict(pi=[32], vf=[512, 256, 128]),
             log_std_init=-0.5,
         ),
         verbose=0,

@@ -1,0 +1,41 @@
+{
+  "generated": "2026-09-17T10:24:55+00:00",
+  "model": "logs/rl_model_30000000_steps.zip",
+  "encoder": "logs/encoder_gru.pt",
+  "onnx": "Simulation/deploy/models/policy_step_stedgeai.onnx",
+  "gelu": "tanh",
+  "compat": true,
+  "exporter": "torchscript",
+  "graph": {
+    "opset": [
+      17
+    ],
+    "ops": {
+      "Add": 17,
+      "Clip": 2,
+      "Concat": 2,
+      "Constant": 7,
+      "MatMul": 11,
+      "Mul": 10,
+      "Sigmoid": 2,
+      "Sub": 2,
+      "Tanh": 5
+    },
+    "n_nodes": 58,
+    "params": 38456,
+    "flash_bytes_fp32": 153824,
+    "file_bytes": 158119,
+    "sha256": "285cd44a0cce888473b1083063a71965bc0cbf58d259b484a64ed8e6d8b67f56"
+  },
+  "verify": {
+    "ok": true,
+    "frames": 3000,
+    "z_tol": 0.002,
+    "action_tol": 0.0005,
+    "max_z_err": 0.0007402896881103516,
+    "max_action_err": 0.00032657384872436523,
+    "mean_z_err": 8.402781531913206e-05,
+    "mean_action_err": 4.9228448915528134e-05,
+    "action_saturation_frac": 0.18133333333333335
+  }
+}

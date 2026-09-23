@@ -40,7 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .observation_spec import ENCODER_IN_DIM
+from .observation_spec import ACTION_DIM, ENCODER_IN_DIM, PHYS_STATE_DIM
 
 VAR_MIN: float = -6.0
 VAR_MAX: float = 4.0
@@ -195,6 +195,135 @@ class EncoderWithHead(nn.Module):
         return logvar.clamp(self.var_min, self.var_max)
 
 
+class DynamicsPredictorHead(nn.Module):
+    """
+    MLP that predicts next physical state change Δs_t from (s_t, a_t, z_t).
+
+    s_t: physical state channels (17 dims: pos, quat, omega, vel, spec_force, v_batt)
+    a_t: action applied at step t (4 dims: collective thrust, body rates / motor cmds)
+    z_t: latent vehicle dynamics representation from HistoryEncoder (z_dim=16)
+
+    Output: Δs_hat_t (17 dims)
+    """
+
+    def __init__(
+        self,
+        state_dim: int = PHYS_STATE_DIM,
+        action_dim: int = ACTION_DIM,
+        z_dim: int = 16,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.z_dim = int(z_dim)
+        self.hidden_dim = int(hidden_dim)
+        in_dim = self.state_dim + self.action_dim + self.z_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.state_dim),
+        )
+
+    def forward(self, s: torch.Tensor, a: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """
+        Forward prediction of state delta.
+        s: [..., state_dim]
+        a: [..., action_dim]
+        z: [..., z_dim]
+        returns: [..., state_dim] Δs_hat
+        """
+        inp = torch.cat([s, a, z], dim=-1)
+        return self.net(inp)
+
+
+class EncoderWithDynamicsHead(nn.Module):
+    """
+    HistoryEncoder paired with DynamicsPredictorHead for self-supervised pretraining.
+    """
+
+    def __init__(
+        self,
+        f_in: int = ENCODER_IN_DIM,
+        width: int = 48,
+        z_dim: int = 16,
+        state_dim: int = PHYS_STATE_DIM,
+        action_dim: int = ACTION_DIM,
+        hidden_dim: int = 128,
+        dilations: Optional[Sequence[int]] = None,
+        kernel: int = 3,
+        groups: int = 1,
+    ):
+        super().__init__()
+        self.encoder = HistoryEncoder(
+            f_in=f_in, width=width, z_dim=z_dim, dilations=dilations, kernel=kernel, groups=groups
+        )
+        self.dynamics_head = DynamicsPredictorHead(
+            state_dim=state_dim, action_dim=action_dim, z_dim=z_dim, hidden_dim=hidden_dim
+        )
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.z_dim = int(z_dim)
+        self.mode = "self_supervised"
+
+    @property
+    def param_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def forward_sequence(self, x: torch.Tensor) -> torch.Tensor:
+        """Readout z at every timestep: [B, T, f_in] -> [B, T, z_dim]."""
+        return self.encoder.forward_sequence(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Readout z at final timestep: [B, T, f_in] -> [B, z_dim]."""
+        return self.encoder(x)
+
+    def rollout_sequence(
+        self,
+        x: torch.Tensor,
+        s_true: torch.Tensor,
+        a_true: torch.Tensor,
+        horizon: int = 1,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Unroll dynamics prediction for K steps across whole sequence.
+
+        Args:
+            x: [B, T, f_in] input frames (standardized)
+            s_true: [B, T, state_dim] true physical states
+            a_true: [B, T-1, action_dim] applied actions (a_true[:, t] applied at t produces step t+1)
+            horizon: K steps ahead to unroll (K >= 1)
+        Returns:
+            z: [B, T, z_dim]
+            pred_states: list of K tensors, each [B, T-K, state_dim]
+            target_states: list of K tensors, each [B, T-K, state_dim]
+        """
+        z = self.forward_sequence(x)  # [B, T, z_dim]
+        B, T, _ = x.shape
+        K = max(1, int(horizon))
+        if T <= K:
+            return z, [], []
+
+        T_eff = T - K
+        z_init = z[:, :T_eff]         # [B, T_eff, z_dim]
+        s_curr = s_true[:, :T_eff]    # [B, T_eff, state_dim]
+
+        preds: List[torch.Tensor] = []
+        targets: List[torch.Tensor] = []
+
+        for k in range(K):
+            a_k = a_true[:, k:k + T_eff]               # [B, T_eff, action_dim]
+            target_k = s_true[:, k + 1:k + 1 + T_eff]  # [B, T_eff, state_dim]
+            delta_k = self.dynamics_head(s_curr, a_k, z_init)
+            s_curr = s_curr + delta_k
+            preds.append(s_curr)
+            targets.append(target_k)
+
+        return z, preds, targets
+
+
 # ---------------------------------------------------------------------------------
 # losses
 # ---------------------------------------------------------------------------------
@@ -255,7 +384,7 @@ def mse_loss(mu: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------------
 def save_encoder_checkpoint(
     path: str,
-    model: "EncoderWithHead",
+    model: nn.Module,
     norm_stats,
     extra: dict | None = None,
 ) -> None:
@@ -263,21 +392,29 @@ def save_encoder_checkpoint(
 
     payload = {
         "encoder_state": model.encoder.state_dict(),
-        "mu_head_state": model.mu_head.state_dict(),
-        "logvar_head_state": model.logvar_head.state_dict(),
         "config": {
             "arch": "gru",
             "f_in": model.encoder.f_in,
             "width": model.encoder.width,
             "z_dim": model.encoder.z_dim,
-            "n_targets": model.n_targets,
-            "var_min": model.var_min,
-            "var_max": model.var_max,
+            "mode": getattr(model, "mode", "privileged"),
             "param_count": model.param_count,
         },
         "norm": norm_stats.to_dict() if hasattr(norm_stats, "to_dict") else dict(norm_stats),
         "extra": extra or {},
     }
+    if hasattr(model, "mu_head"):
+        payload["mu_head_state"] = model.mu_head.state_dict()
+        payload["logvar_head_state"] = model.logvar_head.state_dict()
+        payload["config"]["n_targets"] = getattr(model, "n_targets", 35)
+        payload["config"]["var_min"] = getattr(model, "var_min", VAR_MIN)
+        payload["config"]["var_max"] = getattr(model, "var_max", VAR_MAX)
+    if hasattr(model, "dynamics_head"):
+        payload["dynamics_head_state"] = model.dynamics_head.state_dict()
+        payload["config"]["state_dim"] = model.dynamics_head.state_dim
+        payload["config"]["action_dim"] = model.dynamics_head.action_dim
+        payload["config"]["hidden_dim"] = model.dynamics_head.hidden_dim
+
     _dir = _os.path.dirname(_os.path.abspath(path))
     _os.makedirs(_dir, exist_ok=True)
     torch.save(payload, path)

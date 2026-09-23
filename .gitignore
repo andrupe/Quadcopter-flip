@@ -43,6 +43,7 @@ Gifs/Raw/
 ################
 .env
 .venv
+.venv-client
 env/
 venv/
 ENV/
@@ -59,3 +60,41 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
+# Deployment #
+##############
+# The Bitcraze firmware clone lives here (build from it, never commit it).
+firmware/
+# Build artifacts of the out-of-tree policy-controller app.
+Simulation/deploy/app_policy_controller/build/
+# Generated C arrays (reproducible: run Simulation/deploy/export_policy.py and
+# Simulation/deploy/gen_flip_reference.py; the manifests under Simulation/deploy/manifests/
+# record which checkpoint/seed produced the flashed firmware).
+Simulation/deploy/app_policy_controller/src/generated/policy_weights.c
+Simulation/deploy/app_policy_controller/src/generated/policy_weights.h
+Simulation/deploy/app_policy_controller/src/generated/reference_tables.c
+Simulation/deploy/app_policy_controller/src/generated/reference_tables.h
+# The ST Edge AI generated network, copied in by Simulation/deploy/install_stedgeai.py
+# (reproducible: run `stedgeai generate` on models/policy_step_stedgeai.onnx).
+Simulation/deploy/app_policy_controller/src/generated/stedgeai/network.c
+Simulation/deploy/app_policy_controller/src/generated/stedgeai/network.h
+Simulation/deploy/app_policy_controller/src/generated/stedgeai/network_data.c
+Simulation/deploy/app_policy_controller/src/generated/stedgeai/network_data.h
+Simulation/deploy/app_policy_controller/src/generated/stedgeai/network_details.h
+# ST Edge AI Core intermediate output (the tool writes these relative to the CWD;
+# `stedgeai analyze/generate --output ...` produces them fresh, so never commit).
+st_ai_output/
+st_ai_ws/
+# ST Edge AI generated network sources (reproducible: run `stedgeai generate` on
+# Simulation/deploy/models/policy_step_stedgeai.onnx, see Simulation/deploy/README.md).
+Simulation/deploy/stedgeai_out/
+
+st_ai_output/
+st_ai_ws/
+Simulation/deploy/st_ai_ws/
+Simulation/deploy/st_ai_validate/
+# Bench capture output (Simulation/deploy/bench_bringup.py) + the cflib param cache.
+logs/bench_shadow.csv
+logs/radio_flight_log.csv
+logs/lighthouse_log.csv
+logs/drone_uri.txt
+.cf_cache/

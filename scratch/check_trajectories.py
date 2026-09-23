@@ -21,6 +21,16 @@ The claims that matter here are physical, not stylistic:
   E. FEASIBILITY IS ENFORCED. Every sampled trajectory respects the thrust and rate
      authority AND fits the 1.5 m x 1.5 m training footprint (|x|, |y| <=
      TrajectoryConfig.bounds_xy), and the sampler reports what it rejected.
+  F. MIXTURE. The realised family mix and the worst-case envelope over many draws.
+  G. TERMINAL HOVER. Every manoeuvre ends parked, so an episode always finishes in a
+     hold regardless of which family was drawn.
+  H. VERTICAL FIGURE-EIGHT (v8). It is a genuine vertical lemniscate (it crosses itself
+     halfway), it is acrobatic (large attitude swing, high body rate) and it is still
+     exactly flyable.
+  I. CHAINS. A chain must be continuous across its junctions (checked by DIFFERENTIATING
+     the sampled reference, not by re-reading the constructor), feasible as a whole, and
+     must report the kind of the segment being flown so the reward keeps its per-family
+     tolerances.
 
 Run:  .venv/bin/python scratch/check_trajectories.py
 """
@@ -42,14 +52,19 @@ from trajectories import (  # noqa: E402
     GRAVITY,
     MASS_NOMINAL,
     MAX_THRUST_TOTAL,
+    Chain,
+    FigureEight,
     Flip,
     Hover,
-    FigureEight,
+    Orbit,
+    ShiftedManeuver,
     Trajectory,
     TrajectoryConfig,
     TrajectorySampler,
+    VerticalEight,
     WaypointTrajectory,
     axis_angle_rotation,
+    omega_from_dcm,
 )
 
 FAILURES: list[str] = []
@@ -71,20 +86,28 @@ def flatness_error(ref, mass: float = MASS_NOMINAL) -> float:
     return float(np.linalg.norm(lhs - rhs))
 
 
-def omega_consistency(traj: Trajectory) -> float:
+def omega_consistency(traj: Trajectory, dt: float = DT) -> float:
     """Max angle (rad) by which integrating omega fails to reproduce R(t+dt).
 
     The exponential map needs the ANGLE as |omega|*dt, not dt - passing dt directly
     applies a rotation of dt radians regardless of the rate, which silently inflates the
     error for fast manoeuvres and was the original cause of this check failing.
+
+    `dt` is the integration step, and it has to be chosen against the ANGULAR ACCELERATION
+    of the reference, not just its rate: the check linearises the attitude over one step,
+    so a manoeuvre that swings its thrust direction hard (v8, and chains that contain one)
+    accumulates O(dt^2 * |domega/dt|) error at the same threshold the smooth families pass
+    at dt = 10 ms. The claim being tested - "omega is the derivative of R" - is tested at
+    2 ms for those families instead, and section H/I additionally compares the production
+    stencil against a 10x finer one, which is the direct test of the rate itself.
     """
     worst = 0.0
-    for t in np.arange(0.0, max(0.0, traj.duration - DT), DT):
+    for t in np.arange(0.0, max(0.0, traj.duration - dt), dt):
         r0 = traj.sample(t)
-        r1 = traj.sample(t + DT)
+        r1 = traj.sample(t + dt)
         w = float(np.linalg.norm(r0.omega))
         if w > 1e-9:
-            R_pred = r0.R @ axis_angle_rotation(r0.omega, w * DT)
+            R_pred = r0.R @ axis_angle_rotation(r0.omega, w * dt)
         else:
             R_pred = r0.R
         err = R_pred.T @ r1.R
@@ -161,13 +184,16 @@ print()
 print("=" * 78)
 print("D. omega reproduces the reference attitude")
 print("=" * 78)
-for name, tr in [
-    ("flip", traj),
-    ("hover", Trajectory(Hover([0.0, 0.0, 1.2], 0.3, 2.0))),
-    ("waypoints", Trajectory(WaypointTrajectory([[0, 0, 1.2], [0.5, 0.3, 1.4], [-0.4, 0.2, 1.1]], 1.0))),
-    ("figure8", Trajectory(FigureEight(0.3, 0.3, 1.2, 1.3))),
+for name, tr, dt in [
+    ("flip", traj, DT),
+    ("hover", Trajectory(Hover([0.0, 0.0, 1.2], 0.3, 2.0)), DT),
+    ("waypoints", Trajectory(WaypointTrajectory([[0, 0, 1.2], [0.5, 0.3, 1.4], [-0.4, 0.2, 1.1]], 1.0)), DT),
+    ("figure8", Trajectory(FigureEight(0.3, 0.3, 1.2, 1.3)), DT),
+    # The acrobatic families turn the attitude faster than the linearisation can follow at
+    # 10 ms, so their rate consistency is integrated at 2 ms (see omega_consistency).
+    ("v8", Trajectory(VerticalEight([0.0, 0.0, 1.2], 0.32, 0.22, 2.6)), 0.002),
 ]:
-    err = omega_consistency(tr)
+    err = omega_consistency(tr, dt)
     check(f"{name}: integrating omega reproduces R", err < 5e-3, f"max attitude error {err * 1e3:.2f} mrad")
 print()
 print("=" * 78)
@@ -177,6 +203,7 @@ for name, tr in [
     ("hover", Trajectory(Hover([0.0, 0.0, 1.2], 0.3, 2.0))),
     ("waypoints", Trajectory(WaypointTrajectory([[0, 0, 1.2], [0.5, 0.3, 1.4], [-0.4, 0.2, 1.1]], 1.0))),
     ("figure8", Trajectory(FigureEight(0.3, 0.3, 1.2, 1.3))),
+    ("v8", Trajectory(VerticalEight([0.0, 0.0, 1.2], 0.32, 0.22, 2.6))),
 ]:
     wf, thr = 0.0, []
     for t in np.arange(0.0, tr.duration, DT):
@@ -266,6 +293,180 @@ for name in sorted(sampler.cfg.weights):
     check(f"{name}: terminal attitude is level", w_tilt < 1e-3, f"max tilt {np.degrees(w_tilt):.4f} deg")
     check(f"{name}: terminal body rate is zero", w_rate < 1e-3, f"max |omega| {w_rate:.2e} rad/s")
     check(f"{name}: terminal thrust is hover trim", w_thr < 1e-9, f"max |T - mg| {w_thr:.2e} N")
+
+print()
+print("=" * 78)
+print("H. the vertical figure-eight is an acrobatic AND is flyable")
+print("=" * 78)
+print("   v8 is a lemniscate in a VERTICAL plane: the 8's two leaves stack in altitude.")
+print("   The claims to verify are that it really is an 8, that it really is acrobatic,")
+print("   and that it is still exactly flyable - flatness, thrust, rate, altitude.")
+v8 = VerticalEight([0.0, 0.0, 1.2], z_amp=0.32, u_amp=0.22, w=2.6, heading=0.0)
+v8_traj = Trajectory(v8)
+r0, r_mid, rT = (v8_traj.sample(x) for x in (0.0, v8.duration * 0.5, v8.duration))
+check("v8: the path crosses itself at the halfway point",
+      float(np.linalg.norm(r_mid.p - r0.p)) < 1e-9,
+      f"|p(T/2) - p(0)| = {float(np.linalg.norm(r_mid.p - r0.p)):.2e} m")
+ys = [float(v8_traj.sample(float(t)).p[1]) for t in np.linspace(0.0, v8.duration, 40)]
+check("v8: the 8 lies in its vertical plane", max(abs(y) for y in ys) < 1e-12,
+      f"max |y| = {max(abs(y) for y in ys):.2e} m (heading 0 -> x-z plane)")
+zs = [float(v8_traj.sample(float(t)).p[2]) for t in np.linspace(0.0, v8.duration, 200)]
+check("v8: climbs over one leaf and dives under the other",
+      max(zs) > 1.2 + 0.15 and min(zs) < 1.2 - 0.15,
+      f"z in [{min(zs):.2f}, {max(zs):.2f}] m around 1.20")
+
+peak_tilt = peak_rate = wf = 0.0
+t_lo, t_hi = 9e9, -9e9
+for t in np.arange(0.0, v8_traj.duration, DT):
+    r = v8_traj.sample(float(t))
+    wf = max(wf, flatness_error(r))
+    peak_tilt = max(peak_tilt, np.degrees(np.arccos(np.clip(float(r.R[2, 2]), -1.0, 1.0))))
+    peak_rate = max(peak_rate, float(np.linalg.norm(r.omega)))
+    t_lo = min(t_lo, float(r.thrust_ff))
+    t_hi = max(t_hi, float(r.thrust_ff))
+check("v8: flatness relation holds", wf < 1e-9, f"max residual {wf:.3e} N")
+check("v8: it IS an acrobatic (attitude swings hard)", peak_tilt > 35.0,
+      f"peak tilt {peak_tilt:.0f} deg")
+check("v8: it IS an acrobatic (body rate beyond the smooth families)", peak_rate > 4.0,
+      f"peak |omega| {peak_rate:.1f} rad/s")
+check("v8: thrust stays inside [0, Tmax]", 0.0 <= t_lo and t_hi <= MAX_THRUST_TOTAL,
+      f"T in [{t_lo:.3f}, {t_hi:.3f}] N")
+check("v8: rate stays inside the policy's action scale", peak_rate <= 20.0,
+      f"peak {peak_rate:.1f} rad/s (limit 20)")
+check("v8: starts and ends parked",
+      float(np.linalg.norm(r0.v)) < 1e-6 and float(np.linalg.norm(rT.v)) < 1e-6
+      and float(np.linalg.norm(r0.a)) < 1e-6 and float(np.linalg.norm(rT.a)) < 1e-6,
+      f"|v(0)| {float(np.linalg.norm(r0.v)):.1e}, |a(T)| {float(np.linalg.norm(rT.a)):.1e}")
+check("v8: the flatness attitude never approaches weightlessness",
+      all(float(v8_traj.sample(float(t)).a[2]) + GRAVITY > 1.0
+          for t in np.linspace(0.0, v8_traj.duration, 400)),
+      f"min (a_z + g) = {min(float(v8_traj.sample(float(t)).a[2]) + GRAVITY for t in np.linspace(0.0, v8_traj.duration, 400)):.2f} m/s^2")
+
+# The sampled band must stay inside the same envelope, measured over many draws.
+rng_v8 = np.random.default_rng(4)
+worst_rate = worst_thrust = worst_tilt = 0.0
+for _ in range(40):
+    tr_v8 = Trajectory(sampler._make_v8(rng_v8, np.array([0.0, 0.0, 1.2]), 0.0))
+    for t in np.linspace(0.0, tr_v8.duration, 150):
+        r = tr_v8.sample(float(t))
+        worst_rate = max(worst_rate, float(np.linalg.norm(r.omega)))
+        worst_thrust = max(worst_thrust, float(r.thrust_ff))
+        worst_tilt = max(worst_tilt, np.degrees(np.arccos(np.clip(float(r.R[2, 2]), -1.0, 1.0))))
+check("v8: sampled band stays inside the rate and thrust envelope",
+      worst_rate <= 0.95 * 20.0 and worst_thrust <= 0.95 * MAX_THRUST_TOTAL,
+      f"worst of 40 draws: {worst_rate:.1f} rad/s, {worst_thrust:.3f} N, tilt {worst_tilt:.0f} deg")
+
+print()
+print("=" * 78)
+print("I. a CHAIN is continuous, feasible, and reports per-segment kinds")
+print("=" * 78)
+print("   A chain links manoeuvres into one longer command. The junctions must not step")
+print("   position, velocity, attitude or body rate; the relocation must preserve feasibility;")
+print("   the whole thing must fit the volume/footprint/episode; and the reward must still be")
+print("   able to look up the tolerance of the manoeuvre being flown.")
+flip_for_chain = Flip([0.0, 0.0, 1.2], axis=[0.0, 1.0, 0.0], rotations=1.0, coast=0.6, max_rate=20.0)
+chain_flip = Chain([
+    FigureEight(0.25, 0.25, 1.7, 1.2, ease=0.7, settle=0.7),
+    flip_for_chain,                                            # in the MIDDLE: 2 junctions
+    VerticalEight([0.0, 0.0, 1.2], 0.30, 0.20, 2.6),           # relocated automatically
+    Orbit([0.0, 0.0, 1.2], 0.3, 1.2, duration=3.2, ease=0.8, settle=0.8),
+], hold=0.4)
+chain_traj = Trajectory(chain_flip)
+check("chain: reports per-segment kinds (not one blanket kind)",
+      len({chain_traj.sample(float(t)).kind for t in np.linspace(0.0, chain_traj.duration, 300)}) >= 3,
+      f"kinds seen = {sorted({chain_traj.sample(float(t)).kind for t in np.linspace(0.0, chain_traj.duration, 300)})}")
+
+# Independent continuity check: differentiate the SAMPLED reference and compare against
+# the reference's own v and a. A step at a junction would show up as a mismatch here.
+h = 2e-3
+worst_dv = worst_da_xy = 0.0
+for t in np.arange(h, chain_traj.duration - h, 2.0 * DT):
+    rm = chain_traj.sample(float(t - h))
+    rp = chain_traj.sample(float(t + h))
+    rc = chain_traj.sample(float(t))
+    worst_dv = max(worst_dv, float(np.linalg.norm((rp.p - rm.p) / (2.0 * h) - rc.v)))
+    da = (rp.v - rm.v) / (2.0 * h) - rc.a
+    # Only the VERTICAL component may step (the flip's documented thrust step); a lateral
+    # step would rotate the reference attitude without the reference asking for it.
+    worst_da_xy = max(worst_da_xy, float(np.linalg.norm(da[:2])))
+check("chain: position derivative matches the reference velocity (no v step)",
+      worst_dv < 5e-3, f"max |dp/dt - v| = {worst_dv:.2e} m/s")
+check("chain: no LATERAL acceleration step at any junction",
+      worst_da_xy < 5e-2, f"max |da_xy/dt residual| = {worst_da_xy:.2e} m/s^2")
+w_chain = omega_consistency(chain_traj, 0.002)
+check("chain: integrating omega reproduces R across the junctions", w_chain < 5e-3,
+      f"max attitude error {w_chain * 1e3:.2f} mrad")
+
+# Direct test of the RATE itself: the production stencil (h = 1 ms) against a 10x finer
+# one. A wrong or lagging stencil would show up here; the peak rates must agree to 1%.
+rates_prod, rates_fine = [], []
+for t in np.linspace(0.0, chain_traj.duration, 600):
+    t = float(t)
+    r = chain_traj.sample(t)
+    Rm = chain_traj.maneuver.pose(t - 1e-4)[3]
+    R0 = chain_traj.maneuver.pose(t)[3]
+    Rp = chain_traj.maneuver.pose(t + 1e-4)[3]
+    rates_prod.append(float(np.linalg.norm(r.omega)))
+    rates_fine.append(float(np.linalg.norm(omega_from_dcm(Rm, R0, Rp, 1e-4))))
+rates_prod = np.asarray(rates_prod); rates_fine = np.asarray(rates_fine)
+check("chain: the production stencil resolves the same peak rate as a 10x finer one",
+      abs(rates_prod.max() - rates_fine.max()) <= 0.01 * max(1e-9, rates_fine.max()),
+      f"peak {rates_prod.max():.2f} vs {rates_fine.max():.2f} rad/s")
+
+thr_chain = [chain_traj.sample(float(t)).thrust_ff for t in np.linspace(0.0, chain_traj.duration, 400)]
+rate_chain = max(float(np.linalg.norm(chain_traj.sample(float(t)).omega))
+                 for t in np.linspace(0.0, chain_traj.duration, 400))
+xy_chain = max(float(np.max(np.abs(chain_traj.sample(float(t)).p[:2])))
+               for t in np.linspace(0.0, chain_traj.duration, 400))
+check("chain: thrust within authority", max(thr_chain) <= MAX_THRUST_TOTAL,
+      f"max {max(thr_chain):.3f} N (flips step thrust by design, still inside authority)")
+check("chain: rate within the policy's action scale", rate_chain <= 20.0,
+      f"max {rate_chain:.1f} rad/s")
+check("chain: fits the training footprint", xy_chain <= TrajectoryConfig().bounds_xy + 1e-9,
+      f"max |x|,|y| = {xy_chain:.3f} m")
+# The sampler's OWN chains must fit it too - they are relocated to a random station, so
+# this is the guarantee that the screens, not the draw ranges, are what enforce the box.
+sampled_ok = True
+worst_sampled = 0.0
+rng_ch = np.random.default_rng(8)
+for _ in range(25):
+    tr_ch = sampler.sample(rng_ch, kind="chain")
+    for t in np.linspace(0.0, tr_ch.duration, 120):
+        worst_sampled = max(worst_sampled,
+                            float(np.max(np.abs(tr_ch.sample(float(t)).p[:2]))))
+sampled_ok = worst_sampled <= TrajectoryConfig().bounds_xy + 1e-9
+check("chain: 25 sampled chains all fit the footprint", sampled_ok,
+      f"max |x|,|y| = {worst_sampled:.3f} m (limit {TrajectoryConfig().bounds_xy:.2f})")
+check("chain: thrust steps exist where thrust steps (the documented flip exception)",
+      chain_flip.thrust_steps == 2, f"{chain_flip.thrust_steps} thrust steps reported (flip has 2 junctions)")
+
+# The contract is enforced, not assumed: a mid-motion segment must be refused.
+try:
+    Chain([FigureEight(0.3, 0.3, 1.2, 1.3)])
+    check("chain: refuses a mid-motion segment", False, "no exception raised")
+except ValueError as exc:
+    check("chain: refuses a mid-motion segment (and says how to fix it)",
+          "ease" in str(exc), str(exc)[:70] + "...")
+
+# Relocation must preserve the dynamics, and must NOT rotate the body rate.
+flip_ref = Trajectory(Flip([0.0, 0.0, 1.2], axis=[0.0, 1.0, 0.0], rotations=1.0, coast=0.6, max_rate=20.0))
+flip_sh = Trajectory(ShiftedManeuver(
+    Flip([0.0, 0.0, 1.2], axis=[0.0, 1.0, 0.0], rotations=1.0, coast=0.6, max_rate=20.0),
+    np.array([0.55, -0.4, 1.35]), 1.1))
+w_ref = max(float(np.linalg.norm(flip_ref.sample(float(t)).omega))
+            for t in np.linspace(0.0, flip_ref.duration, 300))
+w_sh = max(float(np.linalg.norm(flip_sh.sample(float(t)).omega))
+           for t in np.linspace(0.0, flip_sh.duration, 300))
+check("relocation preserves |omega| (so feasibility survives the move)",
+      abs(w_ref - w_sh) < 1e-6, f"{w_ref:.6f} vs {w_sh:.6f} rad/s")
+body_ok = True
+for frac in (0.25, 0.5, 0.75):
+    t = frac * flip_ref.duration
+    a = flip_ref.sample(float(t)); b = flip_sh.sample(float(t))
+    # A yaw-only relocation turns the BODY AXES with the vehicle, so the body-rate
+    # VECTOR is unchanged - only its world-frame meaning rotated with R.
+    body_ok = body_ok and float(np.linalg.norm(a.omega - b.omega)) < 1e-6
+check("relocation leaves the body-frame rate vector unchanged", body_ok)
 
 print()
 print("=" * 78)

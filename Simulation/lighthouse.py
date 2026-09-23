@@ -94,6 +94,50 @@ class LighthouseConfig:
     # sweep period rather than a continuous output.
     fix_decimation: int = 1
 
+    # ----------------------------------------------------------------------------
+    # FIX PLAUSIBILITY GATE
+    #
+    # The estimator is the only absolute state source, and on the real airframe it is
+    # not always merely noisy - it fails LOUDLY. Measured during bring-up: a STATIC
+    # vehicle's `stateEstimate.x` walked to +98 m at 5-9 m/s while the KF repeatedly reset
+    # itself. Nothing downstream of the estimator can distinguish that from real motion,
+    # so the absurd fixes are rejected here and the estimator keeps dead-reckoning.
+    #
+    # The thresholds are deliberately ~an order of magnitude beyond anything the flight
+    # envelope produces, because a gate that fires during nominal flight is far worse
+    # than no gate: rejecting a good fix mid-flip would delay exactly the recovery the
+    # whole design depends on.
+    #
+    # `max_fix_jump` (m, per accepted fix, measured against the propagated estimate).
+    # MEASURED (400 blackouts over the full DR envelope, plus 200 of 3-4 s, i.e. longer
+    # than a flip): a legitimate post-blackout innovation runs p50 0.03 / p99 1.41 /
+    # max 2.67 m, while a fix that arrives with continuous coverage never exceeds 0.13 m.
+    # 5.0 m therefore sits ~2x above the worst legitimate re-acquisition and ~40x above
+    # the steady-state innovation, so it cannot fire on good data.
+    max_fix_jump: float = 5.0
+    # `max_fix_dv` (m/s, per step). Same measurement: the worst legitimate post-blackout
+    # velocity step is 1.50 m/s (the dead-reckoned velocity has been integrating a tilt
+    # error for seconds), and the steady-state maximum is 0.43 m/s. An earlier draft used
+    # 1.5 m/s, which REJECTED EVERY FIX after a 2.2 s blackout - a false positive that
+    # blinds the estimator exactly when the flip needs it. 4.0 m/s is ~2.7x the worst
+    # legitimate value and still 20x the physical single-step limit (thrust/mass ~
+    # 20 m/s^2 over 10 ms = 0.2 m/s), so it only ever catches a velocity teleport.
+    max_fix_dv: float = 4.0
+    # Consecutive rejections before the gate stands down and accepts the next fix
+    # REGARDLESS of thresholds. A glitch filter that can veto forever is a liability: if
+    # the fix keeps disagreeing with us, the dead-reckoned estimate is the thing that is
+    # wrong. 50 steps = 0.5 s, far longer than any glitch and short enough that a blind
+    # estimator recovers inside one manoeuvre.
+    max_reject_streak: int = 50
+    # `max_fix_range` (m from the episode's anchor pose). This is the ONLY guard here that
+    # can resist a PERSISTENT lie: the measured runaway accumulated ~0.02-0.04 m per step,
+    # which no per-step threshold (and no streak breaker) can see, but it left the flight
+    # volume within seconds. 0.0 disables it (the default), because how far a vehicle may
+    # legitimately be from its anchor depends on the flight volume, which only the caller
+    # knows. The Sim environment enables it from its own sphere radius; free-flight tools
+    # leave it off.
+    max_fix_range: float = 0.0
+
 
 class LighthouseModel:
     """
@@ -126,6 +170,13 @@ class LighthouseModel:
         self._dropout_prob = 0.0
         self._tilt_walk = 0.0
         self._accel_walk = 0.0
+        # Fix-plausibility gate state. Diagnostics only - they never feed the estimate.
+        self.n_fix_rejected = 0
+        self.n_nonfinite = 0
+        self.n_fix_forced = 0
+        self._reject_streak = 0
+        self.last_reject_reason = ""
+        self._anchor = np.zeros(3, dtype=np.float64)
 
     # -- episode setup --------------------------------------------------------------
     def reset(self, p0: np.ndarray, v0: np.ndarray, rng: np.random.Generator, dr: float = 0.0) -> None:
@@ -170,12 +221,18 @@ class LighthouseModel:
 
         self.p_est = np.asarray(p0, dtype=np.float64).copy()
         self.v_est = np.asarray(v0, dtype=np.float64).copy()
+        self._anchor = np.asarray(p0, dtype=np.float64).copy()
         self._tilt_err = np.zeros(2, dtype=np.float64)
         self._accel_bias = np.zeros(3, dtype=np.float64)
         self.outage_t = 0.0
         self.fix_available = True
         self.n_visible = self.n_stations
         self._step = 0
+        self.n_fix_rejected = 0
+        self.n_nonfinite = 0
+        self.n_fix_forced = 0
+        self._reject_streak = 0
+        self.last_reject_reason = ""
 
     # -- geometry -------------------------------------------------------------------
     def visible_mask(self, p: np.ndarray, R_world: np.ndarray) -> np.ndarray:
@@ -232,12 +289,34 @@ class LighthouseModel:
             and (self._step % max(1, self.cfg.fix_decimation) == 0)
         )
 
+        # The raw fix is drawn first and then TESTED, so a rejected fix is discarded
+        # exactly like a missing one - the estimator falls through to dead reckoning.
+        p_raw = v_raw = None
         if has_fix:
             sigma = np.array([self._pos_sigma, self._pos_sigma,
                               self._pos_sigma * self.cfg.z_noise_scale])
-            self.p_est = np.asarray(p_true, dtype=np.float64) + rng.normal(0.0, sigma)
-            self.v_est = np.asarray(v_true, dtype=np.float64) + rng.normal(0.0, self._vel_sigma, size=3)
+            p_raw = np.asarray(p_true, dtype=np.float64) + rng.normal(0.0, sigma)
+            v_raw = np.asarray(v_true, dtype=np.float64) + rng.normal(0.0, self._vel_sigma, size=3)
+            ok, why = self._fix_is_plausible(p_raw, v_raw, dt)
+            if not ok and self._reject_streak < int(self.cfg.max_reject_streak):
+                has_fix = False
+                self.n_fix_rejected += 1
+                self._reject_streak += 1
+                self.last_reject_reason = why
+            elif not ok:
+                # The gate has vetoed for `max_reject_streak` steps in a row: stand down and
+                # take the fix. A persistent disagreement means the dead-reckoned estimate
+                # is the wrong one, and continuing to refuse would leave the estimator
+                # blind for the rest of the flight.
+                self.n_fix_forced += 1
+                self._reject_streak = 0
+                self.last_reject_reason = f"forced ({why})"
+
+        if has_fix:
+            self.p_est = p_raw
+            self.v_est = v_raw
             self.outage_t = 0.0
+            self._reject_streak = 0
             # A fix re-anchors attitude and velocity, so the accumulated error states are
             # mostly cancelled; retain a little, as a real EKF would not fully trust one
             # update.
@@ -266,6 +345,16 @@ class LighthouseModel:
             self.v_est = self.v_est + a_drift * dt
             self.p_est = self.p_est + self.v_est * dt
 
+        # Last line of defence: a NaN anywhere in the estimate would propagate into every
+        # observation and permanently poison the policy's (and the encoder's) state, and
+        # np.clip does NOT remove NaN. Deliberately not counted as a "rejected fix": it is
+        # a different failure (the estimator produced garbage rather than no answer).
+        finite = bool(np.all(np.isfinite(self.p_est)) and np.all(np.isfinite(self.v_est)))
+        if not finite:
+            self.p_est = np.nan_to_num(self.p_est, nan=0.0, posinf=0.0, neginf=0.0)
+            self.v_est = np.nan_to_num(self.v_est, nan=0.0, posinf=0.0, neginf=0.0)
+            self.n_nonfinite += 1
+
         self.fix_available = has_fix
         self.n_visible = n_vis
         return {
@@ -276,6 +365,49 @@ class LighthouseModel:
             "outage_t": float(self.outage_t),
             "drifted": float(np.linalg.norm(self.p_est - np.asarray(p_true, dtype=np.float64))),
         }
+
+    # -- fix plausibility -----------------------------------------------------------------
+    def _fix_is_plausible(
+        self,
+        p_raw: np.ndarray,
+        v_raw: np.ndarray,
+        dt: float,
+    ) -> Tuple[bool, str]:
+        """
+        Reject a fix no physical vehicle could have produced.
+
+        Four independent guards, in order of how loud the failure is:
+
+          1. non-finite        - NaN/inf anywhere in the sample.
+          2. jump vs propagated - the fix disagrees with where the estimate propagated to
+                                  by more than `max_fix_jump`. Catches teleports and the
+                                  KF's "state out of bounds" snap.
+          3. velocity step      - the fix's velocity differs from the propagated velocity by
+                                  more than `max_fix_dv`, i.e. an implied acceleration far
+                                  beyond thrust/mass.
+          4. range from anchor  - only when `max_fix_range > 0`. The ONLY guard that can see
+                                  a slow divergence, which no per-step test can.
+
+        Returns (ok, reason). The reason is for diagnostics; it never affects the estimate.
+        """
+        if not (np.all(np.isfinite(p_raw)) and np.all(np.isfinite(v_raw))):
+            return False, "non-finite fix"
+
+        p_pred = self.p_est + self.v_est * dt
+        jump = float(np.linalg.norm(p_raw - p_pred))
+        if jump > self.cfg.max_fix_jump:
+            return False, f"jump {jump:.2f} m > {self.cfg.max_fix_jump:.2f} m"
+
+        dv = float(np.linalg.norm(v_raw - self.v_est))
+        if dv > self.cfg.max_fix_dv:
+            return False, f"velocity step {dv:.2f} m/s > {self.cfg.max_fix_dv:.2f} m/s"
+
+        if self.cfg.max_fix_range > 0.0:
+            span = float(np.linalg.norm(p_raw - self._anchor))
+            if span > self.cfg.max_fix_range:
+                return False, f"range {span:.2f} m > {self.cfg.max_fix_range:.2f} m"
+
+        return True, ""
 
 
 def _lerp(rng_range: Tuple[float, float], dr: float) -> float:

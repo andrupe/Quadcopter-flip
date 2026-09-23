@@ -44,7 +44,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 
 GRAVITY: float = 9.81
-MASS_NOMINAL: float = 0.028
+MASS_NOMINAL: float = 0.033
 MAX_THRUST_TOTAL: float = 0.60          # matches QuadcopterMuJoCo params["maxThr"]
 MIN_THRUST_TOTAL: float = 0.0
 
@@ -74,7 +74,7 @@ def _normalize(v: np.ndarray, fallback: Optional[np.ndarray] = None) -> np.ndarr
 
 
 def axis_angle_rotation(axis: np.ndarray, angle: float) -> np.ndarray:
-    """Rodrigues' rotation formula."""
+    """Rodrigues' rotation formula. skaei kathisterimeno telos pantwn brm"""
     k = _normalize(axis)
     K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
     return np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * (K @ K)
@@ -119,7 +119,7 @@ def dcm_from_thrust_dir_and_yaw(z_b: np.ndarray, yaw: float) -> np.ndarray:
 def omega_from_dcm(R_prev: np.ndarray, R_mid: np.ndarray, R_next: np.ndarray, h: float) -> np.ndarray:
     """
     Body rate from central differences: [omega]_x = R^T Rdot.
-
+    as poume oti bgazei noima nai nai
     Returns omega in the BODY frame (which is the frame the rate PID and the gyro use).
     """
     Rdot = (R_next - R_prev) / (2.0 * h)
@@ -128,7 +128,7 @@ def omega_from_dcm(R_prev: np.ndarray, R_mid: np.ndarray, R_next: np.ndarray, h:
 
 
 def smoothstep(t: float) -> float:
-    """C1 ramp on [0, 1]."""
+    """C1 ramp on [0, 1]. overengineered ala ok mpok"""
     t = float(np.clip(t, 0.0, 1.0))
     return t * t * (3.0 - 2.0 * t)
 
@@ -138,6 +138,12 @@ def _window(t: float, t0: float, t1: float, ramp: float) -> float:
     if ramp <= 0.0:
         return 1.0 if t0 <= t <= t1 else 0.0
     return smoothstep((t - t0) / ramp) * (1.0 - smoothstep((t - (t1 - ramp)) / ramp))
+
+
+def _yaw_of(R: np.ndarray) -> float:
+    """Heading of a body->world rotation: the rotation about world z of its first column."""
+    R = np.asarray(R, dtype=np.float64)
+    return float(math.atan2(R[1, 0], R[0, 0]))
 
 
 def _poly_deriv(k: int, d: int, t: float) -> float:
@@ -166,6 +172,37 @@ def _settle_envelope(t: float, T: float, L: float) -> Tuple[float, float, float]
     ds = (30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4) / L
     dds = (60.0 * s - 180.0 * s**2 + 120.0 * s**3) / (L * L)
     return 1.0 - (10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5), -ds, -dds
+
+
+def _rest_envelope(t: float, T: float, L0: float, L1: float) -> Tuple[float, float, float]:
+    """
+    C2 REST envelope: a quintic ramp IN over the first `L0` seconds, 1 through the middle,
+    a quintic ramp OUT over the last `L1` seconds - and FLAT outside [0, T].
+
+    This is the two-sided twin of `_settle_envelope`, and it is what turns an oscillating
+    shape into a COMMAND. Applied to a profile as
+        p(t) = start + e(t) * (base(t) - base(0)),
+    the zero value and zero first two derivatives of e at BOTH ends make v(0) = a(0) = 0
+    and v(T) = a(T) = 0 for any base: the manoeuvre genuinely begins and ends parked, in
+    a level attitude, which is what a `Chain` junction requires and what lets an
+    acrobatic shape be spawned from rest without a velocity or attitude step.
+
+    The flat extension outside [0, T] is not cosmetic. `Trajectory.sample` evaluates its
+    +-h stencil across the horizon, so the profile has to stay smooth for t slightly
+    below 0 and slightly above T; the quintic's first two derivatives are exactly zero at
+    s = 0 and s = 1, so freezing the ramp value there is C2-continuous with it.
+    """
+    if L0 > 1e-9 and t < L0:
+        s = float(np.clip(t / L0, 0.0, 1.0))
+        ds = (30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4) / L0
+        dds = (60.0 * s - 180.0 * s**2 + 120.0 * s**3) / (L0 * L0)
+        return 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5, ds, dds
+    if L1 > 1e-9 and t > T - L1:
+        s = float(np.clip((t - (T - L1)) / L1, 0.0, 1.0))
+        ds = (30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4) / L1
+        dds = (60.0 * s - 180.0 * s**2 + 120.0 * s**3) / (L1 * L1)
+        return 1.0 - (10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5), -ds, -dds
+    return 1.0, 0.0, 0.0
 
 
 # =====================================================================================
@@ -236,6 +273,19 @@ class Maneuver:
     def pose(self, t: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
         raise NotImplementedError
 
+    def kind_at(self, t: float) -> str:
+        """
+        Reference kind at time t - the key the reward's per-manoeuvre tolerances are
+        looked up with, and the label telemetry carries.
+
+        Constant for every single manoeuvre. `Chain` overrides it so that each of its
+        segments reports its OWN kind: a 360 deg flip in the middle of a chain is graded
+        with the flip tolerances and a hover pause with the hover tolerances, instead of
+        the whole chain being graded on one compromise scale that would be sloppy in the
+        pauses and over-strict in the acrobatics.
+        """
+        return self.kind
+
     # -- shared algebra -----------------------------------------------------------
     @staticmethod
     def flat_attitude(a: np.ndarray, yaw: float) -> np.ndarray:
@@ -266,6 +316,67 @@ class Hover(Maneuver):
                 self.flat_attitude(a, self._yaw(t)), 0.0, self.required_thrust(a))
 
 
+class Takeoff(Maneuver):
+    """
+    Smooth, dynamically feasible ascent trajectory from ground (or arbitrary altitude
+    between 0 and 1.2m) to a stable hover station.
+
+    Uses a degree-7 minimum-snap polynomial with zero velocity, acceleration, and jerk
+    at both boundaries (u=0 and u=1), ensuring C^3-smooth handover from resting/ground
+    trim to the target hover station.
+    """
+
+    kind = "takeoff"
+
+    def __init__(
+        self,
+        p0: Sequence[float],
+        p1: Sequence[float],
+        climb_time: float = 2.0,
+        hold_time: float = 3.0,
+        yaw: float = 0.0,
+        yaw_rate: float = 0.0,
+    ):
+        super().__init__()
+        self.p0 = np.asarray(p0, dtype=np.float64)
+        self.p1 = np.asarray(p1, dtype=np.float64)
+        self.climb_time = float(max(0.5, climb_time))
+        self.hold_time = float(max(0.5, hold_time))
+        self.duration = self.climb_time + self.hold_time
+        self.yaw = float(yaw)
+        self.yaw_rate = float(yaw_rate)
+
+    def pose(self, t: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+        tc = self.climb_time
+        delta = self.p1 - self.p0
+        if t <= 0.0:
+            p = self.p0.copy()
+            v = np.zeros(3, dtype=np.float64)
+            a = np.zeros(3, dtype=np.float64)
+        elif t < tc:
+            u = float(t / tc)
+            u2 = u * u
+            u3 = u2 * u
+            u4 = u3 * u
+            u5 = u4 * u
+            u6 = u5 * u
+            u7 = u6 * u
+            s = 35.0 * u4 - 84.0 * u5 + 70.0 * u6 - 20.0 * u7
+            ds = (140.0 * u3 - 420.0 * u4 + 420.0 * u5 - 140.0 * u6) / tc
+            d2s = (420.0 * u2 - 1680.0 * u3 + 2100.0 * u4 - 840.0 * u5) / (tc * tc)
+            p = self.p0 + s * delta
+            v = ds * delta
+            a = d2s * delta
+        else:
+            p = self.p1.copy()
+            v = np.zeros(3, dtype=np.float64)
+            a = np.zeros(3, dtype=np.float64)
+
+        R = self.flat_attitude(a, self._yaw(t))
+        thrust = self.required_thrust(a)
+        return p, v, a, R, 0.0, thrust
+
+
 class WaypointTrajectory(Maneuver):
     """
     Waypoint trajectory built from ONE global polynomial per axis.
@@ -290,6 +401,7 @@ class WaypointTrajectory(Maneuver):
     The polynomial extrapolates smoothly but not meaningfully outside [0, duration];
     Trajectory.sample() clamps only the value it returns, so the +-h stencil used for
     omega is always evaluated on the smooth interior.
+    kala ntaks
     """
 
     kind = "waypoints"
@@ -381,11 +493,19 @@ class FigureEight(Maneuver):
         cycles: float = 1.0,
         yaw: float = 0.0,
         settle: Optional[float] = None,
+        ease: Optional[float] = None,
     ):
         super().__init__()
         self.A, self.B, self.w, self.z0, self.cycles, self.yaw = A, B, w, z0, cycles, yaw
         self.duration = float(cycles * 2.0 * np.pi / w)
         self.settle = float(min(0.35 * self.duration, 1.2) if settle is None else settle)
+        # ease=0 (the default) leaves the mid-motion start the periodic families have
+        # always had; a positive ease ramps the amplitude up from zero over that many
+        # seconds, which turns the lemniscate into a rest-to-rest CLOSED LOOP (it starts
+        # and ends at the offset point) that a Chain can link. See _rest_envelope.
+        self.ease = float(0.0 if ease is None else max(0.0, ease))
+        if self.ease + self.settle > self.duration + 1e-9:
+            raise ValueError("FigureEight: ease + settle must not exceed the duration")
 
     def _envelope(self, t: float) -> Tuple[float, float, float]:
         """Amplitude envelope e(t) and its first two time derivatives."""
@@ -404,7 +524,12 @@ class FigureEight(Maneuver):
         lem_v = np.array([A * w * np.cos(ph), B * w * np.cos(2 * ph), 0.0])
         lem_a = np.array([-A * w**2 * np.sin(ph), -2.0 * B * w**2 * np.sin(2 * ph), 0.0])
 
-        e, de, dde = self._envelope(t)
+        # lem(0) = 0, so the offset subtraction the rest envelope needs is a no-op here:
+        # the crossing point of the lemniscate is the manoeuvre's start/end point.
+        if self.ease > 0.0:
+            e, de, dde = _rest_envelope(t, self.duration, self.ease, self.settle)
+        else:
+            e, de, dde = self._envelope(t)
         p = np.array([0.0, 0.0, self.z0]) + e * lem
         v = de * lem + e * lem_v
         a = dde * lem + 2.0 * de * lem_v + e * lem_a
@@ -432,7 +557,8 @@ class Orbit(Maneuver):
 
     def __init__(self, center: Sequence[float], radius: float, w: float, climb: float = 0.0,
                  turns: float = 1.0, yaw: float = 0.0, yaw_rate: float = 0.0,
-                 settle: Optional[float] = None, duration: Optional[float] = None):
+                 settle: Optional[float] = None, duration: Optional[float] = None,
+                 ease: Optional[float] = None):
         super().__init__()
         self.center = np.asarray(center, dtype=np.float64)
         self.R = float(radius)
@@ -449,12 +575,24 @@ class Orbit(Maneuver):
         else:
             self.duration = float(turns * 2.0 * np.pi / max(1e-6, abs(w)))
         self.settle = float(min(0.35 * self.duration, 1.2) if settle is None else settle)
+        # With ease > 0 the circle is also ramped in from the CENTRE, which makes the
+        # manoeuvre start and end at the same point (a rest-to-rest "lasso"): without it
+        # the orbit begins mid-circle, already banked and already moving.
+        self.ease = float(0.0 if ease is None else max(0.0, ease))
+        if self.ease + self.settle > self.duration + 1e-9:
+            raise ValueError("Orbit: ease + settle must not exceed the duration")
+        self._base0 = np.array([self.R, 0.0, 0.0], dtype=np.float64)
 
     def pose(self, t):
         w, R, T = self.w, self.R, max(1e-9, self.duration)
-        e, de, dde = _settle_envelope(t, self.duration, self.settle)
+        if self.ease > 0.0:
+            e, de, dde = _rest_envelope(t, self.duration, self.ease, self.settle)
+            off = self._base0
+        else:
+            e, de, dde = _settle_envelope(t, self.duration, self.settle)
+            off = np.zeros(3)
         c, s = np.cos(w * t), np.sin(w * t)
-        base = np.array([R * c, R * s, self.climb * t / T])
+        base = np.array([R * c, R * s, self.climb * t / T]) - off
         base_v = np.array([-R * w * s, R * w * c, self.climb / T])
         base_a = np.array([-R * w * w * c, -R * w * w * s, 0.0])
         p = self.center + e * base
@@ -478,7 +616,8 @@ class Lissajous(Maneuver):
 
     def __init__(self, A: float, B: float, w: float, z0: float, a: float = 1.0, b: float = 2.0,
                  phi: float = 0.0, C: float = 0.0, c: float = 2.0, cycles: float = 1.0,
-                 yaw: float = 0.0, yaw_rate: float = 0.0, settle: Optional[float] = None):
+                 yaw: float = 0.0, yaw_rate: float = 0.0, settle: Optional[float] = None,
+                 ease: Optional[float] = None):
         super().__init__()
         self.A, self.B, self.w, self.z0 = float(A), float(B), float(w), float(z0)
         self.a, self.b, self.phi, self.C, self.c = float(a), float(b), float(phi), float(C), float(c)
@@ -486,17 +625,29 @@ class Lissajous(Maneuver):
         self.yaw_rate = float(yaw_rate)
         self.duration = float(cycles * 2.0 * np.pi / max(1e-6, abs(w)))
         self.settle = float(min(0.35 * self.duration, 1.2) if settle is None else settle)
+        # ease > 0 makes the pattern rest-to-rest (and closed, since the whole profile is
+        # scaled about its t = 0 value) instead of the mid-motion start it shares with
+        # the other periodic families.
+        self.ease = float(0.0 if ease is None else max(0.0, ease))
+        if self.ease + self.settle > self.duration + 1e-9:
+            raise ValueError("Lissajous: ease + settle must not exceed the duration")
+        self._base0 = np.array([self.A * math.sin(self.phi), 0.0, 0.0], dtype=np.float64)
 
     def pose(self, t):
-        w, ph = self.w, self.phi
-        e, de, dde = _settle_envelope(t, self.duration, self.settle)
-        args = np.array([self.a * w * t + ph, self.b * w * t, self.c * w * t])
+        w = self.w
+        if self.ease > 0.0:
+            e, de, dde = _rest_envelope(t, self.duration, self.ease, self.settle)
+            off = self._base0
+        else:
+            e, de, dde = _settle_envelope(t, self.duration, self.settle)
+            off = np.zeros(3)
+        args = np.array([self.a * w * t + self.phi, self.b * w * t, self.c * w * t])
         amp = np.array([self.A, self.B, self.C if self.C != 0.0 else 0.0])
-        base = amp * np.sin(args)
+        base = amp * np.sin(args) - off
         base_v = amp * self.__freqs() * w * np.cos(args)
         base_a = -amp * (self.__freqs() * w) ** 2 * np.sin(args)
-        off = np.array([0.0, 0.0, self.z0])
-        p = off + e * base
+        off_z = np.array([0.0, 0.0, self.z0])
+        p = off_z + e * base
         v = de * base + e * base_v
         a = dde * base + 2.0 * de * base_v + e * base_a
         return p, v, a, self.flat_attitude(a, self._yaw(t)), 0.0, self.required_thrust(a)
@@ -528,7 +679,7 @@ class Slalom(Maneuver):
     def __init__(self, start: Sequence[float], heading: float, dist: float, A: float, w: float,
                  z0: float, yaw: float = 0.0, yaw_rate: float = 0.0,
                  settle: Optional[float] = None, cycles: float = 2.5,
-                 duration: Optional[float] = None):
+                 duration: Optional[float] = None, ease: Optional[float] = None):
         super().__init__()
         self.p0 = np.asarray(start, dtype=np.float64)
         self.heading = float(heading)
@@ -547,6 +698,12 @@ class Slalom(Maneuver):
         else:
             self.duration = float(np.clip(cycles * 2.0 * np.pi / max(1e-6, abs(w)), 2.5, 4.5))
         self.settle = float(min(0.35 * self.duration, 1.2) if settle is None else settle)
+        # Only the WEAVE needs the rest envelope: the traverse already carries its own
+        # zero-velocity quintic. Easing the traverse would drag the vehicle back to its
+        # starting point instead of ending at the end of the run.
+        self.ease = float(0.0 if ease is None else max(0.0, ease))
+        if self.ease + self.settle > self.duration + 1e-9:
+            raise ValueError("Slalom: ease + settle must not exceed the duration")
 
     def pose(self, t):
         T = max(1e-9, self.duration)
@@ -554,7 +711,10 @@ class Slalom(Maneuver):
         s = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
         ds = (30.0 * u**2 - 60.0 * u**3 + 30.0 * u**4) / T
         dds = (60.0 * u - 180.0 * u**2 + 120.0 * u**3) / (T * T)
-        e, de, dde = _settle_envelope(t, self.duration, self.settle)
+        if self.ease > 0.0:
+            e, de, dde = _rest_envelope(t, self.duration, self.ease, self.settle)
+        else:
+            e, de, dde = _settle_envelope(t, self.duration, self.settle)
 
         u_vec = np.array([np.cos(self.heading), np.sin(self.heading), 0.0])
         n_vec = np.array([-np.sin(self.heading), np.cos(self.heading), 0.0])
@@ -567,6 +727,99 @@ class Slalom(Maneuver):
         a = u_vec * (self.dist * dds) + dde * (n_vec * (self.A * np.sin(ph))) \
             + 2.0 * de * (n_vec * (self.A * self.w * np.cos(ph))) \
             + e * (n_vec * (-self.A * self.w * self.w * np.sin(ph)))
+        return p, v, a, self.flat_attitude(a, self._yaw(t)), 0.0, self.required_thrust(a)
+
+
+class VerticalEight(Maneuver):
+    """
+    Fast figure-eight in a VERTICAL plane: the two leaves of the 8 are stacked in
+    ALTITUDE, so the quad climbs over the top leaf, dives back through the crossing point
+    and under the bottom leaf - the numeral 8, flying.
+
+        u(t) = p0 + e(t) * Au * sin(2 phi)          horizontal, along `heading`
+        z(t) = p0 + e(t) * Az * sin(phi)            vertical, phi = w t
+        (the third axis is untouched: the whole path lives in the plane spanned by
+         u_dir and e_z)
+
+    WHY THE PATH IS 'AN 8' AND NOT A WEAVE. The horizontal weave runs at the SECOND
+    harmonic of the vertical motion, which is exactly what closes the figure: at
+    phi = 0, pi, 2pi BOTH coordinates return to the start, so the path crosses itself
+    at its start/end point twice per cycle and the two leaves (z > start, z < start) are
+    the two lobes. The 8 is a genuine lemniscate (Gerono), not a sine pair drawn twice.
+
+    WHY A MODEST-LOOKING PATH IS AN ACROBATIC. Differentiating twice gives
+        a_z = -Az w^2 sin(phi),        a_u = -4 Au w^2 sin(2 phi)
+    The factor 4 on the weave is the whole story: at w ~ 3 rad/s a 0.15 m weave already
+    demands ~5 m/s^2 of sideways acceleration, and it does so at the same time as the
+    vertical acceleration swings towards -Az w^2. The flatness attitude
+    z_b = normalize(a + g e_z) therefore pitches hard and snaps back twice per cycle.
+    Measured over the sampled amplitudes: attitude excursions up to ~60-70 deg, peak
+    reference body rate ~10-16 rad/s (a 360 deg flip's coast runs at 800-1000 deg/s =
+    14-17 rad/s, so this is the same class of motion), and the collective thrust
+    modulates from a light-load dip at the crossing towards the top of the band. It is
+    the one manoeuvre in the mixture that reaches the attitude limits WITHOUT inverting.
+
+    WHY IT DOES NOT GO OVER THE TOP. At the sampled amplitudes Az w^2 stays below g, so
+    a_z + g > 0 for every t and the reference attitude never crosses the horizon. That is
+    deliberate. As a_z approaches -g the flatness direction z_b = normalize(a + g e_z)
+    approaches the origin of its argument, where it is DEGENERATE: the direction turns
+    arbitrarily fast for an arbitrarily small change in a, so the reference body rate
+    diverges. That is precisely the defect `Flip` avoids by confining its rotation to a
+    zero-thrust coast. Draws that would push a_z below -g are rejected by the sampler's
+    rate screen instead of being shipped as an unflyable reference.
+
+    REST ENVELOPE. The base profile is multiplied by a C2 rest envelope (see
+    `_rest_envelope`): a quintic ramp in over `ease` seconds, out over `settle` seconds,
+    flat outside [0, T]. e, e' and e'' vanish at both ends, so the manoeuvre starts and
+    ends in a genuine hover (v = a = 0, level attitude, thrust = m g) at exactly the point
+    it began - which is what makes it chainable and what lets an episode spawn the
+    vehicle directly on it. Passing `ease=0` restores the mid-motion start the other
+    periodic families use.
+
+    WHERE THE PEAK RATE COMES FROM. Most of it is in the entry/exit ramps: the weave
+    velocity is multiplied by the envelope derivative while the amplitude is still small,
+    so |a + g| is close to g and the attitude direction turns quickly. That is a real
+    property of a fast rest-to-rest 8 (it has to get to full weave speed somehow), not a
+    defect, and it is bounded by the same thrust/rate/volume screens as every family.
+    """
+
+    kind = "v8"
+
+    def __init__(self, p0: Sequence[float], z_amp: float = 0.35, u_amp: float = 0.15,
+                 w: float = 2.8, cycles: float = 1.0, heading: float = 0.0,
+                 yaw: float = 0.0, yaw_rate: float = 0.0,
+                 ease: Optional[float] = None, settle: Optional[float] = None):
+        super().__init__()
+        self.p0 = np.asarray(p0, dtype=np.float64)
+        self.Az = float(z_amp)
+        self.Au = float(u_amp)
+        self.w = float(max(1e-6, w))
+        self.cycles = float(cycles)
+        self.heading = float(heading)
+        self.yaw = float(yaw)
+        self.yaw_rate = float(yaw_rate)
+        self.duration = float(self.cycles * 2.0 * np.pi / self.w)
+        default = min(0.35 * self.duration, 0.9)
+        self.ease = float(default if ease is None else max(0.0, ease))
+        self.settle = float(default if settle is None else max(0.0, settle))
+        if self.ease + self.settle > self.duration + 1e-9:
+            raise ValueError("VerticalEight: ease + settle must not exceed the duration")
+
+    def pose(self, t):
+        e, de, dde = _rest_envelope(t, self.duration, self.ease, self.settle)
+        w = self.w
+        ph = w * t
+        s1, c1 = math.sin(ph), math.cos(ph)
+        s2, c2 = math.sin(2.0 * ph), math.cos(2.0 * ph)
+        u_vec = np.array([math.cos(self.heading), math.sin(self.heading), 0.0])
+        z_vec = np.array([0.0, 0.0, 1.0])
+        # base(0) = 0, so the crossing point IS the manoeuvre's start/end point.
+        base = u_vec * (self.Au * s2) + z_vec * (self.Az * s1)
+        base_v = u_vec * (2.0 * self.Au * w * c2) + z_vec * (self.Az * w * c1)
+        base_a = u_vec * (-4.0 * self.Au * w * w * s2) + z_vec * (-self.Az * w * w * s1)
+        p = self.p0 + e * base
+        v = de * base + e * base_v
+        a = dde * base + 2.0 * de * base_v + e * base_a
         return p, v, a, self.flat_attitude(a, self._yaw(t)), 0.0, self.required_thrust(a)
 
 
@@ -729,6 +982,238 @@ class Flip(Maneuver):
         return p, v, a, R, phi, thrust
 
 
+class ShiftedManeuver(Maneuver):
+    """
+    A manoeuvre RELOCATED by a rigid motion: rotated about world z to a new heading, then
+    translated so that its first sample lands on a requested point.
+
+    WHY THIS IS THE RIGHT TRANSFORM TO MOVE A REFERENCE. A yaw rotation plus a translation
+    is a rigid motion of the entire trajectory, so every dynamic property keeps its
+    meaning: p, v, a and R rotate, |a| and |omega| are unchanged, and the required
+    collective thrust is untouched. Relocation therefore preserves FEASIBILITY - a
+    manoeuvre that fits the thrust and rate authority in one place fits it everywhere.
+
+    OMEGA IS DELIBERATELY NOT ROTATED. The body frame turns with the vehicle, so for
+    R' = Q R the body rate is [omega']_x = R'^T R'dot = R^T Q^T Q Rdot = R^T Rdot = [omega]_x:
+    the same body-frame vector. (Rotating omega by Q, by analogy with v and a, would
+    describe a different manoeuvre - a 90 deg yaw shift of a pitch flip would claim a
+    roll rate. The wrapper's central difference over the RELOCATED R produces the right
+    answer by construction.)
+    """
+
+    def __init__(self, inner: Maneuver, p0: Sequence[float], yaw0: float):
+        super().__init__()
+        self.inner = inner
+        self.duration = float(inner.duration)
+        p_s, _v, _a, R_s, _spin, _thr = inner.pose(0.0)
+        dyaw = float(yaw0) - _yaw_of(R_s)
+        c, s = math.cos(dyaw), math.sin(dyaw)
+        self._Rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        self._shift = np.asarray(p0, dtype=np.float64) - self._Rz @ np.asarray(p_s, dtype=np.float64)
+
+    @property
+    def kind(self) -> str:  # type: ignore[override]
+        """The relocated manoeuvre is still that manoeuvre (reward tolerances, telemetry)."""
+        return self.inner.kind
+
+    def kind_at(self, t: float) -> str:
+        return self.inner.kind_at(t)
+
+    def pose(self, t):
+        p, v, a, R, spin, thr = self.inner.pose(t)
+        return (self._Rz @ p + self._shift, self._Rz @ v, self._Rz @ a,
+                self._Rz @ R, spin, float(thr))
+
+
+class Chain(Maneuver):
+    """
+    A CHAIN of manoeuvres flown back-to-back as ONE command - a longer mission than any
+    single family (say: flip, recover, climb-and-weave, recover, loop), assembled from
+    the manoeuvres this module already provides.
+
+    THE CONTINUITY CONTRACT. A reference is only usable if it is CONTINUOUS in position,
+    velocity, attitude and body rate. A step in any of them asks the policy for a move
+    the reference itself does not make, and the tracking reward would then charge the
+    policy for the reference's own defect. The chain therefore requires every segment to
+    START AND END PARKED: v = 0, level attitude, zero body rate. That is the contract
+    every manoeuvre here already satisfies at its END (it is what "every manoeuvre ends
+    in a hover" means); `Hover`, `WaypointTrajectory`, `Flip` and `VerticalEight`
+    satisfy it at BOTH ends, and the periodic families (`FigureEight`, `Lissajous`,
+    `Orbit`, `Slalom`) become rest-to-rest by passing `ease=<seconds>`.
+
+    THE JUNCTIONS. Each segment is RELOCATED with `ShiftedManeuver` - a world-frame yaw
+    plus a translation - so that its start pose lands exactly on the previous segment's
+    end pose. Since both sides are parked and level, the junction is then continuous in
+    p, v, a, R and omega, and the thrust command is continuous too (both sides ask for
+    m*g). Optional `hold` seconds of hover are inserted between segments, so a chain
+    reads as a sequence of distinct commands with a beat between them.
+
+    ONE DOCUMENTED EXCEPTION. `Flip` has a deliberately piecewise-constant vertical
+    acceleration: its thrust steps from m*g up to m*(u+g) at take-off and snaps back to
+    trim at the hand-off (see its docstring - the profile is what makes the flip close on
+    altitude exactly). A junction involving a flip therefore steps |a| ALONG WORLD Z
+    ONLY, with position, velocity, attitude and body rate still continuous - exactly how
+    a flip already behaves when it opens an episode. The check below allows that single
+    case and counts it in `self.thrust_steps`; any other acceleration step, in any
+    direction, raises.
+
+    WHAT IS VERIFIED AT CONSTRUCTION (`verify=True`, the default): every segment boundary
+    must be parked (v, attitude tilt, body rate, and a purely vertical acceleration), and
+    every junction must match in p, v, a, R and omega - measured with the same central
+    difference the environment uses. The match is exact by construction, so the
+    tolerances are tight (1e-6) and a future change to a manoeuvre's end state fails
+    loudly here instead of quietly biasing the reward.
+
+    FEASIBILITY. Relocation is a rigid motion, so a chain inherits the feasibility of its
+    parts: |a|, |omega| and the required thrust are unchanged, while the sampler then
+    screens the WHOLE chain - thrust, body rate, flight volume, the 1.5 m footprint and
+    the episode horizon - exactly as it does for every other family. Chains are long
+    (2-4 commands of 1.2-4 s plus pauses), which is one of the reasons the training
+    episode is 15 s: a chain that outlived the episode would be truncated mid-manoeuvre
+    and would never reach its terminal hover.
+    """
+
+    kind = "chain"
+
+    # A junction may not be off by more than this. Everything except the flip's thrust
+    # step is exact to machine precision; these exist to catch a REGRESSION in a
+    # manoeuvre's end state, not to tolerate one. A_TOL and W_TOL are looser than p/v/R
+    # because a manoeuvre whose acceleration ramps in over a finite window leaves a
+    # boundary acceleration and body rate proportional to the ramp rather than zero
+    # (measured on VerticalEight: a_xy 5e-5 m/s^2 and |omega| 4.1e-3 rad/s = 0.23 deg/s,
+    # four orders below the tightest rate tolerance in TRACK_TOL). A real step - a
+    # discontinuity in R, or a lateral acceleration jump - is O(1) and still fails.
+    P_TOL: float = 1e-6
+    V_TOL: float = 1e-6
+    A_TOL: float = 1e-3
+    R_TOL: float = 1e-6
+    W_TOL: float = 0.08
+
+    def __init__(self, maneuvers: Sequence[Maneuver], hold: float = 0.0, verify: bool = True):
+        super().__init__()
+        segs = list(maneuvers)
+        if not segs:
+            raise ValueError("Chain needs at least one manoeuvre")
+        for m in segs:
+            if not isinstance(m, Maneuver):
+                raise TypeError(f"Chain segments must be Maneuver instances, got {type(m).__name__}")
+        self.hold = float(max(0.0, hold))
+        self.thrust_steps: int = 0
+        self.segments: List[Maneuver] = []
+        parts: List[Maneuver] = []
+        station_p = np.zeros(3, dtype=np.float64)
+        station_yaw = 0.0
+        for i, m in enumerate(segs):
+            seg = m if i == 0 else ShiftedManeuver(m, station_p, station_yaw)
+            self.segments.append(seg)
+            parts.append(seg)
+            end = seg.pose(seg.duration)
+            station_p = np.asarray(end[0], dtype=np.float64).copy()
+            station_yaw = _yaw_of(end[3])
+            if self.hold > 0.0 and i < len(segs) - 1:
+                parts.append(Hover(station_p, station_yaw, duration=self.hold))
+        self._parts = parts
+        self._starts: List[float] = []
+        t = 0.0
+        for part in parts:
+            self._starts.append(t)
+            t += float(part.duration)
+        self.duration = float(t)
+        if verify:
+            self._verify()
+
+    # -- dispatch -------------------------------------------------------------------
+    def _index(self, t: float) -> int:
+        """Index of the part active at time t (junctions belong to the LATER part)."""
+        for i in range(len(self._parts) - 1, -1, -1):
+            if t >= self._starts[i] - 1e-12:
+                return i
+        return 0
+
+    def kind_at(self, t: float) -> str:
+        # Beyond the chain's own duration sits the Trajectory wrapper's terminal hover.
+        if t >= self.duration:
+            return "hover"
+        i = self._index(t)
+        return self._parts[i].kind_at(t - self._starts[i])
+
+    def pose(self, t):
+        i = self._index(t)
+        return self._parts[i].pose(t - self._starts[i])
+
+    # -- verification ---------------------------------------------------------------
+    def _verify(self) -> None:
+        """
+        Enforce the continuity contract. Raises ValueError naming the offending segment.
+
+        The two things it can catch are worth separating:
+          * a segment that is not rest-to-rest - typically a periodic family built
+            without `ease`, which starts mid-motion. The message names the class and the
+            offending quantity, because silently relocating it would put a velocity step
+            into the reference.
+          * a junction whose states do not line up. Everything after relocation lines up
+            to machine precision, so a failure here means a manoeuvre's end state is not
+            what the chain assumed (a regression, not a tuning issue).
+        """
+        for idx, seg in enumerate(self.segments):
+            for label, t in (("start", 0.0), ("end", float(seg.duration))):
+                _p, v, a, R, _spin, _thr = seg.pose(t)
+                tilt = float(np.arccos(np.clip(R[2, 2], -1.0, 1.0)))
+                if float(np.linalg.norm(v)) > self.V_TOL:
+                    raise ValueError(
+                        f"Chain segment {idx} ({type(seg).__name__}) does not {label} at rest: "
+                        f"|v| = {float(np.linalg.norm(v)):.3e} m/s. A segment must begin and end "
+                        f"parked; the periodic families need `ease=<seconds>` to do so.")
+                if tilt > 1e-3:
+                    raise ValueError(
+                        f"Chain segment {idx} ({type(seg).__name__}) does not {label} level: "
+                        f"tilt = {math.degrees(tilt):.3f} deg.")
+                if abs(float(a[0])) > self.A_TOL or abs(float(a[1])) > self.A_TOL:
+                    raise ValueError(
+                        f"Chain segment {idx} ({type(seg).__name__}) does not {label} with a "
+                        f"vertical acceleration: a_xy = {np.round(np.asarray(a)[:2], 6).tolist()}.")
+                # Body rate at the boundary, with the same central difference the
+                # Trajectory wrapper uses (h is the wrapper's stencil half-width).
+                h = 1e-3
+                Rm = seg.pose(t - h)[3]
+                Rp = seg.pose(t + h)[3]
+                w = float(np.linalg.norm(omega_from_dcm(Rm, R, Rp, h)))
+                if w > self.W_TOL:
+                    raise ValueError(
+                        f"Chain segment {idx} ({type(seg).__name__}) does not {label} with zero "
+                        f"body rate: |omega| = {w:.3e} rad/s.")
+
+        for i in range(len(self._parts) - 1):
+            a_end = self._parts[i].pose(float(self._parts[i].duration))
+            b_start = self._parts[i + 1].pose(0.0)
+            dp = float(np.linalg.norm(a_end[0] - b_start[0]))
+            dv = float(np.linalg.norm(a_end[1] - b_start[1]))
+            dR = float(np.max(np.abs(a_end[3] - b_start[3])))
+            if dp > self.P_TOL or dv > self.V_TOL or dR > self.R_TOL:
+                raise ValueError(
+                    f"Chain junction {i} is discontinuous: |dp| = {dp:.3e} m, "
+                    f"|dv| = {dv:.3e} m/s, |dR| = {dR:.3e}.")
+            da = np.asarray(a_end[2], dtype=np.float64) - np.asarray(b_start[2], dtype=np.float64)
+            if float(np.linalg.norm(da)) > self.A_TOL:
+                # Legal ONLY as the flip's vertical thrust step; anything with a lateral
+                # component - or a mismatch between two non-vertical accelerations - is a
+                # real discontinuity in the reference attitude (R = f(a)) and is refused.
+                if abs(float(da[0])) > self.A_TOL or abs(float(da[1])) > self.A_TOL:
+                    raise ValueError(
+                        f"Chain junction {i} steps the acceleration laterally: da = "
+                        f"{np.round(da, 6).tolist()}.")
+                self.thrust_steps += 1
+            t_j = self._starts[i + 1]
+            h = 1e-3
+            Rj = self.pose(t_j)[3]
+            w_j = float(np.linalg.norm(
+                omega_from_dcm(self.pose(t_j - h)[3], Rj, self.pose(t_j + h)[3], h)))
+            if w_j > self.W_TOL:
+                raise ValueError(
+                    f"Chain junction {i} steps the reference body rate: |omega| = {w_j:.3e} rad/s "
+                    f"across the measurement stencil.")
+
+
 # =====================================================================================
 # trajectory wrapper + sampling
 # =====================================================================================
@@ -789,7 +1274,7 @@ class Trajectory:
 
         return Reference(
             t=t, p=p, v=v, a=a, R=R, omega=omega,
-            thrust_ff=thrust, spin=spin, kind=self.maneuver.kind,
+            thrust_ff=thrust, spin=spin, kind=self.maneuver.kind_at(t),
         )
 
     def initial_state(self) -> Reference:
@@ -845,9 +1330,16 @@ class TrajectoryConfig:
     # fit inside a 2 m sphere), so the flip weight is set ABOVE its intended share to
     # compensate. Measured realised mixture at these weights is printed by
     # scratch/check_trajectories.py.
+    #
+    # `v8` (the vertical figure-eight) and `chain` are the 2026-09-15 additions. v8 is an
+    # ACROBATIC family (attitude excursions up to ~60-70 deg, body rate up to ~16 rad/s,
+    # heavy thrust modulation), so it is weighted like a sibling of the flip. A chain is
+    # LONG - 2-4 commands plus hover pauses, so 6-12 s of a 15 s episode - which is why
+    # its DRAW weight is small: weight is per draw, and draw share is not time share.
+    # Set a weight to 0.0 to drop a family without touching the code.
     weights: dict = field(default_factory=lambda: {
-        "hover": 0.10, "waypoints": 0.16, "figure8": 0.08, "lissajous": 0.11,
-        "orbit": 0.14, "slalom": 0.12, "flip": 0.29,
+        "hover": 0.07, "takeoff": 0.10, "waypoints": 0.11, "figure8": 0.06, "lissajous": 0.08,
+        "orbit": 0.10, "slalom": 0.08, "flip": 0.25, "v8": 0.10, "chain": 0.05,
     })
     max_resample: int = 40
 
@@ -858,7 +1350,12 @@ class TrajectoryConfig:
     # own episode_seconds at construction; the value here is only the standalone default.
     # FigureEight and Lissajous derive their duration from their angular frequency, so the
     # sampler floors that frequency at 2*pi / (episode_seconds - TRAJECTORY_TAIL).
-    episode_seconds: float = 8.0
+    #
+    # 8 -> 15 s on 2026-09-15: long enough to hold a full CHAIN (a couple of acrobatic
+    # commands plus the hover beats between them) instead of truncating it, and it costs
+    # nothing for the short families - they simply end earlier and the terminal hold runs
+    # longer, which is a hover the policy already has to fly.
+    episode_seconds: float = 15.0
     # Action-scaling limits of QuadFlipEnv, mirrored here so the sampler never emits a
     # reference the policy is structurally unable to follow. These are POLICY ACTION
     # SCALES, not physical limits; the physical ceilings are much higher (the rate loop
@@ -869,6 +1366,34 @@ class TrajectoryConfig:
     # flips unsatisfiable - at 6 rad/s the rotation alone needs >= 1.05 s of ballistic
     # coast, which no 1.2 m hover can survive, so the sampler rejected every one.
     rate_limits: dict = field(default_factory=lambda: {"roll": 20.0, "pitch": 20.0})
+
+    # -- mixture weights at runtime --------------------------------------------------
+    def set_weight(self, name: str, weight: float) -> None:
+        """Set one family's draw weight.
+
+        Weights are RELATIVE: `TrajectorySampler.sample` normalises them by their sum on
+        every draw, so raising one family automatically lowers every other family's share
+        in proportion - no renormalisation is needed here, and adding a weight does not
+        require knowing the others.
+
+        This is the hook the training-time mixture curriculum drives (see
+        `train.py`'s ManeuverMixCurriculumCallback): the sampler reads `cfg.weights` on
+        every draw, so a change takes effect on the next environment reset, including in
+        the SubprocVecEnv workers.
+        """
+        if name not in self.weights:
+            raise ValueError(f"unknown manoeuvre {name!r}; expected one of {list(self.weights)}")
+        w = float(weight)
+        if not np.isfinite(w) or w < 0.0:
+            raise ValueError(f"weight for {name!r} must be finite and >= 0, got {weight!r}")
+        self.weights[name] = w
+
+    def normalized_weights(self) -> dict:
+        """The mixture probabilities as the sampler actually draws them (sums to 1)."""
+        total = float(sum(self.weights.values()))
+        if total <= 0.0:
+            return {k: 0.0 for k in self.weights}
+        return {k: float(v) / total for k, v in self.weights.items()}
 
 
 class TrajectorySampler:
@@ -899,6 +1424,138 @@ class TrajectorySampler:
         )
         # Screen against the REAL top of the flight volume, not the old hardcoded 2.40 m.
         return fl if fl.is_feasible(z_max=self.cfg.z_max) else None
+
+    # Chain recipes: the families a chain may be assembled from, and how often each is
+    # drawn. Every one of them is rest-to-rest (the periodic members are built with
+    # `ease` here, see Chain), which is what makes the junctions exact. `waypoints` is the
+    # only member that MOVES the station; every other segment is a closed loop that
+    # returns to where it started, so the chain does not wander out of the training
+    # footprint simply by being long.
+    CHAIN_KINDS: tuple = ("flip", "v8", "orbit", "figure8", "lissajous", "waypoints")
+    CHAIN_KIND_WEIGHTS: tuple = (0.26, 0.24, 0.14, 0.12, 0.10, 0.14)
+
+    def _make_v8(self, rng, p0, yaw) -> VerticalEight:
+        """
+        Draw the acrobatic vertical figure-eight.
+
+        The ranges are the measured feasible band, not a guess. They were chosen by
+        sweeping draws and keeping the worst case well inside the envelope: over 300 draws
+        from these ranges the peak reference body rate was 15.5 rad/s (p90 10.5, median
+        6.9 - the flip's coast runs at 14-17 rad/s), peak tilt 58 deg (median 44), peak
+        thrust 0.465 N against the 0.60 N authority, and the vertical acceleration never
+        came closer than 4.5 m/s^2 to -g, so the flatness direction never approaches the
+        degenerate weightless point described in the class docstring.
+
+        Sampling wider (e.g. z_amp up to 0.42 with a 2 s cycle) produces draws whose entry
+        ramp drives a_z THROUGH -g for a few hundred milliseconds; the attitude direction
+        then whips at >100 rad/s. Those draws are rejected by the rate screen, but there
+        is no reason to generate them in the first place, so the band stops short of them.
+
+        `ease` and `settle` are drawn as a FRACTION of the cycle, so the ramp always takes
+        the same slice of the figure regardless of how fast the 8 is flown.
+        """
+        T = float(rng.uniform(2.2, 2.8))
+        w = 2.0 * np.pi / T
+        return VerticalEight(
+            p0,
+            z_amp=float(rng.uniform(0.26, 0.36)),
+            u_amp=float(rng.uniform(0.18, 0.28)),
+            w=w,
+            heading=float(rng.uniform(-np.pi, np.pi)),
+            yaw=yaw,
+            yaw_rate=float(rng.uniform(-1.0, 1.0)),
+            ease=float(rng.uniform(0.40, 0.50)) * T,
+            settle=float(rng.uniform(0.40, 0.50)) * T,
+        )
+
+    def _make_chain(self, rng, mass) -> Optional[Maneuver]:
+        """
+        Assemble a multi-command chain: 2-3 rest-to-rest manoeuvres flown in sequence
+        from a station near the spawn point, with a short hover beat between them.
+
+        Each segment is built in CANONICAL coordinates (starting at the spawn altitude on
+        a zero heading) and `Chain` relocates it onto the pose the previous segment left
+        behind - that is what makes the junctions exact without the sampler knowing
+        anything about the composition. Durations are drawn against a budget so the whole
+        chain still fits inside one episode; a draw that cannot is abandoned and the
+        sampler redraws, exactly like any other rejected candidate.
+        """
+        cfg = self.cfg
+        # Small station box: every command loops back to the station, and the waypoint
+        # segment rings slightly past its knots, so the whole chain has to fit inside the
+        # 1.5 m footprint from a point that is not already near its edge.
+        station = np.array([
+            rng.uniform(-0.15, 0.15), rng.uniform(-0.15, 0.15), float(cfg.spawn_z),
+        ])
+        yaw0 = float(rng.uniform(-np.pi, np.pi))
+        hold = float(rng.uniform(0.30, 0.55))
+        n = int(rng.integers(2, 4))
+        budget = cfg.episode_seconds - TRAJECTORY_TAIL - (n - 1) * hold
+        p_ref = np.array([0.0, 0.0, cfg.spawn_z])
+        kinds = list(self.CHAIN_KINDS)
+        probs = np.array(self.CHAIN_KIND_WEIGHTS, dtype=np.float64)
+        probs /= probs.sum()
+        parts: List[Maneuver] = []
+        for _ in range(n):
+            chosen = str(rng.choice(kinds, p=probs))
+            if chosen == "flip":
+                seg: Optional[Maneuver] = self._make_flip(rng, p_ref, 0.0, mass)
+            elif chosen == "v8":
+                seg = self._make_v8(rng, p_ref, 0.0)
+            elif chosen == "orbit":
+                settle = float(rng.uniform(0.6, 0.9))
+                seg = Orbit(
+                    center=[0.0, 0.0, cfg.spawn_z],
+                    radius=float(rng.uniform(0.25, 0.45)), w=1.2,
+                    climb=float(rng.uniform(-0.15, 0.20)), turns=1.0,
+                    ease=settle, settle=settle,
+                    duration=float(rng.uniform(2.8, 3.6)),
+                )
+            elif chosen == "figure8":
+                settle = float(rng.uniform(0.6, 0.9))
+                seg = FigureEight(
+                    A=float(rng.uniform(0.20, 0.32)), B=float(rng.uniform(0.20, 0.32)),
+                    w=float(rng.uniform(1.5, 2.0)), z0=cfg.spawn_z, cycles=1.0,
+                    ease=settle, settle=settle,
+                )
+            elif chosen == "lissajous":
+                settle = float(rng.uniform(0.6, 0.9))
+                seg = Lissajous(
+                    A=float(rng.uniform(0.15, 0.28)), B=float(rng.uniform(0.15, 0.28)),
+                    w=float(rng.uniform(1.5, 2.0)), z0=cfg.spawn_z,
+                    a=float(rng.choice([1.0, 1.0, 2.0])), b=float(rng.choice([2.0, 3.0])),
+                    phi=float(rng.uniform(0.0, np.pi)), C=float(rng.uniform(0.0, 0.10)),
+                    ease=settle, settle=settle,
+                )
+            else:
+                # The one segment that translates: targets are drawn as small offsets
+                # from the canonical start so that the station cannot run away, and the
+                # z targets stay inside the band the flip and the v8 need around them.
+                n_wp = 3
+                seg = WaypointTrajectory(
+                    waypoints=[
+                        p_ref + np.array([
+                            rng.uniform(-0.25, 0.25),
+                            rng.uniform(-0.25, 0.25),
+                            rng.uniform(-0.20, 0.30),
+                        ])
+                        for _ in range(n_wp)
+                    ],
+                    segment_time=float(rng.uniform(0.8, 1.1)),
+                )
+            if seg is None or float(seg.duration) > budget:
+                return None
+            budget -= float(seg.duration)
+            parts.append(seg)
+        try:
+            chain = Chain(parts, hold=hold)
+        except ValueError:
+            return None
+        # The chain is placed ON the drawn station with the same rigid relocation its
+        # segments get internally, so every episode starts somewhere different while the
+        # command stays relative to itself (and the whole thing stays well inside the
+        # footprint whatever station was drawn).
+        return ShiftedManeuver(chain, station, yaw0)
 
     def sample(self, rng: np.random.Generator, mass: float = MASS_NOMINAL,
                kind: Optional[str] = None) -> Trajectory:
@@ -942,6 +1599,33 @@ class TrajectorySampler:
                 traj = Trajectory(Hover(
                     p0, yaw, duration=float(rng.uniform(1.5, 3.0)),
                     yaw_rate=float(rng.uniform(-1.5, 1.5)),
+                ))
+            elif chosen == "takeoff":
+                # Start from ground (z=0.025m) or anywhere between 0 and 1.2m
+                if rng.random() < 0.50:
+                    z_start = 0.025  # Ground resting level
+                else:
+                    z_start = float(rng.uniform(0.025, 1.20))
+                p_start = np.array([
+                    rng.uniform(-0.35, 0.35),
+                    rng.uniform(-0.35, 0.35),
+                    z_start,
+                ], dtype=np.float64)
+                z_target = float(rng.uniform(1.00, 1.30))
+                p_target = np.array([
+                    rng.uniform(-0.40, 0.40),
+                    rng.uniform(-0.40, 0.40),
+                    z_target,
+                ], dtype=np.float64)
+                climb_time = max(1.2, float(rng.uniform(1.6, 2.8)))
+                hold_time = float(rng.uniform(2.5, 5.0))
+                traj = Trajectory(Takeoff(
+                    p0=p_start,
+                    p1=p_target,
+                    climb_time=climb_time,
+                    hold_time=hold_time,
+                    yaw=yaw,
+                    yaw_rate=float(rng.uniform(-1.0, 1.0)),
                 ))
             elif chosen == "waypoints":
                 n = int(rng.integers(3, 5))
@@ -1001,6 +1685,23 @@ class TrajectorySampler:
                     cycles=float(rng.choice([2.0, 2.5, 3.0])),
                     duration=float(rng.uniform(2.5, 4.0)),
                 ))
+            elif chosen == "v8":
+                # A tighter station box than the other families: the 8 WEAVES around its
+                # start point by up to u_amp, and the start point is where the episode
+                # spawns, so drawing it at the edge of the footprint would put the far
+                # leaf straight through the footprint screen. (The families that roam -
+                # figure-8, lissajous, orbit, slalom - are centred on the origin for the
+                # same reason.)
+                station = 0.30
+                p0_v8 = np.array([
+                    rng.uniform(-station, station), rng.uniform(-station, station), z0,
+                ])
+                traj = Trajectory(self._make_v8(rng, p0_v8, yaw))
+            elif chosen == "chain":
+                chain = self._make_chain(rng, mass)
+                if chain is None:
+                    continue
+                traj = Trajectory(chain)
             else:
                 fl = self._make_flip(rng, p0, yaw, mass)
                 if fl is None:
@@ -1024,7 +1725,11 @@ class TrajectorySampler:
             # therefore the binding constraint for aggressive geometry and has to be part
             # of the screen.
             if chosen != "flip":
-                ts = np.linspace(0.0, traj.duration, 96)
+                # A chain is long and carries several manoeuvres inside it, so its screen
+                # is sampled four times as finely: at 96 points a 12 s chain is checked
+                # every 125 ms, which is enough to walk past the peak of a flip's climb.
+                n_screen = 256 if chosen == "chain" else 96
+                ts = np.linspace(0.0, traj.duration, n_screen)
                 refs = [traj.sample(float(t)) for t in ts]
                 req = np.array([r.thrust_ff for r in refs])
                 if req.max() > 0.95 * MAX_THRUST_TOTAL or req.min() < MIN_THRUST_TOTAL:

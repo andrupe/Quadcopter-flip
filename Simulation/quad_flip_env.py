@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -24,7 +25,7 @@ from utils.rate_pid import RatePIDController
 import utils
 import config
 from lighthouse import LighthouseConfig, LighthouseModel
-from trajectories import Reference, Trajectory, TrajectoryConfig, TrajectorySampler
+from trajectories import GRAVITY, Reference, Trajectory, TrajectoryConfig, TrajectorySampler
 
 # ======================================================================================
 # ENVIRONMENT CONFIGURATION
@@ -34,7 +35,12 @@ from trajectories import Reference, Trajectory, TrajectoryConfig, TrajectorySamp
 SPAWN_ALTITUDE: float = 1.2          # Quadcopter spawn altitude (meters)
 SIM_DT: float = 0.01                 # Timestep in seconds (0.01s = 10ms -> 100 Hz)
 
-EPISODE_SECONDS: float = 8.0         # Episode duration in seconds
+EPISODE_SECONDS: float = 15.0        # Episode duration in seconds (must match train.py)
+                                     # 8 -> 15 s on 2026-09-15: the mixture now contains
+                                     # multi-command CHAINS (up to ~12 s) and every family
+                                     # must be able to finish inside one episode, or its
+                                     # terminal hover never happens and the truncation
+                                     # bootstrap is graded on a mid-manoeuvre reference.
 ACTION_MODE: str = "rate_pid"        # "rate_pid" (thrust + body rate PID), "motor", or "thrust_moment"
 OBS_NOISE: bool = True               # Add Gaussian sensor noise (sim-to-real domain randomization)
 RANDOM_WIND: bool = True             # Add dynamic wind disturbances
@@ -48,21 +54,28 @@ PITCH_DIRECTION: float = 1.0         # +1.0 for front-flip, -1.0 for back-flip
 FLIP_THRESHOLD: float = 2.0 * np.pi  # Rotation angle required for a full 360° pitch flip
 # ======================================================================================
 # OBSERVATION LAYOUT
-#   env obs vector : [ o_t (29) | aux (4) | privileged (44) ]                  = 77 dims
-#   vec obs vector : [ o_t (29) | z (16) | aux (4) | privileged (44) ]         = 93 dims
+#   env obs vector : [ o_t (29) | ref_ff (3) | aux (4) | privileged (44) ]          = 80 dims
+#   vec obs vector : [ o_t (29) | z (16) | ref_ff (3) | aux (4) | privileged (44) ] = 96 dims
 #                    (the z block is injected by LatentObsWrapper, in the trainer process)
-# The actor consumes only the first ACTOR_SINGLE_OBS_DIM (+ z when the encoder is
-# attached) dims = 29 or 45; the critic consumes the whole vector. `aux` carries the
-# encoder-only sensors (specific force, battery voltage) and must NOT be visible to the
-# actor.
+#
+# The actor consumes the PREFIX actor_single (29) + z (16, when attached) + ref_ff (3) = 48
+# dims; the critic consumes the whole vector. `aux` carries the encoder-only sensors
+# (specific force, battery voltage) and must NOT be visible to the actor.
+#
+# WHY ref_ff SITS BEFORE aux. The actor's view is a clean PREFIX of the vector, which is
+# what both the policy (obs[..., :actor_obs_dim]) and the wrapper rely on, so anything the
+# actor must see has to come before the encoder-only and privileged blocks. Placing it
+# after the actor frame and before aux is what makes "actor = prefix" hold with z inserted
+# in between.
 # ======================================================================================
 OBS_HISTORY_LEN: int = 1             # Stacked actor frames. 1 = single frame; the causal history
                                      # encoder subsumes the old 3-frame (30ms) stack.
 ACTOR_SINGLE_OBS_DIM: int = 29       # Onboard sensor observation dimension (actor-facing frame)
+REF_FF_DIM: int = 3                  # Reference feed-forward specific force command, WORLD frame
 ENCODER_AUX_DIM: int = 4             # 3-axis specific force + normalised battery voltage
 ACTOR_TOTAL_DIM: int = ACTOR_SINGLE_OBS_DIM * OBS_HISTORY_LEN  # 29 dims
 PRIVILEGED_OBS_DIM: int = 44         # Privileged simulation truth
-TOTAL_OBS_DIM: int = ACTOR_TOTAL_DIM + ENCODER_AUX_DIM + PRIVILEGED_OBS_DIM  # 77 dims
+TOTAL_OBS_DIM: int = ACTOR_TOTAL_DIM + REF_FF_DIM + ENCODER_AUX_DIM + PRIVILEGED_OBS_DIM  # 80
 SINGLE_OBS_DIM: int = ACTOR_SINGLE_OBS_DIM
 
 # --------------------------------------------------------------------------------------
@@ -88,9 +101,37 @@ O_PREV_ACTION = 13                                      # previous applied actio
 O_P_ERR, O_V_ERR, O_ATT_ERR, O_W_ERR = 17, 20, 23, 26   # reference errors (3 each)
 assert O_W_ERR + 3 == ACTOR_SINGLE_OBS_DIM, "actor frame layout does not fill the frame"
 
+# --------------------------------------------------------------------------------------
+# REFERENCE FEED-FORWARD (3 dims).  a_ff = a_ref + g*e_z, WORLD frame, m/s^2.
+#
+# WHY THIS EXISTS. The actor frame above carries the reference only as ERRORS, and the
+# policy is memoryless (the GRU's z summarises the recent sensor stream, not the plan), so
+# nothing the policy sees encodes the reference's ACCELERATION - it would have to
+# differentiate p_err/v_err across steps to recover it, and it cannot. The feed-forward is
+# the dominant term in any tracking controller: the feedback terms are corrections to it.
+# Without it the best a policy can do is learn a high-gain lagged proportional law, which is
+# exactly the failure this project measured live: the trained policy sat ~1.4 m behind a
+# continuously translating reference.
+#
+# WHY a+g AND NOT a. The flatness map is thrust = m*|a + g| and z_b = normalize(a + g), so
+# the NORM of this vector is the collective feed-forward and its DIRECTION is the desired
+# thrust direction. Giving `a` alone would make the policy add g and take the norm itself.
+#
+# WHY WORLD FRAME. It keeps the channel's scale independent of attitude (a body-frame
+# version spins with the airframe, and through a flip that is the difference between a
+# smooth channel and one that sweeps the whole sphere in half a second). The policy already
+# receives the attitude quaternion, so the body-frame form is one rotation away.
+#
+# A Hover has a = 0, so this is [0, 0, g] and |a_ff| = g (1 g of collective). A Flip's
+# zero-thrust coast has a = -g, so this is [0, 0, 0]: the channel says "zero collective"
+# exactly where the reference commands zero collective.
+# --------------------------------------------------------------------------------------
+GRAVITY_VEC: np.ndarray = np.array([0.0, 0.0, GRAVITY], dtype=np.float64)
+
 # Layout offsets inside the env observation vector
-AUX_OFFSET: int = ACTOR_TOTAL_DIM                      # 29
-PRIV_OFFSET: int = ACTOR_TOTAL_DIM + ENCODER_AUX_DIM   # 33
+REF_FF_OFFSET: int = ACTOR_TOTAL_DIM                      # 29
+AUX_OFFSET: int = ACTOR_TOTAL_DIM + REF_FF_DIM            # 32
+PRIV_OFFSET: int = AUX_OFFSET + ENCODER_AUX_DIM           # 36
 
 # ======================================================================================
 # PHYSICS REGRESSION TARGETS for the frozen history encoder
@@ -119,13 +160,26 @@ PRIV_TARGET_GROUPS: tuple = (
     ("true_vel_w", 3),          # ground-truth velocity (denoising target)
     ("motor_speed_norm", 4),    # actual Omega_i / maxW (denoising target)
     ("aero_force_b", 3),        # fluid (wind/drag) force, body frame
+    # SELF-SUPERVISED ESTIMATOR-DRIFT TARGETS (added 2026-09-16).
+    #
+    # These are not plant parameters: they are the estimator's OWN ERROR, and they exist
+    # so the encoder has to say out loud how wrong the state estimate currently is rather
+    # than silently mis-attribute a corrupted pose to a plant fault. z then carries a
+    # usable "discount the estimate" signal to the policy, and the logvar head has a
+    # genuinely heteroscedastic target (mm-level with a fix, growing without one).
+    #
+    # `est_drift_p` is what a disappearing fix looks like from the inside, and it is the
+    # quantity the corrupted-estimate augmentation in encoder/corruption.py perturbs in
+    # lockstep with the frame, so the two mechanisms stay consistent by construction.
+    ("est_drift_p", 3),         # p_est - p_true (world, m)
+    ("est_drift_v", 3),         # v_est - v_true (world, m/s)
 )
-PRIV_TARGET_DIM: int = 29       # sum of the group dims above
+PRIV_TARGET_DIM: int = 35       # sum of the group dims above
 
 # Real-world Hardware Distortions & Physical Asymmetries (Domain Randomization)
 COM_OFFSET_MAX_XY: float = 0.0025      # ±2.5 mm off-center Center of Mass
-COM_OFFSET_MAX_Z: float = 0.0030       # ±3.0 mm vertical CoM offset
-PAYLOAD_MASS_MAX: float = 0.0045       # +0 to 4.5g calibrated payload
+COM_OFFSET_MAX_Z: float = 0.0030       # ±3.0 mm vertical Center of Mass offset
+PAYLOAD_MASS_MAX: float = 0.0050       # +0 to 5.0g calibrated payload (covers 33g-38g total mass)
 ARM_LENGTH_JITTER_MAX: float = 0.0015  # ±1.5 mm independent rotor arm length variation
 MOTOR_MISMATCH_MAX: float = 0.08       # Up to 8% independent motor efficiency degradation
 DYNAMIC_SAG_COEF_MAX: float = 0.07     # Up to 7% 1S LiPo dynamic voltage sag
@@ -152,31 +206,150 @@ OBS_NOISE_ACCEL_RANGE: tuple = (0.02, 0.12)       # m/s^2
 # and a rounding error during a 360 deg flip. Keying them on kind keeps one formula while
 # letting the flip be graded on the scale the flip actually operates at.
 #
-# EVERY kind emitted by TrajectorySampler must appear here - a missing key silently falls
-# back to the hover set, which for a flying manoeuvre is the tightest scale in the table.
-# orbit / lissajous / slalom did exactly that until 2026-09-11: the scripted geometric
-# controller scored 60-64% of the per-step maximum on them against the solvability floor,
-# with the position kernel sitting near its saturated flat region for realistic errors.
-# They now take the waypoints/figure8 velocity, attitude and rate tolerances (same
-# dynamic class) with position one notch looser (0.30 m), because they roam over the
-# largest extent of the smooth set (orbit radius up to 0.55 m, slalom traverse up to
-# 1.2 m). Measured with the scripted controller: 77-84%, in band with the other
-# families, vs 74-75% at 0.25 m and 60-64% under the hover fallback.
-# check_env_tracking.py section B asserts the coverage.
+# EVERY kind emitted by a manoeuvre at some time must appear here - a missing key
+# silently falls back to the hover set, which for a flying manoeuvre is the tightest
+# scale in the table. orbit / lissajous / slalom did exactly that until 2026-09-11: the
+# scripted geometric controller scored 60-64% of the per-step maximum on them against the
+# solvability floor, with the position kernel sitting near its saturated flat region for
+# realistic errors. They now take the waypoints/figure8 velocity, attitude and rate
+# tolerances (same dynamic class) with position one notch looser (0.30 m), because they
+# roam over the largest extent of the smooth set (orbit radius up to 0.55 m, slalom
+# traverse up to 1.2 m). Measured with the scripted controller: 77-84%, in band with the
+# other families, vs 74-75% at 0.25 m and 60-64% under the hover fallback.
+# `v8` and `chain` were added 2026-09-15; check_env_tracking.py section B asserts this
+# table covers every kind the sampler can emit and re-scores all of them.
 # ======================================================================================
 TRACK_TOL: dict = {
     "hover":     {"pos": 0.12, "vel": 0.25, "att": 0.20, "rate": 1.2},
+    "takeoff":   {"pos": 0.15, "vel": 0.35, "att": 0.20, "rate": 1.5},
     "waypoints": {"pos": 0.25, "vel": 0.60, "att": 0.30, "rate": 2.5},
     "figure8":   {"pos": 0.25, "vel": 0.60, "att": 0.30, "rate": 2.5},
     "orbit":     {"pos": 0.30, "vel": 0.60, "att": 0.30, "rate": 2.5},
     "lissajous": {"pos": 0.30, "vel": 0.60, "att": 0.30, "rate": 2.5},
     "slalom":    {"pos": 0.30, "vel": 0.60, "att": 0.30, "rate": 2.5},
     "flip":      {"pos": 0.35, "vel": 1.20, "att": 0.55, "rate": 6.0},
+    # v8 (the vertical figure-eight) is the second acrobatic family: fast but NOT inverted,
+    # so it holds attitude and velocity closer than a flip while still swinging ~45-60 deg
+    # of tilt at up to ~15 rad/s. The tolerances sit between the flip's and the smooth
+    # families' - measured with the scripted controller in check_env_tracking.py section B.
+    "v8":        {"pos": 0.30, "vel": 0.80, "att": 0.45, "rate": 4.5},
+    # `chain` is a FALLBACK only: a Chain reports the kind of the segment it is currently
+    # flying (`Maneuver.kind_at`), so mid-chain the reward uses the segment's own scale -
+    # hover tolerances during a pause, flip tolerances through the rotation. This entry
+    # exists so the coverage assertion in check_env_tracking holds and so a chain built
+    # from an unlabelled custom manoeuvre still has a sane scale (waypoints-class).
+    "chain":     {"pos": 0.30, "vel": 0.80, "att": 0.45, "rate": 4.0},
 }
 TRACK_W_POS: float = 3.0
 TRACK_W_VEL: float = 1.0
 TRACK_W_ATT: float = 2.0
 TRACK_W_RATE: float = 0.8
+W_ACTION_SMOOTH: float = 0.5
+
+# ======================================================================================
+# FLIP ROTATION PROGRESS (flip-scoped: numerically inert for every other family)
+#
+# WHY THE ATTITUDE TERM ALONE CANNOT SEE A FLIP. The attitude term scores
+# `||rotvec(R_ref^T R)||`, and a rotvec WRAPS: a full 360 deg turn returns the body to
+# the attitude it started in, so the error is ~0 at BOTH ends of the rotation and maximal
+# in the MIDDLE. Maximising it therefore never requires rotating - the cheapest way to
+# collect the attitude reward on a flip is to sit still and wait for the reference to
+# come back upright. Measured: with the flip selected and the reward unchanged, the
+# vehicle's dcm22 never went below +0.60 over 10/10 pinned-flip runs (peak tilt 18-53 deg
+# against a reference reaching -1.000), while `flip` still read as one of the BEST
+# families (~79%, and 4.07 in a flip-only probe). The score did not measure the flip.
+#
+# THE FIX. During a flip, also require the vehicle to have accumulated the rotation the
+# reference has accumulated:
+#
+#     progress_err = |ref.spin - spin_veh|        spin_veh = integral of the body rate
+#                                                 along the reference's own flip axis
+#     att_err      = max(rotvec_err, progress_err)
+#
+# The `max` (rather than a replacement) is what makes this surgical. When the vehicle
+# IS rotating with the reference the two errors agree to within the rotvec's own wrap -
+# for a body turning with the reference, |rotvec| = |ref.spin - spin_veh| while both
+# angles are under pi - so a tracking vehicle's reward is UNCHANGED. They separate only
+# when the vehicle does NOT rotate: at the end of the flip the rotvec error is 0 but
+# progress_err is a full 2*pi*k, so the free attitude reward for hovering through the
+# manoeuvre is withdrawn and rotating strictly dominates. Measured cost of the refusal:
+# the flip's arrest phase drops from r_att ~ 1.0 to r_att ~ 0.008.
+#
+# SCOPING. Gated on `ref.kind == "flip"`, which `Maneuver.kind_at` reports for the
+# flip SEGMENT of a chain too, and which no other family emits - so the reward for the
+# eight non-flip families is bit-identical. `ref.spin` defaults to 0.0 and only `Flip`
+# defines a non-trivial schedule, so the term is inert by construction elsewhere.
+#
+# NO NEW WEIGHT. The term rides the existing TRACK_W_ATT (2.0), so
+# REWARD_CEILING_PER_STEP stays 7.3 and every recorded percentage stays comparable. It
+# also keeps `_tracking_kernel` at exactly four calls per step, which is what the CSV
+# term decomposition and `scratch/check_eval_callback.py` spy on.
+#
+# TARGET. `ref.spin` runs 0 -> 2*pi*rotations analytically, so using it (rather than the
+# FLIP_THRESHOLD constant) handles the k=2 double flips the sampler draws without a
+# special case.
+#
+# Ablate without an edit:  QUAD_FLIP_PROGRESS=0 .venv/bin/python scratch/check_env_tracking.py
+# ======================================================================================
+FLIP_PROGRESS: bool = os.environ.get("QUAD_FLIP_PROGRESS", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+
+# The reference's body rate at which the flip's rotation axis is latched. Zero while the
+# reference climbs (the spin is confined to the zero-thrust coast window) and 11-16 rad/s
+# once it rotates, so any threshold in between is unambiguous.
+FLIP_SPIN_AXIS_MIN_RATE: float = 1.0
+
+# ======================================================================================
+# REWARD KERNEL SHAPE
+#
+# Each tracking term is a bounded, monotone, maximum-at-zero kernel of err/tol. WHICH
+# kernel is not cosmetic: a GAUSSIAN kernel exp(-(e/tol)^2) collapses to ~0 within a
+# factor of two of its own tolerance and takes its gradient with it.
+#
+# Measured, on the hover tolerance (pos = 0.12 m) with a weight of 3.0 (41% of the
+# ceiling):
+#
+#     p_err     gaussian    cauchy
+#     0.12 m      0.368      0.500
+#     0.24 m      0.018      0.200
+#     0.35 m      0.0002     0.105
+#     0.60 m      2.7e-08    0.038
+#
+# So under the gaussian a policy flying 2x-5x the tolerance - which is where a policy
+# spends its entire early training, and where the live point-hold sits at 0.2-0.7 m -
+# collects essentially zero position signal, and the scripted geometric controller loses
+# 27% of the per-step maximum on HOVER for exactly this reason (measured: hover 73% of max
+# against a 70% floor). The kernel, not the controller, is what is being measured there.
+#
+# CAUCHY keeps the [0,1] bound, is smooth and monotone, is FLATTER near the target than
+# the gaussian (so it does not distort the precision end of the task) and decays like
+# 1/e^2 instead of e^(-e^2), which keeps a usable gradient out to several tolerances.
+# "gaussian" remains selectable for reproducing pre-2026-09-16 runs.
+# Overridable at import time so an A/B of the two kernels needs no edit:
+#     QUAD_REWARD_KERNEL=gaussian .venv/bin/python scratch/check_env_tracking.py
+REWARD_KERNEL: str = os.environ.get("QUAD_REWARD_KERNEL", "cauchy").strip().lower()
+
+# Ceiling of the per-step reward, i.e. what a perfect tracker collects. Single source of
+# truth: the value used to be quoted as a literal 7.3 in several comments, which is exactly
+# the kind of number that silently goes stale when a weight is retuned.
+REWARD_CEILING_PER_STEP: float = TRACK_W_POS + TRACK_W_VEL + TRACK_W_ATT + TRACK_W_RATE + W_ACTION_SMOOTH
+
+
+def _tracking_kernel(err: float, tol: float) -> float:
+    """
+    Map a tracking error to a bounded [0, 1] reward, 1.0 at zero error.
+
+    `tol` sets the scale (kernel(tol) = 0.37 gaussian / 0.50 cauchy), not a hard cutoff:
+    the kernel is smooth and strictly monotone everywhere, so there is no error at which
+    the gradient discontinuously vanishes. See REWARD_KERNEL for why the tail shape
+    matters more than the scale.
+    """
+    if tol <= 0.0:                                     # guard: a zero tolerance would divide
+        return 1.0 if err == 0.0 else 0.0
+    x = err / tol
+    if REWARD_KERNEL == "gaussian":
+        return float(np.exp(-(x * x)))
+    return float(1.0 / (1.0 + x * x))                  # cauchy
 
 # ======================================================================================
 # FLIGHT VOLUME  (mirror of TrajectoryConfig in trajectories.py - keep in step)
@@ -199,6 +372,47 @@ SPAWN_Z: float = 1.2                 # metres; every manoeuvre starts here
 FLIGHT_RADIUS: float = 2.0           # metres; hard outer boundary, centred on the spawn
 VOLUME_CENTER: tuple = (0.0, 0.0, SPAWN_Z)
 
+# ======================================================================================
+# ACTOR FRAME ANCHORING (2026-09-16): the x,y channels are RELATIVE, z stays absolute.
+#
+# `o_t[O_POS:O_POS+3]` used to be the raw Lighthouse estimate in ROOM coordinates. That
+# made the actor input depend on WHERE the vehicle happened to be: a translation of the
+# whole episode changes that one channel and nothing else (everything else in the frame is
+# a difference, a body-frame quantity, an acceleration or an action). Measured on the 15M
+# checkpoint, a 0.5 m translation moved the rate command by 54% of its own magnitude, and
+# the dependence is roughly LINEAR with no saturation - so an episode flown 2-4 m from
+# whatever the estimator calls the origin (i.e. any real room) is far outside the trained
+# span. The task itself is already relative: the reference is relocated onto the launch
+# pose, and every error channel is a difference. Only this channel was not.
+#
+# So the actor frame's x,y are now measured from the pose the episode started at:
+#
+#     x_rel = est.x - anchor.x        y_rel = est.y - anchor.y        z = est.z
+#
+# At launch the pair reads exactly (0, 0) wherever the vehicle is, and moving the whole
+# room leaves the observation BIT-IDENTICAL. That is what makes the policy truly
+# position-agnostic ("it does not matter where we start").
+#
+# WHY x,y AND NOT z. Horizontally there is no landmark: the task is a relative reference
+# plus a guard, both of which move with the anchor. Vertically there IS one - gravity, the
+# floor and the ceiling are absolute - so an absolute z is an exact, launch-height-
+# independent ground cue. Anchoring z too would make a launch at 0.5 m indistinguishable
+# from one at 1.2 m, which is how a policy is flown into the floor.
+#
+# The ANCHOR MOVES WHENEVER THE EPISODE DOES: `reset()` and the live layer's
+# `adopt_state()` handover, which is exactly where the GRU state and the observation
+# buffers are also reseated. A manoeuvre launched from inside a live policy segment does
+# NOT re-anchor: the reference is already relocated onto the current pose, so the frame
+# stays continuous for the encoder's history.
+#
+# KEEP IN STEP: `collect_data.py` records ACTOR_FRAME_MODE into every shard and
+# `export_policy.py` bakes it into the firmware as POLICY_FRAME_ANCHORED_XY, so a corpus,
+# an encoder checkpoint or an image built for the other mode fails loudly rather than
+# silently feeding the policy a frame it was not trained on.
+# ======================================================================================
+ACTOR_FRAME_MODE: str = "anchored_xy"
+ANCHOR_ACTOR_XY: bool = True         # False reproduces the pre-2026-09-16 layout (ablation only)
+
 # INITIAL KICK. The vehicle starts at the centre of the volume with an arbitrary
 # TRANSLATIONAL and ROTATIONAL velocity, so the policy has to recover from a disturbed
 # start rather than from the trim condition. Both are (dr=0, dr=1) envelopes and are
@@ -217,7 +431,8 @@ class QuadFlipEnv(gym.Env):
     """
     Quadcopter Gymnasium Environment backed by MuJoCo physics.
     Task: track a sampled reference trajectory (hover / waypoints / figure-8 / orbit /
-    lissajous / slalom / 360 deg flip) and recover to the terminal hover.
+    lissajous / slalom / 360 deg flip / vertical figure-eight / multi-command chain) and
+    recover to the terminal hover.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -278,19 +493,34 @@ class QuadFlipEnv(gym.Env):
         self.curriculum_arena = False
         self.arena_radius = float(arena_radius) if arena_radius is not None else FLIGHT_RADIUS
         self.flight_radius = FLIGHT_RADIUS
+        self.envelope_scale: float = 5.0
         self.volume_center = np.array(VOLUME_CENTER, dtype=np.float64)
+        # Origin of the actor frame's x,y channels (see ACTOR_FRAME_MODE). Numeric z here
+        # is unused by the frame - only x,y are subtracted - but the guard uses it.
+        self.anchor_pos = np.zeros(3, dtype=np.float64)
 
         # Trajectory tracking: the reference generator, the Lighthouse sensor model, and
         # the current reference sample. `maneuver` pins a fixed high-level command; None
         # samples from the mixture every episode, which is what pretraining wants.
         self.traj_cfg = trajectory_config or TrajectoryConfig()
         self.sampler = TrajectorySampler(self.traj_cfg)
+        # The flight volume is the plausibility bound for a fix: a sample that places the
+        # vehicle metres outside the sphere the task lives in is not a pose, it is a
+        # divergence. 4x the sphere radius (8 m) is loose enough to never fire on any
+        # legitimate manoeuvre, including the metre-scale re-acquisition after a flip
+        # blackout, while still rejecting the metre-to-hundred-metre walk-away observed
+        # on the real estimator. Set explicitly here because the model cannot know the
+        # volume; free-flight tools leave it at 0 (disabled) by not constructing the env.
+        if lighthouse_config is None:
+            lighthouse_config = LighthouseConfig(max_fix_range=4.0 * FLIGHT_RADIUS)
+        elif float(lighthouse_config.max_fix_range) <= 0.0:
+            lighthouse_config = replace(lighthouse_config, max_fix_range=4.0 * FLIGHT_RADIUS)
         self.lighthouse = LighthouseModel(lighthouse_config)
         self._maneuver_command: Optional[str] = maneuver
         self.traj: Optional[Trajectory] = None
         self.ref: Optional[Reference] = None
         self._last_actor_frame: Optional[np.ndarray] = None
-        self.w_action_smooth: float = 0.5
+        self.w_action_smooth: float = W_ACTION_SMOOTH
 
         # MuJoCo physics model
         self.quad = QuadcopterMuJoCo(motor_tau=self.motor_tau)
@@ -387,7 +617,11 @@ class QuadFlipEnv(gym.Env):
 
         # Flight-progress diagnostics. `accumulated_pitch` is retained because several
         # diagnostic scripts report how far the vehicle ACTUALLY rotated; it is no longer
-        # part of the objective, which now scores tracking error only.
+        # part of the objective, which now scores tracking error only. It is also NOT what
+        # FLIP_PROGRESS integrates: it is clamped to [0, FLIP_THRESHOLD] and only cleared
+        # in `reset()`, so a second flip inside one chain would be credited against the
+        # first one's angle. `flip_spin_veh` below is the per-segment, signed, uncapped
+        # integral instead.
         self.initial_pos = np.array([0.0, 0.0, self.spawn_altitude], dtype=np.float32)
         self.accumulated_pitch: float = 0.0
         self.accumulated_roll: float = 0.0
@@ -397,6 +631,16 @@ class QuadFlipEnv(gym.Env):
         self.flip_completed: bool = False
         self.flip_completed_time: Optional[float] = None
         self.termination_reason: str = "none"
+
+        # Flip rotation progress (see FLIP_PROGRESS). `flip_spin_veh` is the signed net
+        # rotation the vehicle has actually executed within the CURRENT flip segment;
+        # `flip_axis` is the unit BODY-frame axis the reference is rotating about, latched
+        # once per segment (see `_update_flip_progress`).
+        self.flip_spin_veh: float = 0.0
+        self.flip_axis: Optional[np.ndarray] = None
+        self.flip_progress_err: float = 0.0
+        self._flip_last_kind: str = ""
+        self._flip_last_spin: float = 0.0
 
         # Action & observation spaces
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
@@ -432,6 +676,24 @@ class QuadFlipEnv(gym.Env):
             raise ValueError(f"unknown manoeuvre {maneuver!r}; expected one of {list(self.traj_cfg.weights)}")
         self._maneuver_command = maneuver
 
+    def set_maneuver_weight(self, name: str, weight: float) -> None:
+        """Set one family's draw weight in the mixture (the curriculum hook).
+
+        Weights are relative - the sampler normalises them on every draw - so raising the
+        `chain` weight lowers every other family's share in proportion. The sampler holds
+        THIS config object, so the change is live at the next reset and needs no rebuild.
+
+        Driven from the trainer process over the vec-env RPC channel
+        (`env_method("set_maneuver_weight", ...)`, the same path `set_dr_level` uses), and
+        usable by hand from a script or ground station. Only the MIXTURE is affected: a
+        manoeuvre pinned with `set_command` ignores the weights entirely.
+        """
+        self.traj_cfg.set_weight(name, weight)
+
+    def get_maneuver_weights(self) -> dict:
+        """Current mixture probabilities (normalised), for reporting and tests."""
+        return self.traj_cfg.normalized_weights()
+
     def set_arena_radius(self, radius: float) -> None:
         """Manually sets the arena boundary radius."""
         self.arena_radius = float(radius)
@@ -453,6 +715,15 @@ class QuadFlipEnv(gym.Env):
         later visit. Has no effect on the arena radius or the ADR schedule.
         """
         self.dr_headroom = float(max(0.0, headroom))
+
+    def set_envelope_scale(self, scale: float) -> None:
+        """
+        Sets the relative tracking envelope multiplier for boundary termination.
+        When scale >= 4.0 (early in training), the policy is distinctly free to explore
+        almost whatever it wants (free exploration, only ground crash and loose safety sphere).
+        As training progresses, it anneals down towards 1.0 - 1.5 ('within 50% extra of maneuver demand').
+        """
+        self.envelope_scale = float(max(0.5, scale))
 
     @property
     def dr_eff(self) -> float:
@@ -585,7 +856,15 @@ class QuadFlipEnv(gym.Env):
         att_err = self._attitude_error_rotvec(ref.R, self._quat_to_dcm(quat))
 
         frame = np.zeros(ACTOR_SINGLE_OBS_DIM, dtype=np.float32)
-        frame[O_POS:O_POS + 3] = est
+        if ANCHOR_ACTOR_XY:
+            # x,y relative to the pose this episode started at; z absolute (see
+            # ACTOR_FRAME_MODE). The ERRORS below are already differences and are
+            # deliberately NOT anchored - `ref.p - est` is invariant under the same
+            # translation, so anchoring it would double-subtract.
+            frame[O_POS:O_POS + 2] = est[:2] - self.anchor_pos[:2]
+            frame[O_POS + 2] = est[2]
+        else:
+            frame[O_POS:O_POS + 3] = est
         frame[O_QUAT:O_QUAT + 4] = quat
         frame[O_OMEGA:O_OMEGA + 3] = measured_omega
         frame[O_VELXY:O_VELXY + 2] = est_v[:2]
@@ -596,6 +875,17 @@ class QuadFlipEnv(gym.Env):
         frame[O_ATT_ERR:O_ATT_ERR + 3] = att_err
         frame[O_W_ERR:O_W_ERR + 3] = ref.omega - measured_omega
         return frame
+
+    def _compute_reference_ff(self) -> np.ndarray:
+        """Reference feed-forward specific force command, world frame (REF_FF_DIM = 3).
+
+        See the layout note at the top of the file for why this is `a + g` and why it is
+        world-frame. Deliberately NOT delayed and NOT noisy: it is a commanded quantity
+        computed from the reference, not a measurement, so it carries no sensor error and
+        no causal lag. Adding either would only hide the signal the policy needs most.
+        """
+        ref = self._reference_or_default()
+        return (np.asarray(ref.a, dtype=np.float64) + GRAVITY_VEC).astype(np.float32)
 
     def _compute_encoder_aux(self) -> np.ndarray:
         """
@@ -679,7 +969,7 @@ class QuadFlipEnv(gym.Env):
     def get_priv_targets(self) -> np.ndarray:
         """
         Physics regression targets for history-encoder supervision, in SI units and in
-        the order given by PRIV_TARGET_GROUPS (PRIV_TARGET_DIM = 29 dims).
+        the order given by PRIV_TARGET_GROUPS (PRIV_TARGET_DIM = 35 dims).
 
         All quantities are ground truth read straight off the plant, so this must never
         be called on the real vehicle - it exists only for pretraining and for on-policy
@@ -716,6 +1006,13 @@ class QuadFlipEnv(gym.Env):
         passive = np.asarray(self.quad.data.qfrc_passive[:3], dtype=np.float64)
         aero_force_b = self.quad.dcm.T @ passive
 
+        # Estimator drift: what the actor frame's pose/velocity channels are wrong by.
+        # The encoder cannot be robust to a lying estimate unless it is asked to measure
+        # the lie; the same fields are what the corruption augmentation shifts when it
+        # deliberately breaks those channels.
+        est_drift_p = np.asarray(self.lighthouse.p_est, dtype=np.float64) - self.quad.pos
+        est_drift_v = np.asarray(self.lighthouse.v_est, dtype=np.float64) - self.quad.vel
+
         return np.concatenate([
             np.array([mass_ratio]),
             com_offset_b,
@@ -728,6 +1025,8 @@ class QuadFlipEnv(gym.Env):
             true_vel_w,
             motor_speed_norm,
             aero_force_b,
+            est_drift_p,
+            est_drift_v,
         ]).astype(np.float32)
 
     def get_wind_state(self) -> np.ndarray:
@@ -760,12 +1059,16 @@ class QuadFlipEnv(gym.Env):
 
     def _get_stacked_obs(self, privileged_critic: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        Env observation vector: [ stacked actor frames | delayed encoder aux | privileged ].
+        Env observation vector: [ stacked actor frames | reference feed-forward | delayed
+        encoder aux | privileged ].
 
         The aux block is kept as a SEPARATE, single-frame block rather than being
         interleaved into the stack or appended per frame, so that the actor
         observation stays a clean PREFIX of the vector for any OBS_HISTORY_LEN
         (which keeps AsymmetricActorCriticPolicy's [:actor_obs_dim] slice valid).
+        The reference feed-forward sits BETWEEN them for the same reason: the actor must
+        see it, the encoder must NOT (its input contract is [o_t | aux] and is frozen), and
+        "actor = prefix" only holds if everything actor-facing is at the front.
         The aux is latency-delayed to match the actor frames - an undelayed
         accelerometer would give the encoder an unrealistic peek at the current
         state that no real airframe provides.
@@ -778,7 +1081,10 @@ class QuadFlipEnv(gym.Env):
         stacked_actor = np.concatenate(self.obs_history_buffer, dtype=np.float32)
         if privileged_critic is None:
             privileged_critic = self._compute_privileged_critic_obs()
-        return np.concatenate([stacked_actor, self._aux_delayed, privileged_critic], dtype=np.float32)
+        return np.concatenate(
+            [stacked_actor, self._compute_reference_ff(), self._aux_delayed, privileged_critic],
+            dtype=np.float32,
+        )
 
     def get_encoder_frame(self) -> np.ndarray:
         """
@@ -806,6 +1112,71 @@ class QuadFlipEnv(gym.Env):
             return self._last_actor_frame.copy()
         return self._compute_actor_obs()
 
+    def _update_flip_progress(self, ref, omega_body: np.ndarray) -> None:
+        """
+        Integrate how far the VEHICLE has rotated through the current flip's rotation.
+
+        Called once per `step()`, BEFORE the reward is scored, and inert for every
+        reference that is not a flip (see FLIP_PROGRESS).
+
+        THE AXIS IS A MIXTURE, NOT A CHANNEL. `Flip` applies its spin about a WORLD axis
+        (`TrajectorySampler._make_flip` draws `[0,1,0]` pitch 75% of the time and
+        `[1,0,0]` roll 25%), so `R = Rot(a, phi) @ R_base` and the BODY-frame axis is
+        `R_base^T a`. `R_base` carries the flip's own yaw, so even a pure pitch flip
+        rotates about a mixture of body-x and body-y: measured at yaw +38.4 deg it is
+        `[0.621, 0.784, 0]`. Integrating only the larger component therefore UNDER-COUNTS
+        the rotation by exactly `cos(yaw)`: 2*pi*0.784 = 4.925 rad instead of 6.283, which
+        is what an `argmax`-based axis selection produced (measured 4.924). That is a
+        silent 22% shortfall on every flip flown at a non-zero heading, and it would have
+        been charged to the policy as a rotation it never failed to make.
+
+        So the axis is latched as a UNIT VECTOR from the reference's own body rate
+        (`ref.omega`, whose direction is exactly the flip axis and is measurably constant -
+        spread 0.00 deg over the whole rotation), taken at the first step where that rate
+        is non-zero (it is exactly zero through the climb - the spin is confined to the
+        zero-thrust coast window). Latching once keeps the integral on one axis instead of
+        letting gyro noise re-aim it mid-rotation.
+
+        THE SIGN. The integral is signed and uncapped, deliberately, and unlike
+        `accumulated_pitch`. A vehicle that rotates backwards, or that stalls halfway and
+        falls back, must lose the credit - and a k=2 flip needs 4*pi, which
+        `accumulated_pitch`'s clamp to FLIP_THRESHOLD would silently cap at half.
+
+        PER-SEGMENT RESET. A new flip segment begins when the kind turns into "flip", or
+        when the reference's spin goes BACKWARDS. The second test is what catches two
+        flips back-to-back inside one chain: their `kind_at` is "flip" throughout, and
+        nothing else in the env is reset between them.
+        """
+        kind = str(getattr(ref, "kind", "hover")) if ref is not None else "hover"
+        spin_ref = float(getattr(ref, "spin", 0.0)) if ref is not None else 0.0
+
+        if kind != "flip":
+            # Not in a rotation window at all: nothing to integrate, and the next flip
+            # starts from scratch.
+            self.flip_spin_veh = 0.0
+            self.flip_axis = None
+            self.flip_progress_err = 0.0
+            self._flip_last_kind = kind
+            self._flip_last_spin = spin_ref
+            return
+
+        if self._flip_last_kind != "flip" or spin_ref + 1e-9 < self._flip_last_spin:
+            self.flip_spin_veh = 0.0
+            self.flip_axis = None
+
+        if self.flip_axis is None:
+            ref_w = np.asarray(getattr(ref, "omega", np.zeros(3)), dtype=np.float64)
+            rate = float(np.linalg.norm(ref_w))
+            if rate >= FLIP_SPIN_AXIS_MIN_RATE:
+                self.flip_axis = ref_w / rate          # unit body-frame rotation axis
+
+        if self.flip_axis is not None:
+            self.flip_spin_veh += float(np.dot(omega_body, self.flip_axis)) * self.dt
+
+        self.flip_progress_err = abs(spin_ref - self.flip_spin_veh)
+        self._flip_last_kind = kind
+        self._flip_last_spin = spin_ref
+
     def _compute_reward(self, action: np.ndarray, delta_pitch: float) -> float:
         """
         Trajectory tracking reward: exponential kernels on position, velocity, attitude and
@@ -819,11 +1190,19 @@ class QuadFlipEnv(gym.Env):
         self-consistent flight error on the real vehicle. The policy never sees truth; only
         the reward function does.
 
-        WHY EXPONENTIAL KERNELS. Each term is bounded in [0, 1], so the achievable return
+        WHY BOUNDED KERNELS. Each term is bounded in [0, 1], so the achievable return
         per step is comparable across a hover, a figure-8 and a 360 deg flip and PPO's
         single value head does not have to span wildly different magnitudes. They also
-        saturate to zero rather than growing without bound, so an early catastrophic error
+        saturate rather than growing without bound, so an early catastrophic error
         cannot dominate the gradient before the policy can fly at all.
+
+        WHICH BOUNDED KERNEL is a separate decision and is NOT cosmetic - see
+        REWARD_KERNEL above. A gaussian tail e^(-x^2) is effectively dead by x = 2, and a
+        policy that is 2-5 tolerances away from its target is the normal case for most of
+        training (and the measured case for the live point-hold at 0.2-0.7 m). The
+        cauchy tail 1/(1+x^2) keeps a usable gradient there while staying flatter than
+        the gaussian near the target, so it widens the basin without loosening the
+        precision end of the objective.
 
         The manoeuvre's terminal hover is not special-cased. Every trajectory ENDS in a
         hover (see trajectories.py), so the tracking objective already assigns full reward
@@ -845,12 +1224,24 @@ class QuadFlipEnv(gym.Env):
         att_err = float(np.linalg.norm(self._attitude_error_rotvec(ref.R, dcm)))
         w_err = float(np.linalg.norm(ref.omega - omega))
 
-        r_pos = float(np.exp(-((p_err / tol["pos"]) ** 2)))
-        r_vel = float(np.exp(-((v_err / tol["vel"]) ** 2)))
-        r_att = float(np.exp(-((att_err / tol["att"]) ** 2)))
-        r_rate = float(np.exp(-((w_err / tol["rate"]) ** 2)))
+        # Through a flip the rotvec error above cannot see rotation progress - it wraps,
+        # reading ~0 at both ends of the turn - so the vehicle's accumulated rotation is
+        # required as well. See FLIP_PROGRESS: this is inert for every other family, and
+        # for a vehicle that IS rotating it matches the rotvec error rather than adding to
+        # it, so only the refusal to rotate is penalised.
+        if FLIP_PROGRESS and ref.kind == "flip":
+            att_err = max(att_err, self.flip_progress_err)
+
+        r_pos = _tracking_kernel(p_err, tol["pos"])
+        r_vel = _tracking_kernel(v_err, tol["vel"])
+        r_att = _tracking_kernel(att_err, tol["att"])
+        r_rate = _tracking_kernel(w_err, tol["rate"])
 
         delta_action_norm = float(np.linalg.norm(action - self.prev_action))
+        # The action-smoothness term keeps the gaussian SHAPE on purpose: it is a
+        # regulariser, not a tracking objective, its measured value is 0.97-1.00
+        # (0.97 even through a flip), and giving it heavy tails would only widen the
+        # slack on the one term that is supposed to be tight.
         r_action = float(np.exp(-((delta_action_norm / TOL_ACTION_SMOOTH) ** 2)))
 
         return float(
@@ -866,19 +1257,71 @@ class QuadFlipEnv(gym.Env):
             self.termination_reason = "divergent_state"
             return True
 
-        # Outside the flight sphere. Measured against the FIXED world centre, so the volume
-        # is a property of the arena and not of where this episode happened to spawn.
-        d = self.quad.pos - self.volume_center
-        if float(np.dot(d, d)) > self.flight_radius ** 2:
+        # Physical ground contact check:
+        if self.quad.check_ground_contact():
+            # In takeoff mode or when starting on/near the ground, allow a grace window
+            # while the vehicle is upright on its landing legs during spin-up and initial liftoff.
+            # Do NOT terminate as long as:
+            # 1. Episode started on or near ground (spawn_pos[2] < 0.20 or kind == "takeoff")
+            # 2. Quad is upright on landing legs (dcm[2, 2] > 0.50, i.e. tilt < 60 deg, not flipped over)
+            # 3. Within initial liftoff grace window (t < 1.2s and has not already achieved sustained flight)
+            is_takeoff = (self.spawn_pos[2] < 0.20 or getattr(self.ref, "kind", "") == "takeoff")
+            is_upright = (self.quad.dcm[2, 2] > 0.50)
+            in_liftoff_window = (self.t < 1.2 and not getattr(self, "_has_lifted_off", False))
+
+            if is_takeoff and is_upright and in_liftoff_window:
+                # Legitimate resting / spool-up / liftoff on ground: do not terminate
+                pass
+            else:
+                self.termination_reason = "ground_crash"
+                return True
+
+        scale = float(getattr(self, "envelope_scale", 5.0))
+
+        # Relative Maneuver-Specific Flight Envelopes
+        # When scale >= 4.0 (early exploration), the agent is distinctly free to explore
+        # and discover coarse dynamics without premature termination.
+        # Below 4.0, bounds progressively engage and tighten down to ~1.5 (within 50% extra margin).
+        if self.ref is not None and scale < 4.0:
+            kind = str(getattr(self.ref, "kind", "hover"))
+            p_rel = self.quad.pos - self.ref.p
+            dist_rel = float(np.linalg.norm(p_rel))
+            eff_scale = scale / 1.5  # 1.0 at target curriculum end (scale=1.5)
+
+            if kind == "flip":
+                # Flip: Bounded vertical hop and horizontal drift
+                # A flip must rotate cleanly in place and NOT balloon upwards into space or drift away
+                dz_hop = float(self.quad.pos[2] - self.ref.p[2])
+                d_xy = float(np.linalg.norm(p_rel[:2]))
+                max_ceiling_excursion = 0.60 * eff_scale
+                max_xy_drift = 0.80 * eff_scale
+
+                if dz_hop > max_ceiling_excursion:
+                    self.termination_reason = "flip_ballooned_ceiling"
+                    return True
+                if d_xy > max_xy_drift:
+                    self.termination_reason = "flip_drifted_xy"
+                    return True
+            else:
+                # Traverse / Smooth / Acrobatic Maneuvers (slalom, figure8, orbit, waypoints, lissajous, v8, chain, hover)
+                # Evaluated along its tracking tunnel: allows wide lateral traverse (e.g. slalom) as long as
+                # it tracks the reference demand.
+                base_tol = TRACK_TOL.get(kind, TRACK_TOL["hover"])["pos"]
+                # At eff_scale=1.0, allowed deviation is 3.5x base tolerance (~50% extra margin over comfort zone)
+                max_tunnel_error = max(0.50, 3.5 * base_tol) * eff_scale
+                if dist_rel > max_tunnel_error:
+                    self.termination_reason = f"breached_{kind}_tunnel"
+                    return True
+
+        # Outer safety guard (prevents unbounded runaway in case of complete divergence)
+        # In early free exploration (scale >= 4.0), allows a generous 3.5m outer bubble
+        max_outer_r = 3.5 if scale >= 4.0 else 2.5
+        centre = np.array([self.anchor_pos[0], self.anchor_pos[1], VOLUME_CENTER[2]])
+        d = self.quad.pos - centre
+        if float(np.dot(d, d)) > max_outer_r ** 2:
             self.termination_reason = "out_of_volume"
             return True
 
-        # The ground. Note the sphere alone would NOT catch this: its bottom is at
-        # -0.8 m, below the floor, so ground contact is what actually enforces the
-        # 1.2 m bottom of the operating region.
-        if self.quad.check_ground_contact():
-            self.termination_reason = "ground_crash"
-            return True
         return False
 
     @staticmethod
@@ -920,6 +1363,12 @@ class QuadFlipEnv(gym.Env):
         self.flip_completed = False
         self.flip_completed_time = None
         self.termination_reason = "none"
+        self._has_lifted_off = False
+        self.flip_spin_veh = 0.0
+        self.flip_axis = None
+        self.flip_progress_err = 0.0
+        self._flip_last_kind = ""
+        self._flip_last_spin = 0.0
 
         dr = self.dr_eff
         max_lat = int(round(dr * OBS_LATENCY_MAX_STEPS))
@@ -1034,8 +1483,9 @@ class QuadFlipEnv(gym.Env):
 
         # The reference attitude at t = 0 is level for every manoeuvre by construction
         # (hover trivially; waypoints and figure-8 because their acceleration and its
-        # derivative are zero there; the flip because its spin starts at 0), so the spawn
-        # attitude is level plus a small perturbation.
+        # derivative are zero there; the flip because its spin starts at 0; the vertical
+        # figure-eight and every chain segment because they are built rest-to-rest with a
+        # C2 ramp-in), so the spawn attitude is level plus a small perturbation.
         if self.random_initial_pos:
             xy_jitter = 0.05 + dr * 0.15
             z_jitter = 0.03 + dr * 0.09
@@ -1047,6 +1497,10 @@ class QuadFlipEnv(gym.Env):
         else:
             pos_jitter = np.zeros(3, dtype=np.float64)
         spawn_pos = ref0.p + pos_jitter
+        # Ground protection: if starting on or near ground (z < 0.06m), ensure position
+        # is strictly resting on/above floor (legs resting at z ~ 0.025m) and eliminate negative vertical jitter
+        if ref0.p[2] < 0.06 or spawn_pos[2] < 0.025:
+            spawn_pos[2] = max(0.025, float(ref0.p[2] + abs(pos_jitter[2]) * 0.2))
 
         # Spawn at the REFERENCE attitude, not at level.
         #
@@ -1060,6 +1514,9 @@ class QuadFlipEnv(gym.Env):
         if self.random_initial_att:
             att_rp = 0.05 + dr * 0.12
             att_y = 0.035 + dr * 0.10
+            # If resting on ground, keep attitude upright so props don't collide with floor
+            if spawn_pos[2] < 0.05:
+                att_rp = min(0.02, att_rp * 0.25)
             jit = np.array([
                 float(self.np_random.uniform(-att_rp, att_rp)),
                 float(self.np_random.uniform(-att_rp, att_rp)),
@@ -1079,7 +1536,11 @@ class QuadFlipEnv(gym.Env):
             vel_ang = INIT_RATE_RANGE[0] + dr * (INIT_RATE_RANGE[1] - INIT_RATE_RANGE[0])
             # Spawn on the reference's initial VELOCITY, then add the kick. The reference
             # has v = 0 at t = 0 for every manoeuvre, so this is the kick alone in practice.
-            self.quad.data.qvel[0:3] = ref0.v + self.np_random.uniform(-vel_lin, vel_lin, size=3)
+            v_init = ref0.v + self.np_random.uniform(-vel_lin, vel_lin, size=3)
+            # When spawned resting on ground, prevent kicking downwards through the floor
+            if spawn_pos[2] < 0.05 and v_init[2] < 0.0:
+                v_init[2] = 0.0
+            self.quad.data.qvel[0:3] = v_init
             self.quad.data.qvel[3:6] = ref0.omega + self.np_random.uniform(-vel_ang, vel_ang, size=3)
             mujoco.mj_forward(self.quad.model, self.quad.data)
             self.quad._update_state_properties()
@@ -1095,6 +1556,9 @@ class QuadFlipEnv(gym.Env):
 
         self.spawn_pos = spawn_pos.copy()
         self.spawn_vel = self.quad.vel.copy()
+        # The actor frame's origin for this episode. Set BEFORE the first
+        # `_compute_actor_obs()` below, so the very first frame already reads (0, 0) in x,y.
+        self.anchor_pos = spawn_pos.copy()
         self.quad.set_target_marker(ref0.p)
 
         initial_obs = self._compute_actor_obs()
@@ -1119,6 +1583,7 @@ class QuadFlipEnv(gym.Env):
             "motor_cmd": np.zeros(4, dtype=np.float32),
             "spawn_pos": self.spawn_pos.copy(),
             "spawn_vel": self.spawn_vel.copy(),
+            "anchor_pos": self.anchor_pos.copy(),
             "accumulated_pitch": self.accumulated_pitch,
             "accumulated_roll": self.accumulated_roll,
             "total_pitch_rotated": self.total_pitch_rotated,
@@ -1139,6 +1604,7 @@ class QuadFlipEnv(gym.Env):
             "lighthouse_visible": int(self.lighthouse.n_visible),
             "lighthouse_outage_s": float(self.lighthouse.outage_t),
             "lighthouse_drift_m": float(np.linalg.norm(self.lighthouse.p_est - self.quad.pos)),
+            "lighthouse_fix_rejected": int(self.lighthouse.n_fix_rejected),
         }
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
@@ -1213,8 +1679,17 @@ class QuadFlipEnv(gym.Env):
             self.flip_completed_time = float(self.t)
         if self.quad.dcm[2, 2] < -0.2:
             self.has_inverted = True
+        if self.quad.pos[2] > 0.08:
+            self._has_lifted_off = True
         if self.accumulated_pitch >= 0.5 * np.pi:
             self.reached_90 = True
+
+        # Flip rotation progress - the ONLY flight-progress quantity that feeds the reward
+        # (see FLIP_PROGRESS). Runs before `_compute_reward` below so the reward sees the
+        # rotation this step.
+        self._update_flip_progress(
+            self.ref, np.asarray(getattr(self.quad, "omega_filtered", self.quad.omega),
+                                 dtype=np.float64))
 
         obs_current = self._compute_actor_obs()
         self._last_actor_frame = obs_current.copy()
@@ -1263,9 +1738,15 @@ class QuadFlipEnv(gym.Env):
                 "motor_cmd": motor_cmd.copy(),
                 "spawn_pos": self.spawn_pos.copy(),
                 "spawn_vel": self.spawn_vel.copy(),
+                "anchor_pos": self.anchor_pos.copy(),
                 "accumulated_pitch": self.accumulated_pitch,
                 "accumulated_roll": self.accumulated_roll,
                 "total_pitch_rotated": self.total_pitch_rotated,
+                "flip_spin_veh": self.flip_spin_veh,
+                "flip_progress_err": self.flip_progress_err,
+                "flip_axis": (None if self.flip_axis is None
+                              else [float(x) for x in self.flip_axis]),
+                "reference_spin": float(getattr(self.ref, "spin", 0.0)) if self.ref is not None else 0.0,
                 "termination_reason": self.termination_reason,
                 "arena_radius": float(self.arena_radius),
                 "reached_90": self.reached_90,
@@ -1278,6 +1759,7 @@ class QuadFlipEnv(gym.Env):
                 "lighthouse_visible": int(self.lighthouse.n_visible),
                 "lighthouse_outage_s": float(self.lighthouse.outage_t),
                 "lighthouse_drift_m": float(np.linalg.norm(self.lighthouse.p_est - self.quad.pos)),
+                "lighthouse_fix_rejected": int(self.lighthouse.n_fix_rejected),
                 "actor_obs": self.get_actor_obs(),
                 "privileged_obs": privileged_critic,
                 "stock_obs": self._compute_stock_obs(),

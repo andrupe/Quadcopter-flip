@@ -61,9 +61,11 @@ class _StatsSpaceEnv(gym.Env):
 # `.venv/bin/python Simulation/evaluate.py`).
 # ======================================================================================
 MODEL_NAME: str = "latest"            # "latest" auto-selects newest checkpoint in logs/
-EPISODE_SECONDS: float = 8.0          # Must match the training horizon (quad_flip_env.EPISODE_SECONDS):
+EPISODE_SECONDS: float = 15.0         # Must match the training horizon (quad_flip_env.EPISODE_SECONDS):
+                                      # it bounds the sampler, so a shorter value here would truncate
+                                      # references mid-manoeuvre and report a lower score for it.
                                       # it caps the episode AND bounds the references the sampler may draw.
-MANEUVER: Optional[str] = None        # Pin one family (hover/waypoints/figure8/lissajous/orbit/slalom/flip); None = sample the mixture
+MANEUVER: Optional[str] = None        # Pin one family (hover/waypoints/figure8/lissajous/orbit/slalom/flip/v8/chain); None = sample the mixture
 NUM_EPISODES: int = 1                 # Number of test episodes to run before showing plots
 SHOW_VIEWER: bool = True              # Launch interactive 3D MuJoCo viewer window
 SHOW_PLOTS: bool = True               # Display 2D telemetry matplotlib plots after run
@@ -82,8 +84,174 @@ RANDOM_INITIAL_VEL: bool = True       # True = randomize initial linear and angu
 RANDOM_INITIAL_ATT: bool = True       # True = slight random orientation tilt (roll/pitch/yaw)
 RANDOM_INITIAL_STATE: bool = True     # Master flag (used for compatibility)
 PLAYBACK_SPEED: float = 1           # Playback speed (0.25 = 4x slow-motion, 0.5 = 2x slow-mo, 1.0 = real-time)
-DR_LEVEL: float = 1                # Domain Randomization intensity: 0.0 = nominal clean sim, 1.0 = full sim-to-real stress
+DR_LEVEL: float = 1.0            # Domain Randomization intensity: 0.0 = nominal clean sim, 1.0 = full sim-to-real stress
 # ======================================================================================
+# LIGHTHOUSE FAILURE INJECTION (evaluation only - training never sees it)
+# ======================================================================================
+# Reproduces the failure measured on the real airframe during bring-up: a STATIC vehicle's
+# `stateEstimate.x` walked to +98 m at 5-9 m/s while the Kalman filter repeatedly reset
+# itself. This is the failure the encoder's corruption augmentation and the fix gate were
+# built for, and this is how to see what the policy does when it happens.
+#
+#     "none"      nominal - the model's own geometry, station dropout and fix gate, exactly
+#                 as training sees them.
+#     "loss"      the Lighthouse is GONE from LIGHTHOUSE_FAIL_AT_S onward: no fix is ever
+#                 produced, so the estimate dead-reckons and drifts. (Flew out of coverage,
+#                 a station switched off, the deck lost its sweeps.)
+#     "outage"    repeated forced blackouts of LIGHTHOUSE_OUTAGE_S every
+#                 LIGHTHOUSE_OUTAGE_PERIOD_S. Intermittent, not total.
+#     "runaway"   THE ESTIMATOR LIES. The estimate is driven away from truth along a fixed
+#                 heading at an accelerating rate - the hardware failure above.
+#     "teleport"  the estimate jumps by LIGHTHOUSE_TELEPORT_M every period.
+#
+# WHY THE INJECTION IS APPLIED TO THE ESTIMATE, NOT TO THE RAW FIX
+# `lighthouse.py` already rejects implausible RAW FIXES (max_fix_jump / max_fix_dv /
+# max_reject_streak). The hardware failure was NOT a bad fix - it was a bad ESTIMATE, and
+# nothing downstream of the estimator could tell. Injecting after the estimate has been
+# produced reproduces exactly that: the gate never gets a say, the actor is fed the lie,
+# and every derived channel (p_err, v_err, w_err, ...) stays COHERENT because they are all
+# computed from this same estimate inside `_compute_actor_obs`. A corruption that only
+# moved `p_est` without moving `p_err` would hand the policy a shortcut - the disagreement
+# between the two would itself be the tell - which is the same coherence reasoning the
+# encoder's `corruption.py` applies.
+LIGHTHOUSE_FAILURE: str = "none"         # none | loss | outage | runaway | teleport
+LIGHTHOUSE_FAIL_AT_S: float = 1       # seconds into the episode before it starts
+LIGHTHOUSE_SEVERITY: float = 0.5       # scales the runaway acceleration / jump size
+LIGHTHOUSE_OUTAGE_S: float = .5         # forced blackout length ('outage'), seconds
+LIGHTHOUSE_OUTAGE_PERIOD_S: float = 1.0  # blackout / teleport period, seconds
+LIGHTHOUSE_TELEPORT_M: float = 1.0       # 'teleport' jump, metres (above the 5 m gate bar)
+LIGHTHOUSE_Z_TOO: bool = True           # also lie about altitude (default: horizontal only)# ======================================================================================
+
+
+class LighthouseFailure:
+    """
+    Post-estimator failure injection for evaluation. See the config block for the modes.
+
+    It monkeypatches `env.lighthouse.observe` rather than editing the environment, so the
+    corruption lands at the RIGHT instant - inside `env.step()`, after the estimate has
+    been produced and before `_compute_actor_obs()` reads it - while leaving
+    `quad_flip_env.py`, `lighthouse.py` and the training path completely untouched. This is
+    the same wrap-the-real-thing pattern the reward spy in train.py uses.
+    """
+
+    BIG = 1.0e9              # "more stations than exist" -> has_fix is never true
+    RUNAWAY_ACCEL = 1.0      # m/s^2 the lie accumulates. The hardware record: 0.5-1.0
+
+    MODES = ("none", "loss", "outage", "runaway", "teleport")
+
+    def __init__(self, lighthouse, mode="none", at_s=0.0, severity=1.0, outage_s=1.5,
+                 period_s=4.0, teleport_m=6.0, z_too=False, seed=0):
+        self.lh = lighthouse
+        self.mode = str(mode).strip().lower()
+        if self.mode not in self.MODES:
+            raise ValueError(f"LIGHTHOUSE_FAILURE must be one of {self.MODES}, got {mode!r}")
+        self.at_s = float(at_s)
+        self.severity = float(severity)
+        self.outage_s = float(outage_s)
+        self.period_s = max(1e-3, float(period_s))
+        self.teleport_m = float(teleport_m)
+        self.z_too = bool(z_too)
+        self._orig_min = int(lighthouse.cfg.min_stations_for_fix)
+
+        # A FIXED heading, so the lie is reproducible across episodes and seeds instead of
+        # looking like noise. z is left alone by default: the failing axis on hardware was
+        # x, and altitude is fused with the barometer.
+        rng = np.random.default_rng(seed)
+        th = float(rng.uniform(0.0, 2.0 * np.pi))
+        d = np.array([np.cos(th), np.sin(th), 0.25 if z_too else 0.0], dtype=np.float64)
+        self.direction = d / np.linalg.norm(d)
+
+        self.reset()
+
+    # -- per-episode state -----------------------------------------------------------
+    def reset(self) -> None:
+        self.t = 0.0
+        self.active = False
+        self.offset = np.zeros(3)
+        self.lie_v = np.zeros(3)
+        self.max_lie = 0.0
+        self._blinding = False
+        self._next_event = 0.0
+        self.lh.cfg.min_stations_for_fix = self._orig_min
+
+    def install(self) -> None:
+        """Wrap observe() so the corruption runs inside env.step(), before the actor frame."""
+        if getattr(self.lh.observe, "_lh_failure_wrapped", False):
+            # Two injectors on one env would corrupt twice per step (a 2x runaway, a
+            # doubly-amplified teleport) and neither would look wrong. Refuse instead.
+            raise RuntimeError("a LighthouseFailure is already installed on this env")
+        original = self.lh.observe
+        outer = self
+
+        def patched(p_true, v_true, R_world, dt, rng):
+            out = original(p_true, v_true, R_world, dt, rng)
+            outer._corrupt(np.asarray(p_true, dtype=np.float64), float(dt))
+            return out
+
+        patched._lh_failure_wrapped = True
+        self.lh.observe = patched
+
+    # -- the injection ----------------------------------------------------------------
+    def _corrupt(self, p_true, dt):
+        self.t += dt
+        if self.mode == "none" or self.t < self.at_s:
+            return
+        self.active = True
+        lh = self.lh
+
+        if self.mode == "loss":
+            # Starve the estimator of fixes using its OWN path: n_visible is still reported
+            # truthfully, has_fix simply can never be true, and observe() falls through to
+            # dead reckoning exactly as it does for a real blackout.
+            lh.cfg.min_stations_for_fix = self.BIG
+            self.max_lie = max(self.max_lie, float(np.linalg.norm(lh.p_est - p_true)))
+            return
+
+        if self.mode == "outage":
+            phase = (self.t - self.at_s) % self.period_s
+            blind = phase < self.outage_s
+            if blind != self._blinding:
+                self._blinding = blind
+                lh.cfg.min_stations_for_fix = self.BIG if blind else self._orig_min
+            self.max_lie = max(self.max_lie, float(np.linalg.norm(lh.p_est - p_true)))
+            return
+
+        if self.mode == "runaway":
+            self.lie_v += self.direction * (self.RUNAWAY_ACCEL * self.severity) * dt
+            self.offset += self.lie_v * dt
+            # p_est is SET, not nudged: a persistent lie is exactly what no per-step gate
+            # can catch, which is why `max_fix_range` exists. v_est follows the same lie so
+            # the estimate stays self-consistent about "how fast it thinks it is moving".
+            lh.p_est[:] = p_true + self.offset
+            lh.v_est[:] = self.lie_v
+            self.max_lie = max(self.max_lie, float(np.linalg.norm(self.offset)))
+            return
+
+        if self.mode == "teleport":
+            if self.t - self.at_s >= self._next_event:
+                self._next_event += self.period_s
+                self.offset += self.direction * (self.teleport_m * self.severity)
+            lh.p_est[:] = p_true + self.offset
+            self.max_lie = max(self.max_lie, float(np.linalg.norm(self.offset)))
+
+    # -- reporting --------------------------------------------------------------------
+    def describe(self) -> str:
+        d = self.direction
+        return (f"{self.mode} (from {self.at_s:.1f}s, severity {self.severity:.2f}, "
+                f"heading [{d[0]:+.2f} {d[1]:+.2f} {d[2]:+.2f}])")
+
+    def summary(self) -> str:
+        if self.mode == "none":
+            return ""
+        lh = self.lh
+        if not self.active:
+            return f"            Lighthouse : armed ({self.mode}) - never fired"
+        extra = ""
+        if self.mode in ("runaway", "teleport"):
+            extra = f" | peak lie {self.max_lie:.2f} m"
+        return (f"            Lighthouse : {self.mode} ACTIVE{extra} | "
+                f"outage {lh.outage_t:.2f}s | fixes rejected {lh.n_fix_rejected} "
+                f"(forced {lh.n_fix_forced}, last: {lh.last_reject_reason or '-'})")
 
 
 def evaluate(
@@ -101,6 +269,9 @@ def evaluate(
     random_initial_att: bool = RANDOM_INITIAL_ATT,
     random_initial_state: bool = RANDOM_INITIAL_STATE,
     playback_speed: float = PLAYBACK_SPEED,
+    lighthouse_failure: str = LIGHTHOUSE_FAILURE,
+    lighthouse_fail_at_s: float = LIGHTHOUSE_FAIL_AT_S,
+    lighthouse_severity: float = LIGHTHOUSE_SEVERITY,
 ):
     """Run policy in MuJoCo with real-time 3D visualization and telemetry plotting."""
     if os.path.isfile(model_name):
@@ -176,6 +347,18 @@ def evaluate(
     env.set_dr_level(dr_level)
     print(f"Manoeuvre          : "
           f"{maneuver if maneuver else 'sampled from the training mixture at every reset'}")
+
+    # --- lighthouse failure injection ------------------------------------------------
+    injector = None
+    if str(lighthouse_failure).strip().lower() != "none":
+        injector = LighthouseFailure(
+            env.lighthouse, mode=lighthouse_failure, at_s=lighthouse_fail_at_s,
+            severity=lighthouse_severity, outage_s=LIGHTHOUSE_OUTAGE_S,
+            period_s=LIGHTHOUSE_OUTAGE_PERIOD_S, teleport_m=LIGHTHOUSE_TELEPORT_M,
+            z_too=LIGHTHOUSE_Z_TOO,
+        )
+        injector.install()
+        print(f"Lighthouse failure : {injector.describe()}")
 
     obs, info = env.reset()
     actor_input.reset()
@@ -320,6 +503,8 @@ def evaluate(
                 sp = getattr(env, "spawn_pos", env.quad.pos)
                 sv = getattr(env, "spawn_vel", env.quad.vel)
                 print(f"             Spawn State : pos=[{sp[0]:+.2f}, {sp[1]:+.2f}, {sp[2]:+.2f}]m | vel=[{sv[0]:+.2f}, {sv[1]:+.2f}, {sv[2]:+.2f}]m/s")
+                if injector is not None and injector.mode != "none":
+                    print(injector.summary())
                 if dist:
                     com = dist.get("com_offset", [0, 0, 0])
                     eff = dist.get("motor_efficiencies", [1, 1, 1, 1])
@@ -360,6 +545,8 @@ def evaluate(
                 time.sleep(0.3)
                 obs, info = env.reset()
                 actor_input.reset()
+                if injector is not None:
+                    injector.reset()
                 total_reward = 0.0
                 max_tilt_deg = 0.0
                 episode_idx += 1

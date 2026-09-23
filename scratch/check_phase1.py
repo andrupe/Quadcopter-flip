@@ -24,10 +24,13 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "Simulation")]:
 from quad_flip_env import (  # noqa: E402
     ACTOR_SINGLE_OBS_DIM,
     ACTOR_TOTAL_DIM,
+    AUX_OFFSET,
     ENCODER_AUX_DIM,
+    PRIV_OFFSET,
     PRIV_TARGET_DIM,
     PRIV_TARGET_GROUPS,
     PRIVILEGED_OBS_DIM,
+    REF_FF_DIM,
     TOTAL_OBS_DIM,
     QuadFlipEnv,
 )
@@ -64,8 +67,8 @@ check("ENCODER_AUX_DIM == 4", ENCODER_AUX_DIM == 4, f"= {ENCODER_AUX_DIM}")
 check("ACTOR_TOTAL_DIM == 29", ACTOR_TOTAL_DIM == 29, f"= {ACTOR_TOTAL_DIM}")
 check("PRIVILEGED_OBS_DIM == 44", PRIVILEGED_OBS_DIM == 44, f"= {PRIVILEGED_OBS_DIM}")
 check(
-    "TOTAL_OBS_DIM == 77",
-    TOTAL_OBS_DIM == 29 + 4 + 44,
+    "TOTAL_OBS_DIM == actor + ref_ff + aux + privileged",
+    TOTAL_OBS_DIM == 29 + REF_FF_DIM + 4 + 44,
     f"= {TOTAL_OBS_DIM}",
 )
 check("PRIV_TARGET_DIM == 32", PRIV_TARGET_DIM == sum(d for _, d in PRIV_TARGET_GROUPS), f"= {PRIV_TARGET_DIM}")
@@ -78,7 +81,7 @@ print("=" * 78)
 env.set_dr_level(0.0)
 obs, info = env.reset(seed=7)
 check("obs dims", obs.shape == (TOTAL_OBS_DIM,), f"= {obs.shape}")
-check("env obs == info actor_obs + aux + priv", obs.shape[0] == 77)
+check("env obs == info actor_obs + ref_ff + aux + priv", obs.shape[0] == TOTAL_OBS_DIM)
 
 prev = obs[13:17]
 check(
@@ -88,7 +91,7 @@ check(
 )
 print(f"        hover trim action          = {np.round(env.hover_trim_action, 4)}")
 
-aux = obs[29:33]
+aux = obs[AUX_OFFSET:AUX_OFFSET + ENCODER_AUX_DIM]
 check("aux accel ~ 9.81 on body +z at rest", abs(aux[2] - 9.81) < 0.5, f"= {np.round(aux[:3], 3)}")
 check("aux accel xy ~ 0", np.abs(aux[:2]).max() < 0.2, f"= {np.round(aux[:2], 3)}")
 check("aux v_batt_norm ~ 1.0 at no DR", abs(aux[3] - 1.0) < 0.05, f"= {aux[3]:.4f}")
@@ -98,8 +101,8 @@ check(
     np.allclose(obs[:29], info["single_obs"], atol=1e-6),
 )
 check(
-    "obs[33:] matches info['privileged_obs']",
-    np.allclose(obs[33:], info["privileged_obs"], atol=1e-6),
+    "obs[AUX_OFFSET:] matches info['privileged_obs'] (after the aux block)",
+    np.allclose(obs[PRIV_OFFSET:], info["privileged_obs"], atol=1e-6),
 )
 
 print()
@@ -254,12 +257,16 @@ if found:
     check("aux_buffer length == latency + 1", len(env4.aux_buffer) == 3, f"= {len(env4.aux_buffer)}")
     check(
         "obs aux block == buffered (delayed) aux",
-        np.allclose(obs[29:33], env4.aux_buffer[0], atol=1e-6),
-        f"{np.round(obs[29:33], 4)}",
+        np.allclose(obs[AUX_OFFSET:AUX_OFFSET + ENCODER_AUX_DIM], env4.aux_buffer[0], atol=1e-6),
+        f"{np.round(obs[AUX_OFFSET:AUX_OFFSET + ENCODER_AUX_DIM], 4)}",
     )
     check(
-        "info['encoder_frame'] == obs[:33]",
-        np.allclose(info["encoder_frame"], obs[:33], atol=1e-6),
+        "info['encoder_frame'] == [o_t | aux] (the ref_ff block is skipped)",
+        np.allclose(
+            info["encoder_frame"],
+            np.concatenate([obs[:ACTOR_TOTAL_DIM], obs[AUX_OFFSET:AUX_OFFSET + ENCODER_AUX_DIM]]),
+            atol=1e-6,
+        ),
     )
 
     # Excite the plant hard so the delayed and current specific force differ.
@@ -276,7 +283,7 @@ if found:
     )
     check(
         "obs aux block still tracks the delayed value, not the current one",
-        not np.allclose(obs[29:33], current, atol=1e-4),
+        not np.allclose(obs[AUX_OFFSET:AUX_OFFSET + ENCODER_AUX_DIM], current, atol=1e-4),
     )
 
 print()

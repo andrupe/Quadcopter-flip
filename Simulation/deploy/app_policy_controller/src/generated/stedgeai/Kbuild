@@ -1,0 +1,5 @@
+# The ST Edge AI generated network. Copied here by
+# Simulation/deploy/install_stedgeai.py - never edit these files by hand; re-run
+# `stedgeai generate` on Simulation/deploy/models/policy_step_stedgeai.onnx instead.
+obj-y += network.o
+obj-y += network_data.o

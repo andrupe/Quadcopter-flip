@@ -20,13 +20,20 @@ sensor stream into a low-dimensional latent that PPO can condition on.
 """
 
 from .observation_spec import (  # noqa: F401
+    ACTION_DIM,
+    ACTION_INDICES,
     ACTOR_FRAME_DIM,
     AUX_DIM,
     ENCODER_IN_DIM,
     NormStats,
+    PHYS_STATE_DIM,
+    PHYS_STATE_GROUPS,
+    PHYS_STATE_INDICES,
     frame_from_env_obs,
 )
 from .history_encoder import (  # noqa: F401
+    DynamicsPredictorHead,
+    EncoderWithDynamicsHead,
     EncoderWithHead,
     HistoryEncoder,
     load_encoder_checkpoint,
@@ -35,11 +42,18 @@ from .history_encoder import (  # noqa: F401
 from .latent_injector import LatentInjector  # noqa: F401
 
 __all__ = [
+    "ACTION_DIM",
+    "ACTION_INDICES",
     "ACTOR_FRAME_DIM",
     "AUX_DIM",
     "ENCODER_IN_DIM",
     "NormStats",
+    "PHYS_STATE_DIM",
+    "PHYS_STATE_GROUPS",
+    "PHYS_STATE_INDICES",
     "frame_from_env_obs",
+    "DynamicsPredictorHead",
+    "EncoderWithDynamicsHead",
     "EncoderWithHead",
     "HistoryEncoder",
     "LatentInjector",

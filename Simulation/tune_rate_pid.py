@@ -54,7 +54,7 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
 import quad_flip_env
 from quadFiles.quad_mujoco import QuadcopterMuJoCo
 from utils.rate_pid import RatePIDController
-from quad_flip_env import ACTOR_TOTAL_DIM
+from quad_flip_env import ACTOR_TOTAL_DIM, REF_FF_DIM
 from actor_input import Z_DIM, ActorInput, load_checkpoint, read_checkpoint_arch
 
 
@@ -165,7 +165,7 @@ def init_worker_process(model_path: str, norm_path: Optional[str], dr_level: flo
     torch.set_num_threads(1)
 
     _WORKER_ENV = quad_flip_env.QuadFlipEnv(
-        episode_seconds=8.0,
+        episode_seconds=15.0,   # matches the training horizon
         random_initial_state=True,
         random_initial_pos=True,
         random_initial_vel=True,
@@ -701,14 +701,18 @@ def tune_rate_pid(
     # where the policy expected [o_t | z]; a wrong input is worse than no tuning, because
     # the gains would then be optimised for a policy that does not exist.
     actor_dim, _ = read_checkpoint_arch(model_path)
-    if actor_dim is None or actor_dim not in (ACTOR_TOTAL_DIM, ACTOR_TOTAL_DIM + Z_DIM):
+    if actor_dim is None or actor_dim not in (
+        ACTOR_TOTAL_DIM + REF_FF_DIM, ACTOR_TOTAL_DIM + Z_DIM + REF_FF_DIM
+    ):
         raise SystemExit(
             f"\n[Error] Could not read a supported actor width from {model_path}\n"
-            f"        (expected {ACTOR_TOTAL_DIM} without the history encoder, or "
-            f"{ACTOR_TOTAL_DIM + Z_DIM} with it).\n"
+            f"        (expected {ACTOR_TOTAL_DIM + REF_FF_DIM} without the history encoder, or "
+            f"{ACTOR_TOTAL_DIM + Z_DIM + REF_FF_DIM} with it).\n"
             "        Retrain with:  .venv/bin/python Simulation/train.py\n"
         )
-    _desc = f"[o_t | z({Z_DIM})]" if actor_dim == ACTOR_TOTAL_DIM + Z_DIM else "o_t"
+    _desc = (f"[o_t | z({Z_DIM}) | ref_ff({REF_FF_DIM})]"
+             if actor_dim == ACTOR_TOTAL_DIM + Z_DIM + REF_FF_DIM
+             else f"[o_t | ref_ff({REF_FF_DIM})]")
     print(f"[TunePID] Checkpoint actor input: {_desc} ({actor_dim} dims)")
 
     if workers is None or workers <= 0:

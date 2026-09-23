@@ -6,7 +6,7 @@ What matters here is that the task is well-posed and SOLVABLE, not just that it 
   A. OBSERVATION CONTRACT. 77 dims, actor frame is a clean prefix, and every declared
      field offset actually contains what the layout comment claims.
   B. THE TASK IS SOLVABLE. A plain cascaded geometric controller, with no learning at all,
-     must score well on EVERY manoeuvre in the sampler's mixture (all seven kinds), as a
+     must score well on EVERY manoeuvre in the sampler's mixture (all nine kinds), as a
      6-seed mean. If a hand-written controller cannot track the reference, the reference
      is wrong or the reward is mis-scaled, and no amount of PPO will fix it. This is the
      single most important check in the file. It also asserts that TRACK_TOL covers every
@@ -36,7 +36,10 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "Simulation")]:
         sys.path.insert(0, _p)
 
 from quad_flip_env import (  # noqa: E402
+    ANCHOR_ACTOR_XY,
     ACTOR_SINGLE_OBS_DIM,
+    ACTOR_TOTAL_DIM,
+    AUX_OFFSET,
     ENCODER_AUX_DIM,
     O_ATT_ERR,
     O_OMEGA,
@@ -48,6 +51,9 @@ from quad_flip_env import (  # noqa: E402
     O_VELZ,
     O_V_ERR,
     O_W_ERR,
+    PRIVILEGED_OBS_DIM,
+    REF_FF_DIM,
+    REF_FF_OFFSET,
     TOTAL_OBS_DIM,
     QuadFlipEnv,
     TRACK_TOL,
@@ -142,17 +148,34 @@ print("A. observation contract")
 print("=" * 78)
 env = QuadFlipEnv()
 obs, info = env.reset(seed=0)
-check("total observation dim is 77", obs.shape == (TOTAL_OBS_DIM,) and TOTAL_OBS_DIM == 77,
+check("total observation dim matches the declared layout",
+      obs.shape == (TOTAL_OBS_DIM,)
+      and TOTAL_OBS_DIM == ACTOR_TOTAL_DIM + REF_FF_DIM + ENCODER_AUX_DIM + PRIVILEGED_OBS_DIM,
       f"shape {obs.shape}, declared {TOTAL_OBS_DIM}")
 check("actor frame is a clean prefix of the env vector",
-      ACTOR_SINGLE_OBS_DIM == 29 and ENCODER_AUX_DIM == 4,
-      f"actor {ACTOR_SINGLE_OBS_DIM}, aux {ENCODER_AUX_DIM}")
+      ACTOR_SINGLE_OBS_DIM == 29 and ENCODER_AUX_DIM == 4 and REF_FF_DIM == 3,
+      f"actor {ACTOR_SINGLE_OBS_DIM}, ref_ff {REF_FF_DIM}, aux {ENCODER_AUX_DIM}")
 
 actor = obs[:ACTOR_SINGLE_OBS_DIM]
 ref, lh = env.ref, env.lighthouse
-check("position channel carries the Lighthouse estimate",
-      np.allclose(actor[O_POS:O_POS + 3], lh.p_est, atol=1e-5),
-      f"|obs - est| = {np.linalg.norm(actor[O_POS:O_POS+3] - lh.p_est):.2e}")
+# The x,y channels are anchored to the episode's launch pose (quad_flip_env.ACTOR_FRAME_MODE);
+# z stays absolute so the ground cue survives. See scratch/check_frame_anchor.py for the
+# invariance property this buys.
+if ANCHOR_ACTOR_XY:
+    expected_pos = np.array([lh.p_est[0] - env.anchor_pos[0],
+                             lh.p_est[1] - env.anchor_pos[1],
+                             lh.p_est[2]])
+    label = "position channel is the estimate, x,y relative to the episode anchor"
+else:
+    expected_pos = np.asarray(lh.p_est).copy()
+    label = "position channel carries the Lighthouse estimate"
+check(label,
+      np.allclose(actor[O_POS:O_POS + 3], expected_pos, atol=1e-5),
+      f"|obs - expected| = {np.linalg.norm(actor[O_POS:O_POS+3] - expected_pos):.2e}")
+check("the first frame of an episode reads (0, 0) in x,y",
+      (not ANCHOR_ACTOR_XY) or
+      (abs(float(actor[O_POS])) < 1e-5 and abs(float(actor[O_POS + 1])) < 1e-5),
+      f"o_t[0:2] = ({float(actor[O_POS]):+.2e}, {float(actor[O_POS + 1]):+.2e})")
 check("horizontal velocity channel is the estimate",
       np.allclose(actor[O_VELXY:O_VELXY + 2], lh.v_est[:2], atol=1e-5), "")
 check("vertical velocity channel is the estimate",
@@ -175,6 +198,41 @@ check("encoder frame is 33 dims (actor + aux)",
       info["encoder_frame"].shape == (ACTOR_SINGLE_OBS_DIM + ENCODER_AUX_DIM,),
       f"{info['encoder_frame'].shape}")
 
+# THE FEED-FORWARD BLOCK. It is the only part of the observation that is a COMMAND rather
+# than a measurement, and it is the actor's only access to the reference's acceleration
+# (the policy is memoryless, so it cannot differentiate p_err across steps). Two invariants
+# matter and BOTH fail silently otherwise:
+#   * POSITION: it must sit immediately after the actor frame and immediately BEFORE aux, so
+#     that the wrapped prefix is [actor | z | ref_ff | ...]. Anywhere else and either the
+#     encoder eats it (contract broken, width unchanged, f_in guard still passes) or the
+#     actor never sees it.
+#   * VALUE: a_ref + g, so a Hover - whose reference acceleration is zero - reads exactly
+#     1 g of collective. This uses its OWN env: resetting the shared one here would
+#     invalidate every estimate comparison above.
+check("ref_ff sits between the actor frame and aux",
+      REF_FF_OFFSET == ACTOR_TOTAL_DIM and AUX_OFFSET == ACTOR_TOTAL_DIM + REF_FF_DIM,
+      f"ref_ff at {REF_FF_OFFSET} (actor ends {ACTOR_TOTAL_DIM}), aux at {AUX_OFFSET}")
+_ff_env = QuadFlipEnv()
+_hover_obs, _ = _ff_env.reset(seed=0, options={"maneuver": "hover"})
+_ff = _hover_obs[REF_FF_OFFSET:REF_FF_OFFSET + REF_FF_DIM]
+check("ref_ff reads 1 g of collective in hover (a_ref = 0)",
+      np.allclose(_ff, np.array([0.0, 0.0, GRAVITY], dtype=np.float32), atol=1e-4),
+      f"block {np.round(_ff, 4)}, expected [0, 0, {GRAVITY}]")
+# A zero-collective reference must read zero feed-forward: this is the Flip's ballistic
+# coast, and it is the single most informative value the channel takes.
+_flip_env = QuadFlipEnv()
+_flip_obs, _ = _flip_env.reset(seed=1, options={"maneuver": "flip"})
+_ff_flip = []
+for _ in range(400):
+    _flip_obs, _r, _t, _tr, _i = _flip_env.step(np.zeros(4, dtype=np.float32))
+    _ff_flip.append(_flip_obs[REF_FF_OFFSET:REF_FF_OFFSET + REF_FF_DIM].copy())
+    if _t or _tr:
+        break
+_ff_flip = np.asarray(_ff_flip)
+check("ref_ff reaches exactly zero during a flip's ballistic coast",
+      float(np.abs(_ff_flip).min()) < 1e-6,
+      f"min |a_ff| = {float(np.abs(_ff_flip).min()):.2e} m/s^2 over {len(_ff_flip)} steps")
+
 print()
 print("=" * 78)
 print("B. the task is solvable by a textbook controller (the important one)")
@@ -193,7 +251,7 @@ check("TRACK_TOL has an entry for every sampled manoeuvre kind", not _missing,
       f"missing {_missing or 'none'} (a missing key silently uses the hover scale)")
 
 results = {}
-for name in ("hover", "waypoints", "figure8", "orbit", "lissajous", "slalom", "flip"):
+for name in ("hover", "waypoints", "figure8", "orbit", "lissajous", "slalom", "flip", "v8", "chain"):
     runs = [run_episode(maneuver=name, seed=s) for s in SCORE_SEEDS]
     # Representative episode for sections C-F: a run that ended on the TRAJECTORY, not
     # on the step cap, so those checks exercise the normal episode horizon.

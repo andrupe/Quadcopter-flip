@@ -49,8 +49,8 @@ class QuadcopterMuJoCo:
         # Standardize coordinate frame to ENU for MuJoCo (+Z is Up)
         config.orient = "ENU"
 
-        # Physical parameters matching Bitcraze Crazyflie 2.X
-        mB = 0.028       # Mass (kg)
+        # Physical parameters matching Bitcraze Crazyflie 2.X (33g baseline with battery & deck)
+        mB = 0.033       # Mass (kg)
         g = 9.81         # Gravity (m/s^2)
         dxm = 0.0325     # Arm length x (m)
         dym = 0.0325     # Arm length y (m)
@@ -59,17 +59,17 @@ class QuadcopterMuJoCo:
         kTo = 7.94e-10   # Torque coefficient (Nm / (rad/s)^2)
         minW = 0.0       # Min motor speed (rad/s)
         maxW = 2600.0    # Max motor speed (rad/s)
-        w_hover = 1767.0 # Hover motor speed (rad/s)
-        thr_hover = mB * g / 4.0 # Hover thrust per motor (~0.06867 N)
+        thr_hover = mB * g / 4.0 # Hover thrust per motor (~0.08093 N)
+        w_hover = float(np.sqrt(thr_hover / kTh)) # Hover motor speed (~1918 rad/s)
 
-        # Izz is 2.85e-5, not the literature 2.89e-5: the measured triple violates the
-        # triangle inequality (1.43 + 1.43 < 2.89), and MuJoCo would either reject it or
-        # silently balance all three axes (which is exactly how a 34% error in Izz hid
-        # here). Must match <inertial> in assets/quadcopter.xml - checked below.
+        # Scaled from CF2.1 nominal (28g -> 33g, ~1.1786x):
+        # (1.685e-5, 1.685e-5, 3.359e-5). Strictly satisfies triangle inequality
+        # (1.685 + 1.685 = 3.370 >= 3.359).
+        # Must match <inertial> in assets/quadcopter.xml - checked below.
         IB = np.array([
-            [1.43e-5, 0.0,     0.0    ],
-            [0.0,     1.43e-5, 0.0    ],
-            [0.0,     0.0,     2.85e-5],
+            [1.685e-5, 0.0,      0.0     ],
+            [0.0,      1.685e-5, 0.0     ],
+            [0.0,      0.0,      3.359e-5],
         ])
 
         self.params: Dict[str, Any] = {

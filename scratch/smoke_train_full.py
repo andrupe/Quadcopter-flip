@@ -40,6 +40,10 @@ def main() -> int:
         from encoder.history_encoder import EncoderWithHead, save_encoder_checkpoint
         from encoder.observation_spec import ENCODER_IN_DIM, NormStats
 
+        # The real trainer's helper: the marker must match this build's actor frame, or
+        # train.py's guard refuses the encoder (which is the point of the guard).
+        from encoder.train_encoder import current_frame_mode
+
         # A synthetic encoder. Random weights are fine: this checks wiring, not capability.
         model = EncoderWithHead(n_targets=29, f_in=ENCODER_IN_DIM, width=48, z_dim=T.Z_DIM)
         norm = NormStats(
@@ -51,16 +55,21 @@ def main() -> int:
             clip=10.0,
             degenerate_dims=[],
         )
-        save_encoder_checkpoint(SMOKE_CKPT, model, norm)
+        save_encoder_checkpoint(SMOKE_CKPT, model, norm,
+                                extra={"frame_mode": current_frame_mode()})
         T.ENCODER_CHECKPOINT = SMOKE_CKPT
         print(f"[smoke] synthetic encoder written to {SMOKE_CKPT}")
     except ImportError as exc:
         print(f"[smoke] encoder package unavailable ({exc}); testing the NO-ENCODER path")
 
     # Compress every schedule so a few thousand steps still traverse all of its phases.
+    # The mixture curriculum is compressed too: otherwise its ramp starts at 10M steps and a
+    # smoke run would never exercise the worker RPC push during a real learn() loop.
     T.LR_WARMUP_STEPS = 2048
     T.DR_START_STEPS = 2048
     T.DR_END_STEPS = 6144
+    T.CHAIN_MIX_START_STEPS = 2048
+    T.CHAIN_MIX_END_STEPS = 8192
     T.CHECKPOINT_FREQ = 4096
 
     print("[smoke] calling train(total_timesteps=8192, num_workers=4)")

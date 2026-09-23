@@ -1,0 +1,71 @@
+{
+  "generated": "2026-09-23T10:34:15+00:00",
+  "model": {
+    "path": "quad_flip_model.zip",
+    "sha256": "2742ee506836c512695da444d3ad667798b831c3ab8b102a76beb0d8745e74f8",
+    "actor_dim": 48,
+    "net_arch": {
+      "pi": [
+        128,
+        128
+      ],
+      "vf": [
+        512,
+        256,
+        128
+      ]
+    }
+  },
+  "encoder": {
+    "path": "logs/encoder_gru.pt",
+    "sha256": "fab168c5f8d871c55d3c9bf2d2b6233947de048f11e01238017be7bd4dfd1052",
+    "f_in": 33,
+    "hidden": 48,
+    "z_dim": 16,
+    "checkpoint_config": {
+      "arch": "gru",
+      "f_in": 33,
+      "width": 48,
+      "z_dim": 16,
+      "mode": "self_supervised",
+      "param_count": 38657,
+      "state_dim": 17,
+      "action_dim": 4,
+      "hidden_dim": 128
+    }
+  },
+  "vecnormalize": {
+    "file": "quad_flip_model_vecnormalize.pkl",
+    "error": "spaces must have the same shape: (96,) != (48,)"
+  },
+  "env_constants": {
+    "sim_dt": 0.01,
+    "action_ema_alpha": 0.8,
+    "actor_total_dim": 29,
+    "encoder_aux_dim": 4,
+    "max_rate_xy": 20.0,
+    "max_rate_pitch": 20.0,
+    "max_rate_z": 4.0,
+    "max_thrust_n": 0.6,
+    "mass_kg": 0.033,
+    "gravity": 9.81,
+    "hover_trim_a0": 0.07910000000000017,
+    "_model_name": "quad_flip_model.zip",
+    "_encoder_name": "encoder_gru.pt"
+  },
+  "weights_sha256": "1549104d690605d33235975d011025a08537d6541d97e2856a0cccd89f53947c",
+  "verify": {
+    "ok": true,
+    "frames": 3000,
+    "source": "shard_w00_0000.npz:frames",
+    "z_tol": 2e-05,
+    "action_tol": 1e-05,
+    "max_z_err": 3.8743019104003906e-07,
+    "max_z_err_step": 648,
+    "max_action_err": 5.364418029785156e-07,
+    "max_action_err_step": 331,
+    "max_action_err_torch_z": 4.76837158203125e-07,
+    "dist": "DiagGaussianDistribution",
+    "squash_output": false
+  }
+}
