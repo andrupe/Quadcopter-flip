@@ -220,6 +220,9 @@ def train(
     load_previous_model: bool = LOAD_PREVIOUS_MODEL,
     previous_model_path: Optional[str] = PREVIOUS_MODEL_PATH,
     random_initial_state: bool = RANDOM_INITIAL_STATE,
+    obs_noise: bool = True,
+    random_wind: bool = True,
+    shaped_reward: bool = False,
 ):
     """Main training loop using Stable-Baselines3 PPO."""
     torch.set_num_threads(1)
@@ -241,18 +244,32 @@ def train(
 
     anneal_steps = (DR_END_STEPS - DR_START_STEPS) if DR_ENABLED else 10_000_000
 
+    # Σημείωση: τα obs_noise / random_wind είναι ορίσματα της train() (όχι module
+    # globals) ώστε να περνούν ως closure μέσω cloudpickle στους subprocess workers.
     def make_env():
-        return QuadFlipEnv(
+        env = QuadFlipEnv(
             action_mode=ACTION_MODE,
             episode_seconds=EPISODE_SECONDS,
             target_altitude=TARGET_ALTITUDE,
             spawn_altitude=SPAWN_ALTITUDE,
             random_initial_state=random_initial_state,
+            obs_noise=obs_noise,
+            random_wind=random_wind,
         )
+        if shaped_reward:
+            # Πειραματικός σχηματισμός reward. Το quad_flip_env.py μένει ανέπαφο·
+            # η αξιολόγηση γίνεται πάντα στο ΑΡΧΙΚΟ env, χωρίς τον wrapper.
+            from reward_shaping import ShapedFlipReward
+            env = ShapedFlipReward(env)
+        return env
 
     vec_env = make_vec_env(make_env, n_envs=num_workers, vec_env_cls=SubprocVecEnv)
     stats_path = os.path.join(_PROJECT_ROOT, f"{model_name}_vecnormalize.pkl")
-    save_dir = os.path.join(_PROJECT_ROOT, "logs")
+    # Ξεχωριστός φάκελος ανά μοντέλο: δύο τρεξίματα που καλύπτουν το ίδιο εύρος
+    # βημάτων (π.χ. ablation 15M->20M δίπλα σε ένα προηγούμενο 15M->20M) αλλιώς
+    # γράφουν το ένα πάνω στο άλλο, γιατί τα checkpoints ονομάζονται μόνο από
+    # τον αριθμό βημάτων.
+    save_dir = os.path.join(_PROJECT_ROOT, "logs", model_name)
     os.makedirs(save_dir, exist_ok=True)
 
     initial_steps = 0
@@ -321,6 +338,11 @@ def train(
 
         model.lr_schedule = ft_schedule
         model._custom_objects = {"learning_rate": ft_schedule, "lr_schedule": ft_schedule}
+
+        # Το ent_coef αγνοούνταν στη συνέχεια εκπαίδευσης (ερχόταν από το checkpoint).
+        # Με υψηλό ent_coef η πολιτική μένει διάχυτη (std ~0.63 σε χώρο [-1,1]) και
+        # η ντετερμινιστική αξιολόγηση καταρρέει, οπότε πρέπει να μπορεί να αλλάξει.
+        model.ent_coef = float(ent_coef)
     else:
         # Fresh training: 3-phase piecewise schedule synchronized with ADR curriculum
         lr_schedule = PiecewiseLinearSchedule(

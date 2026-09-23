@@ -55,3 +55,36 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
+
+# ======================================================================
+# Προσθήκες για την εργασία Intelligent Control 2025-2026
+# ======================================================================
+
+# Checkpoints εκπαίδευσης: ~510 MB, 404 αρχεία. ΔΕΝ πάνε σε git.
+# Αναπαράγονται τρέχοντας ξανά την εκπαίδευση.
+logs/
+
+MUJOCO_LOG.TXT
+
+# ΠΡΟΣΟΧΗ: ο κανόνας *.zip παραπάνω αποκλείει ΚΑΙ τα εκπαιδευμένα
+# μοντέλα. Τα εξαιρούμε ρητά - χωρίς αυτά ο ελεγκτής δεν τρέχει.
+!ppo_final.zip
+!ppo_shaped_best.zip
+!ppo_adr_best.zip
+!ppo_adr_robust.zip
+!ppo_control_best.zip
+!ppo_best.zip
+
+# Τα .pkl με τις στατιστικές VecNormalize είναι ΑΠΑΡΑΙΤΗΤΑ μαζί με κάθε
+# μοντέλο. Χωρίς αυτά η πολιτική δέχεται παρατηρήσεις σε λάθος κλίμακα.
+!*_vecnormalize.pkl
+
+
+# Bundles: διπλα αρχεια που ηδη υπαρχουν ξεχωριστα στο repo
+models.zip
+report_bundle.zip
+anafora.zip
+controllers/PPO/models.zip
+controllers/PPO/anafora.zip
+*.mangled_backup
+
