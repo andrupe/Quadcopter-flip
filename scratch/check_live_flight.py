@@ -69,7 +69,9 @@ RAW_UP = -1.0
 section("A. HumanTarget: the pilot as a trajectory generator")
 # ======================================================================================
 g = 9.81
-m = 0.028
+# The reference's own nominal mass, NOT a literal: it was hardcoded 0.028 and went stale
+# the moment the plant changed to 0.033, which made this check fail forever after.
+from trajectories import MASS_NOMINAL as m  # noqa: E402
 target = HumanTarget(np.array([0.0, 0.0, 1.2]), yaw0=0.0)
 
 # hover: no command, the reference must not move at all

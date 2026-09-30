@@ -59,19 +59,30 @@ HOW TO RUN
 ----------
     .venv/bin/python Simulation/live_flight.py            (VS Code: click Run)
 
-The panel opens in its own process (tkinter cannot own a window under mjpython). Keys in
-the 3D window: 1 MANUAL-acro, 2 MANUAL-assisted, 3 POLICY(human); 4 hover-hold, 5 flip,
-6 orbit, 7 figure-8, 8 lissajous, 9 slalom, 0 waypoints; ENTER respawn; ESC quit. Pad:
-`-` hand over / take back, `+` hover now, X match velocity (manual) / hover (policy),
-bottom face button level/hover, B respawn.
+The panel opens in its own process (tkinter cannot own a window under mjpython). The
+KEYBOARD is laid out like the real-flight program (`deploy/radio_flight.py`), so the same
+muscle memory works in both:
+
+    h          HOVER: hand over to the policy (it holds position). In policy: hover now.
+    w / s      climb / descend (latched, one step per press; the HUD shows the command)
+    0..5       manoeuvres under the REAL-FLIGHT indices - 0 flip, 1 orbit, 2 figure-8,
+               3 lissajous, 4 slalom, 5 waypoints (sim extras: 6 v8, 7 chain)
+    .          stop and hold (release the trajectory / clear the commands)
+    i / k      forward / back      a / d  left / right      q / e  yaw
+    space / x  clear the commands (hover now)      m  manual control / cycle the set
+    ENTER      respawn                              ESC quit
+
+Pad: `-` hand over / take back, `+` hover now, X match velocity (manual) / hover
+(policy), bottom face button level/hover, B respawn.
 
 WHERE THE FLIGHT STARTS
 -----------------------
 On the FLOOR, resting on its landing legs, the way a real quad waits for its pilot - the
 floor is a RUNWAY until the vehicle has climbed above `LiveFlightEnv.GROUND_RELEASE_Z`
 (0.20 m) for the first time, and a crash surface after that. So the flight begins at the
-bottom: spool up and take off (GAME mode: hold ZR; ACRO: SPACE/R raises the collective),
-then hand over to the policy whenever you are airborne.
+bottom: take off in a manual mode (GAME: hold ZR; ACRO: SPACE/R raises the collective),
+OR just press `h` - the policy takes the hover and climbs out by itself; `w` climbs
+further once it is in the air.
 
 The pose is tweakable - `START_POS` / `START_YAW_DEG` in the config block, or:
 
@@ -209,17 +220,37 @@ PAD_BTN_CLIMB = mf.PAD_BTN_CLIMB          # ZR: climb
 PAD_BTN_DESCEND = mf.PAD_BTN_DESCEND      # ZL: descend
 PAD_BTN_FLIP = mf.PAD_BTN_FLIP            # top-right shoulder: flip (GAME mode)
 
-# Policy-mode keyboard, for flying without a pad. The viewer reports presses only (no
-# key-up), so these are LATCHED like every other keyboard channel in this project:
-# W/S = fwd +-0.5 m/s, A/D = left/right +-0.5, R/F = up/down +-0.5, Q/E = yaw +-0.25 rad/s,
-# SPACE = clear everything (hover). The commanded speed is shown in the HUD.
-POLICY_KEY_V_STEP: float = 0.5        # m/s per press
+# Keyboard, laid out to MATCH THE REAL-FLIGHT PROGRAM (deploy/radio_flight.py) so the
+# muscle memory transfers: `w` climbs, `h` hands over to the policy, and the NUMBER keys
+# launch manoeuvres under the SAME index the firmware's baked tables use
+# (`REF_KIND_*`: 0 = flip, 1 = orbit, ...). The viewer reports presses only (no key-up),
+# so every channel is LATCHED like the rest of this project; the HUD shows the commands.
+#
+#   h            HOVER: hand over to the policy (it holds position); in policy = hover now
+#   w / s        climb / descend (latched, +-POLICY_KEY_V_STEP per press)
+#   0..5         manoeuvres, real-flight indices: 0 flip, 1 orbit, 2 figure8, 3 lissajous,
+#                4 slalom, 5 waypoints (+ sim extras 6 = v8, 7 = chain)
+#   .            stop and hold (release the trajectory / clear the commands)
+#   i / k        forward / back    a / d left / right    q / e yaw left / right
+#   space / x    clear the commands (hover now)
+#   m            take back manual control / cycle the manual set (game -> acro -> assisted)
+#   ENTER        respawn                                  ESC    quit
+POLICY_KEY_V_STEP: float = 0.5        # m/s per press (fwd/strafe and climb)
 POLICY_KEY_YAW_STEP: float = 0.25     # rad/s per press
 
-_KEY_TRAJ = {ord("4"): "hover", ord("5"): "flip", ord("6"): "orbit", ord("7"): "figure8",
-             ord("8"): "lissajous", ord("9"): "slalom", ord("0"): "waypoints"}
-_KEY_MODE = {ord("1"): MODE_MANUAL_GAME, ord("2"): MODE_MANUAL_ACRO,
-             ord("3"): MODE_POLICY_HUMAN}
+# A LATCHED climb is bounded by the reference's altitude: measured in this sim, a
+# reference that keeps climbing past ~1.45 m (vehicle ~1.5 m) leaves the station cone,
+# the estimate falls back to dead reckoning, and the vehicle flies away. The keyboard
+# climb therefore eases into a ceiling (and a floor) instead of commanding a rate forever
+# - which is also what makes `w` usable for a demo: press it, the vehicle climbs, and it
+# STOPS. 1.15 m keeps the vehicle near 1.3 m, inside the band where fixes are continuous.
+POLICY_ALT_MAX: float = 1.15          # m: reference ceiling for the keyboard climb
+POLICY_ALT_MIN: float = 0.25          # m: reference floor
+POLICY_ALT_KP: float = 2.0            # 1/s: how fast the ceiling/floor is approached
+
+_KEY_TRAJ = {ord("0"): "flip", ord("1"): "orbit", ord("2"): "figure8",
+             ord("3"): "lissajous", ord("4"): "slalom", ord("5"): "waypoints",
+             ord("6"): "v8", ord("7"): "chain"}
 
 
 def _resolve_model(name: str) -> str:
@@ -232,13 +263,18 @@ def _resolve_model(name: str) -> str:
     if os.path.isfile(candidate + ".zip"):
         return candidate + ".zip"
     logs = os.path.join(_PROJECT_ROOT, "logs")
-    if name.lower() in ("latest", "auto") and os.path.isdir(logs):
-        zips = [os.path.join(logs, f) for f in os.listdir(logs) if f.endswith(".zip")]
-        if zips:
-            # Prefer the periodic rl_model_<steps>_steps.zip checkpoints when present.
-            preferred = [z for z in zips if os.path.basename(z).startswith("rl_model_")]
-            pool = preferred or zips
-            return max(pool, key=os.path.getmtime)
+    if name.lower() in ("latest", "auto"):
+        # NEWEST .zip wins, exactly like evaluate.py. Preferring rl_model_<steps>_.zip by
+        # NAME meant a freshly trained/exported model (quad_flip_model_extended.zip) was
+        # silently shadowed by a month-old periodic checkpoint - the programs would then
+        # fly different policies for the same "latest".
+        candidates = [os.path.join(_PROJECT_ROOT, "quad_flip_model.zip")]
+        if os.path.isdir(logs):
+            candidates.extend(os.path.join(logs, f) for f in os.listdir(logs)
+                              if f.endswith(".zip"))
+        present = [p for p in candidates if os.path.isfile(p)]
+        if present:
+            return max(present, key=os.path.getmtime)
     return candidate
 
 
@@ -268,6 +304,7 @@ class LiveFlight:
         self.traj_t0 = 0.0
         self.traj_duration = 0.0
         self._key_cmd = np.zeros(4)                 # fwd, left, up, yaw (latched keyboard)
+        self._keys_own_cmd = False                  # True once a key set a policy command
         self._last_cmd = (0.0, 0.0, 0.0, 0.0)       # fwd, left, up, yaw (whatever was set last)
         self._policy_flip_active = False            # the flip button, in POLICY mode
         self._policy_flip_t = 0.0                   # time since it engaged (the pop clock)
@@ -426,6 +463,8 @@ class LiveFlight:
             return
         was_policy = self.mode.startswith("POLICY")
         self._policy_flip_active = False          # never carry a flip across a handover
+        self._key_cmd[:] = 0.0                    # a handover is a new flight: drop the latch
+        self._keys_own_cmd = False
         if mode == MODE_MANUAL_ACRO:
             self.cmd.set_mode(mf.MODE_ACRO)
             self._manual_takeover(was_policy)
@@ -483,6 +522,15 @@ class LiveFlight:
         """Hand the policy a training manoeuvre relocated onto the current hover."""
         if not self.policy_ok:
             self.messages.append("trajectory launch needs a loaded policy")
+            return
+        # The training manoeuvres assume they start from a proper hover; a flip launched
+        # from the landing legs has nowhere to pop. (Measured: from z ~0.3 m the flip's
+        # ballistic coast finds the floor every time.) 0.6 m clears the legs and the pop.
+        if kind != "hover" and float(self.env.quad.pos[2]) < 0.6:
+            self.messages.append(
+                f"too low for a {kind} (z {self.env.quad.pos[2]:.2f} m < 0.60 m) - "
+                "climb first (press w) or press h and let the policy take the hover)"
+            )
             return
         if self.mode != MODE_POLICY_TRAJ and not self.mode.startswith("POLICY"):
             self.enter_mode(MODE_POLICY_HUMAN, announce=False)
@@ -669,30 +717,49 @@ class LiveFlight:
         if pad_deflected:
             self.human.set_command(fwd=fwd, left=left, up=up, yaw_rate=yaw)
             self._last_cmd = (fwd, left, up, yaw)
-        elif bool(np.any(np.abs(self._key_cmd) > 0.0)):
-            self.human.set_command(fwd=float(self._key_cmd[0]), left=float(self._key_cmd[1]),
-                                   up=float(self._key_cmd[2]), yaw_rate=float(self._key_cmd[3]))
-            self._last_cmd = tuple(float(v) for v in self._key_cmd)
+        elif self._keys_own_cmd:
+            # The keyboard owns the command (even when it commands zero: a cleared latch
+            # must actually STOP the vehicle - without this the "external source" branch
+            # below would silently keep flying the last latched climb).
+            fwd = float(self._key_cmd[0])
+            left = float(self._key_cmd[1])
+            up = float(self._key_cmd[2])
+            yaw = float(self._key_cmd[3])
+            z_ref = float(self.human.p_ref[2])
+            if up > 0.0:
+                up = min(up, POLICY_ALT_KP * (POLICY_ALT_MAX - z_ref))
+            elif up < 0.0:
+                up = max(up, POLICY_ALT_KP * (POLICY_ALT_MIN - z_ref))
+            up = float(np.clip(up, -POLICY_STICK_UP, POLICY_STICK_UP))
+            self.human.set_command(fwd=fwd, left=left, up=up, yaw_rate=yaw)
+            self._last_cmd = (fwd, left, up, yaw)
         elif pad is not None and pad.connected:
             self.human.set_command(0.0, 0.0, 0.0, 0.0)
             self._last_cmd = (0.0, 0.0, 0.0, 0.0)
         # else: no input device - leave the command as it is (external source)
 
     def _policy_key(self, key: int) -> bool:
-        """Latched keyboard commands for policy mode. Returns True if consumed."""
+        """Latched keyboard commands for policy mode. Returns True if consumed.
+
+        `w`/`s` own the CLIMB (the real-flight layout); forward/back moved to `i`/`k`.
+        """
         if key == mf.K_SPACE or key == mf.K_X:
             self._key_cmd[:] = 0.0
+            self._keys_own_cmd = True       # own the channel, commanding ZERO (stop)
+            self.human.clear_command()
             self.messages.append("hover: command cleared")
             return True
         step_v = POLICY_KEY_V_STEP
         step_y = POLICY_KEY_YAW_STEP
-        delta = {mf.K_W: (step_v, 0), mf.K_S: (-step_v, 0),
+        delta = {mf.K_I: (step_v, 0), mf.K_K: (-step_v, 0),
                  mf.K_A: (0, step_v), mf.K_D: (0, -step_v)}.get(key)
         if delta is not None:
             self._key_cmd[0] += delta[0]
             self._key_cmd[1] += delta[1]
-        elif key in (mf.K_R, mf.K_F):
-            self._key_cmd[2] += step_v if key == mf.K_R else -step_v
+        elif key in (mf.K_W, mf.K_R):
+            self._key_cmd[2] += step_v          # w = climb (real-flight key)
+        elif key in (mf.K_S, mf.K_F):
+            self._key_cmd[2] -= step_v          # s = descend
         elif key in (mf.K_Q, mf.K_E):
             # The command is a rotation rate about z, where POSITIVE is a left turn
             # (the project's convention), so "turn right" is negative.
@@ -704,6 +771,7 @@ class LiveFlight:
         self._key_cmd[1] = float(np.clip(self._key_cmd[1], -POLICY_STICK_V, POLICY_STICK_V))
         self._key_cmd[2] = float(np.clip(self._key_cmd[2], -POLICY_STICK_UP, POLICY_STICK_UP))
         self._key_cmd[3] = float(np.clip(self._key_cmd[3], -POLICY_STICK_YAW, POLICY_STICK_YAW))
+        self._keys_own_cmd = True
         self.messages.append(f"command fwd {self._key_cmd[0]:+.1f} left {self._key_cmd[1]:+.1f} "
                              f"up {self._key_cmd[2]:+.1f} yaw {self._key_cmd[3]:+.2f}")
         return True
@@ -749,15 +817,7 @@ class LiveFlight:
         if PAD_BTN_MODE_ALT in pressed:                 # '-' : take back control
             self.enter_mode(MODE_MANUAL_ACRO)
         if PAD_BTN_MODE in pressed or PAD_BTN_MATCH in pressed:
-            if self.mode == MODE_POLICY_TRAJ:
-                self.human.sync_to_reference(self.env.ref)
-                self.env.set_external_reference(self.human)
-                self.mode = MODE_POLICY_HUMAN
-                self.messages.append("trajectory released - holding a hover")
-            else:
-                self.human.clear_command()
-                self._key_cmd[:] = 0.0
-                self.messages.append("hover: commands cleared")
+            self.stop_and_hold()
         if PAD_BTN_RESPAWN in pressed:
             self.respawn()
 
@@ -770,11 +830,20 @@ class LiveFlight:
         if key == mf.K_ENTER:
             self.respawn()
             return
-        if key in _KEY_MODE:
-            self.enter_mode(_KEY_MODE[key])
-            return
         if key in _KEY_TRAJ:
             self.launch_trajectory(_KEY_TRAJ[key])
+            return
+        if key in (ord("H"), ord("h")):               # h = HOVER (hand to the policy)
+            self.hover_handover()
+            return
+        if key in (ord("M"), ord("m")):               # m = manual / next manual set
+            self.manual_takeback()
+            return
+        if key == ord("."):                            # . = stop and hold (real flight)
+            if self.mode.startswith("POLICY"):
+                self.stop_and_hold()
+            else:
+                self.messages.append("manual mode - press h to hand over to the policy")
             return
         if self.mode.startswith("MANUAL"):
             line = self.cmd.handle_key(key)
@@ -782,6 +851,44 @@ class LiveFlight:
                 self.messages.append(line)
         else:
             self._policy_key(key)
+
+    # -- keyboard mode commands (the real-flight set) --------------------------------------
+    def hover_handover(self) -> None:
+        """`h` - the real-flight HOVER key: hand control to the policy (it holds position).
+
+        In a manual mode this is the handover; already in policy it means "hover HERE" -
+        drop any trajectory and centre every command, i.e. the same thing the pad's `+`
+        button does.
+        """
+        if self.mode.startswith("POLICY"):
+            self.stop_and_hold()
+            return
+        if not self.policy_ok:
+            self.messages.append("no policy loaded - staying manual")
+            return
+        self.enter_mode(MODE_POLICY_HUMAN)
+
+    def manual_takeback(self) -> None:
+        """`m` - the real flight's 'back to stock': take the sticks, cycle the manual set."""
+        if self.mode.startswith("MANUAL"):
+            order = [MODE_MANUAL_GAME, MODE_MANUAL_ACRO, MODE_MANUAL_ASSISTED]
+            idx = order.index(self.mode) if self.mode in order else 0
+            self.enter_mode(order[(idx + 1) % len(order)])
+        else:
+            self.enter_mode(MODE_MANUAL_ACRO)
+
+    def stop_and_hold(self) -> None:
+        """`. ` - stop the manoeuvre and hold a hover where it is (or hover now)."""
+        if self.mode == MODE_POLICY_TRAJ:
+            self.human.sync_to_reference(self.env.ref)
+            self.env.set_external_reference(self.human)
+            self.mode = MODE_POLICY_HUMAN
+            self.messages.append("trajectory released - holding a hover")
+        else:
+            self.human.clear_command()
+            self._key_cmd[:] = 0.0
+            self._keys_own_cmd = True
+            self.messages.append("hover: commands cleared")
 
     # -- panel commands ------------------------------------------------------------------
     def handle_gui(self, command: str) -> None:
@@ -849,6 +956,7 @@ class LiveFlight:
         self.cmd.game_flip = False
         self.cmd.throttle = self.ctrl.hover_throttle
         self._key_cmd[:] = 0.0
+        self._keys_own_cmd = False
         self.crashed = False
 
         if self.actor_input is not None:
@@ -877,7 +985,7 @@ class LiveFlight:
             head = f"POLICY - executing {self.traj_kind or '?'}  ({left:4.1f} s left)"
             sub = f"ref z {ref.p[2]:.2f} m  err {ref_err:.2f} m  thrust {100 * self.last_thrust / q.params['maxThr']:3.0f}%"
         elif self.mode == MODE_POLICY_HUMAN:
-            head = "POLICY - tracking your sticks (left = movement, right X = heading, ZL/ZR = altitude)"
+            head = "POLICY - holding your commands (w/s climb, i/k fwd, a/d strafe, q/e yaw)"
             c = self._last_cmd
             sub = (f"cmd fwd {c[0]:+4.1f} left {c[1]:+4.1f} up {c[2]:+4.1f} yaw {c[3]:+4.2f} | "
                    f"ref err {ref_err:.2f} m  thrust {100 * self.last_thrust / q.params['maxThr']:3.0f}%")
@@ -887,13 +995,13 @@ class LiveFlight:
         live = (f"t {self.env.t:6.1f}s  z {q.pos[2]:5.2f} m  speed {float(np.linalg.norm(q.vel)):5.2f} m/s  "
                 f"tilt {tilt:4.0f} deg  [{self.env.quad.pos[0]:+.2f} {self.env.quad.pos[1]:+.2f}]")
         health = (f"policy {'ON' if self.policy_ok else 'off'} (encoder {'on' if self.encoder_on else 'off'})  "
-                  f"link {self.link.name}  1/2/3 modes  4-0 trajectories  ENTER respawn  ESC quit")
-        help_left = ("PAD: - hand over/take back   + hover now   "
-                     "GAME mode: top-right shoulder = FLIP while held")
+                  f"link {self.link.name}  h hover  w/s climb  0 flip 1 orbit 2 fig8  . hold  m manual  ESC quit")
         if self.pad_state is not None and self.pad_state.connected:
-            pad_line = (f"PAD {self.pad_state.name[:30]}  {self.mapper.calibration_report()}")
+            pad_line = (f"PAD {self.pad_state.name[:30]}  {self.mapper.calibration_report()}"
+                        "  |  keys: h hover  w/s climb  0..7 manoeuvres  . hold")
         else:
-            pad_line = "PAD none - keyboard only"
+            pad_line = ("no pad - keys: h hover  w/s climb  i/k fwd  a/d strafe  q/e yaw  "
+                        "0 flip 1 orbit 2 figure8  . hold  m manual")
         texts = [
             (mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_TOPLEFT, head, sub),
             (mujoco.mjtFontScale.mjFONTSCALE_100, mujoco.mjtGridPos.mjGRID_TOPRIGHT, live, health),
@@ -953,7 +1061,12 @@ class LiveFlight:
                 print(f"Note: could not launch the viewer ({exc}); running headless.")
                 self.viewer = None
 
-        print("\nLive flight running. 1/2/3 = modes, 4-0 = trajectories, ENTER = respawn, ESC = quit.")
+        print("\nLive flight running - keys (same layout as the real-flight program):")
+        print("  h     = HOVER: hand over to the policy (it holds position)")
+        print(f"  w / s = climb / descend, {POLICY_KEY_V_STEP:.1f} m/s per press (latched)")
+        print("  0 flip | 1 orbit | 2 figure8 | 3 lissajous | 4 slalom | 5 waypoints")
+        print("  .     = stop and hold      i/k = fwd/back   a/d = strafe   q/e = yaw")
+        print("  m     = manual control (cycles the manual set)   ENTER = respawn   ESC = quit")
         for m in self.messages:
             print(f"  {m}")
         self.messages.clear()

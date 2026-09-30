@@ -1,16 +1,15 @@
-# Compiled source #
-###################
+# Compiled source & object files
 *.com
 *.class
 *.dll
 *.exe
 *.o
 *.so
+*.cmd
+.*.cmd
+build/
 
-# Packages #
-############
-# it's better to unpack these files and commit the raw source
-# git has its own built in compression methods
+# Packages & archives
 *.7z
 *.dmg
 *.gz
@@ -20,18 +19,16 @@
 *.tar
 *.zip
 
-# Logs and databases #
-######################
+# Logs and databases
 *.log
 *.sql
 *.sqlite
 
-# Data files #
-##############
+# Data files & checkpoints
 *.npz
+*.pkl.bak
 
-# Applications #
-################
+# Applications & IDE
 .vscode/
 .idea/
 __pycache__/
@@ -39,8 +36,7 @@ __pycache__/
 *$py.class
 Gifs/Raw/
 
-# Environments #
-################
+# Environments
 .env
 .venv
 .venv-client
@@ -50,8 +46,7 @@ ENV/
 env.bak/
 venv.bak/
 
-# OS generated files #
-######################
+# OS generated files
 .DS_Store
 .DS_Store?
 ._*
@@ -60,41 +55,79 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
-# Deployment #
-##############
-# The Bitcraze firmware clone lives here (build from it, never commit it).
+# LaTeX intermediate build files
+*.aux
+*.nav
+*.out
+*.snm
+*.toc
+*.bbl
+*.blg
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+
+# Temporary slide previews & check images (actual figures live in figures/)
+presentation/*.png
+scratch/pdf_pages/
+
+# AI scratch / planning files & testing documents
+.github/
+PROPOSED_CHANGES.md
+*QUESTIONNAIRE*
+RETRAIN_AUDIT.txt
+
+# Scratch and intermediate testing directories
+scratch/
+Simulation/scratch/
+
+# Legacy simulation archive & experiments
+Simulation/quad_mjx_legacy_20260923/
+
+# Raw camera images & personal CV at root (processed figures live in figures/)
+IMG_*.jpg
+cv_andreas.pdf
+
+# Legacy flight logs, smoke test directories & intermediate checkpoints
+logs/*.legacy.csv
+logs/flight_logs/
+logs/smoke_generated/
+logs/rl_model_*_steps_vecnormalize.pkl
+logs/*_extended.csv
+logs/*_ft*.csv
+logs/*_prod*.csv
+logs/*_smoke*.csv
+logs/*_val.csv
+
+# Deployment
 firmware/
-# Build artifacts of the out-of-tree policy-controller app.
 Simulation/deploy/app_policy_controller/build/
-# Generated C arrays (reproducible: run Simulation/deploy/export_policy.py and
-# Simulation/deploy/gen_flip_reference.py; the manifests under Simulation/deploy/manifests/
-# record which checkpoint/seed produced the flashed firmware).
 Simulation/deploy/app_policy_controller/src/generated/policy_weights.c
 Simulation/deploy/app_policy_controller/src/generated/policy_weights.h
 Simulation/deploy/app_policy_controller/src/generated/reference_tables.c
 Simulation/deploy/app_policy_controller/src/generated/reference_tables.h
-# The ST Edge AI generated network, copied in by Simulation/deploy/install_stedgeai.py
-# (reproducible: run `stedgeai generate` on models/policy_step_stedgeai.onnx).
 Simulation/deploy/app_policy_controller/src/generated/stedgeai/network.c
 Simulation/deploy/app_policy_controller/src/generated/stedgeai/network.h
 Simulation/deploy/app_policy_controller/src/generated/stedgeai/network_data.c
 Simulation/deploy/app_policy_controller/src/generated/stedgeai/network_data.h
 Simulation/deploy/app_policy_controller/src/generated/stedgeai/network_details.h
-# ST Edge AI Core intermediate output (the tool writes these relative to the CWD;
-# `stedgeai analyze/generate --output ...` produces them fresh, so never commit).
-st_ai_output/
-st_ai_ws/
-# ST Edge AI generated network sources (reproducible: run `stedgeai generate` on
-# Simulation/deploy/models/policy_step_stedgeai.onnx, see Simulation/deploy/README.md).
-Simulation/deploy/stedgeai_out/
 
 st_ai_output/
 st_ai_ws/
+Simulation/deploy/stedgeai_out/
 Simulation/deploy/st_ai_ws/
 Simulation/deploy/st_ai_validate/
-# Bench capture output (Simulation/deploy/bench_bringup.py) + the cflib param cache.
+
+# Bench capture output & radio log
 logs/bench_shadow.csv
 logs/radio_flight_log.csv
 logs/lighthouse_log.csv
 logs/drone_uri.txt
 .cf_cache/
+
+# Large raw recordings & obsolete binary assets (>100MB / non-repo)
+*.mov
+movie.mp4
+*Technical Challenges*
+presentation_keynote.key
+AI_Hub_2026_Submission_Quadcopter_Flip.zip

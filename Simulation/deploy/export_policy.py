@@ -69,6 +69,7 @@ from encoder.history_encoder import load_encoder_checkpoint  # noqa: E402
 from encoder.observation_spec import ACTOR_FRAME_DIM, AUX_DIM, ENCODER_IN_DIM  # noqa: E402
 from quad_flip_env import (  # noqa: E402
     ACTION_EMA_ALPHA,
+    ACTION_MAX_DELTA,
     ACTOR_FRAME_MODE,
     ACTOR_TOTAL_DIM,
     ANCHOR_ACTOR_XY,
@@ -202,6 +203,7 @@ def extract_env_constants() -> Dict[str, float]:
     return {
         "sim_dt": float(SIM_DT),
         "action_ema_alpha": float(ACTION_EMA_ALPHA),
+        "action_max_delta": float(ACTION_MAX_DELTA),
         "actor_total_dim": int(ACTOR_TOTAL_DIM),
         "encoder_aux_dim": int(ENCODER_AUX_DIM),
         "max_rate_xy": float(env.max_rate_xy),
@@ -469,6 +471,7 @@ def emit_c(out_dir: str, act: Dict[str, np.ndarray], enc: Dict[str, Any],
         "// sim constants the firmware must mirror (recorded at export time)",
         "#define POLICY_SIM_DT " + _fmt(consts["sim_dt"]),
         "#define POLICY_ACTION_EMA_ALPHA " + _fmt(consts["action_ema_alpha"]),
+        "#define POLICY_ACTION_MAX_DELTA " + _fmt(consts["action_max_delta"]),
         "#define POLICY_RATE_SCALE_RP " + _fmt(consts["max_rate_xy"]),
         "#define POLICY_RATE_SCALE_PITCH " + _fmt(consts["max_rate_pitch"]),
         "#define POLICY_RATE_SCALE_YAW " + _fmt(consts["max_rate_z"]),
@@ -592,6 +595,39 @@ def vecnormalize_report(model_path: str, actor_dim: int) -> Dict[str, Any]:
 # ======================================================================================
 # main
 # ======================================================================================
+def warn_if_stale(model_path: str) -> None:
+    """
+    Shout if newer MJX weights exist than the checkpoint being exported.
+
+    The default `--model latest` resolves to the newest `logs/rl_model_*.zip`, which is an
+    SB3-path artifact.  After an MJX run (`run_pipeline_mjx.sh`) the real weights live in
+    `logs/quad_mjx_policy.npz` and only reach a zip via `Simulation/export_to_sb3.py`.  So
+    the default can silently export the PREVIOUS policy into the firmware -- which builds
+    cleanly, verifies cleanly, and flies the wrong thing.  This is a warning rather than a
+    hard error because exporting an old checkpoint on purpose is legitimate.
+    """
+    logs = os.path.join(_PROJECT_ROOT, "logs")
+    if not os.path.isdir(logs):
+        return
+    npz = [os.path.join(logs, f) for f in os.listdir(logs)
+           if f.startswith("quad_mjx_policy") and f.endswith(".npz")]
+    if not npz:
+        return
+    newest = max(npz, key=os.path.getmtime)
+    if os.path.getmtime(newest) > os.path.getmtime(model_path) + 1.0:
+        print()
+        print("!" * 71)
+        print("  WARNING: exporting a STALE checkpoint.")
+        print(f"    exporting : {os.path.relpath(model_path, _PROJECT_ROOT)}")
+        print(f"    newer MJX : {os.path.relpath(newest, _PROJECT_ROOT)}")
+        print("  Convert it first, then re-run with the converted zip:")
+        print("    .venv/bin/python Simulation/export_to_sb3.py \\")
+        print(f"        --weights {os.path.relpath(newest, _PROJECT_ROOT)} \\")
+        print("        --output quad_flip_model.zip --verify")
+        print("!" * 71)
+        print()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Export the trained policy to C for the Crazyflie")
     ap.add_argument("--model", default="latest", help="checkpoint path/name (default: latest rl_model_*)")
@@ -605,6 +641,7 @@ def main() -> int:
     model_path = resolve_model(args.model)
     print(f"model   : {model_path}")
     print(f"encoder : {args.encoder}")
+    warn_if_stale(model_path)
 
     actor_dim, net_arch = read_checkpoint_arch(model_path)
     if actor_dim is None:

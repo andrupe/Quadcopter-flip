@@ -195,6 +195,97 @@ class EncoderWithHead(nn.Module):
         return logvar.clamp(self.var_min, self.var_max)
 
 
+# ---------------------------------------------------------------------------------
+# Attitude algebra: relative rotations, NOT component-wise differences
+# ---------------------------------------------------------------------------------
+# The state carries attitude as a unit quaternion. The original dynamics target was a plain
+# component-wise difference s[t+1] - s[t], which is not an attitude increment: q and -q are
+# the SAME rotation, so whenever the quaternion crosses the hemisphere boundary it jumps to
+# the antipode and its 4-vector difference is ~2x the quaternion instead of ~0.
+#
+# Measured on logs/encoder_data (2026-09-24): 556 of 80,003 consecutive pairs (0.695%) had
+# dot(q_t, q_{t+1}) < 0, i.e. an apparent rotation of more than 180 deg at a sample rate
+# where the body rate is capped at 40 rad/s (~0.4 rad/step at most). Those 556 pairs were
+# 0.7% of the data but carried 83% of var(delta_q) (sigma 0.704 vs 0.027 for the rest).
+#
+# quad_flip_env.py hit the same wall and answered it in _attitude_error_rotvec: "A rotation
+# vector is used rather than a quaternion because it is 3-dimensional and has no
+# double-cover sign ambiguity, which a flip would otherwise run straight into."
+#
+# Same answer here, adapted so the 4-dim layout and the observation contract are untouched:
+# the increment is the RELATIVE ROTATION q_t^-1 (x) q_{t+1}, re-signed to the short arc
+# (w >= 0) so the two representations of one rotation can never disagree. It is a unit
+# quaternion, so it integrates by COMPOSITION (q <- q (x) dq) and stays on the sphere; it is
+# continuous through the boundary; and unlike a rotation vector it has no singularity at
+# 180 deg, which matters for the multi-step targets where a flip spans most of a half-turn.
+#
+# The dynamics head is discarded at deployment (only z ships), so this is training-side only:
+# no observation contract, export chain, or firmware change.
+_QUAT_CONJ = torch.tensor([1.0, -1.0, -1.0, -1.0])
+# Quaternion block within the PHYS_STATE layout: pos 0:3, QUAT 3:7, omega 7:10, vel 10:13,
+# spec_force 13:16, v_batt 16:17. These are PHYS_STATE coordinates, not frame coordinates.
+_STATE_QUAT_SLICE = (3, 7)
+
+
+def _quat_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Batched Hamilton product, w-first. [..., 4] x [..., 4] -> [..., 4]."""
+    aw, ax, ay, az = a.unbind(-1)
+    bw, bx, by, bz = b.unbind(-1)
+    return torch.stack(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ],
+        dim=-1,
+    )
+
+
+def _quat_conj(q: torch.Tensor) -> torch.Tensor:
+    return q * _QUAT_CONJ.to(dtype=q.dtype, device=q.device)
+
+
+def _quat_normalize(q: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    return q / q.norm(dim=-1, keepdim=True).clamp_min(eps)
+
+
+def short_arc(q: torch.Tensor) -> torch.Tensor:
+    """Pick the representative with w >= 0, so q and -q can never disagree."""
+    return torch.where(q[..., :1] < 0, -q, q)
+
+
+def attitude_increment(q_a: torch.Tensor, q_b: torch.Tensor) -> torch.Tensor:
+    """Relative rotation q_a^-1 (x) q_b on the short arc. [..., 4] x [..., 4] -> [..., 4]."""
+    return short_arc(_quat_mul(_quat_conj(_quat_normalize(q_a)), _quat_normalize(q_b)))
+
+
+def state_increment(s_a: torch.Tensor, s_b: torch.Tensor) -> torch.Tensor:
+    """
+    Physical-dynamics increment s_b - s_a, with attitude as a RELATIVE ROTATION.
+
+    Additive on every channel except the quaternion block, which uses attitude_increment().
+    Use this for the supervised targets and for delta_std; step_state() is its exact inverse
+    and is what integrates a predicted increment forward.
+    """
+    a, b = _STATE_QUAT_SLICE
+    inc = torch.empty_like(s_b)
+    inc[..., :a] = s_b[..., :a] - s_a[..., :a]
+    inc[..., b:] = s_b[..., b:] - s_a[..., b:]
+    inc[..., a:b] = attitude_increment(s_a[..., a:b], s_b[..., a:b])
+    return inc
+
+
+def step_state(s_curr: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+    """Integrate one increment: additive channels add, the attitude COMPOSES and renormalizes."""
+    a, b = _STATE_QUAT_SLICE
+    out = torch.empty_like(s_curr)
+    out[..., :a] = s_curr[..., :a] + delta[..., :a]
+    out[..., b:] = s_curr[..., b:] + delta[..., b:]
+    out[..., a:b] = _quat_normalize(_quat_mul(s_curr[..., a:b], short_arc(delta[..., a:b])))
+    return out
+
+
 class DynamicsPredictorHead(nn.Module):
     """
     MLP that predicts next physical state change Δs_t from (s_t, a_t, z_t).
@@ -295,10 +386,15 @@ class EncoderWithDynamicsHead(nn.Module):
             s_true: [B, T, state_dim] true physical states
             a_true: [B, T-1, action_dim] applied actions (a_true[:, t] applied at t produces step t+1)
             horizon: K steps ahead to unroll (K >= 1)
+        Every returned tensor is an INCREMENT (state_increment from the window start), not an
+        absolute state, and its attitude slots are the relative rotation q_start^-1 (x) q.
+        That makes the prediction and the target the same physical quantity at every horizon,
+        and it removes the quaternion double cover from both sides.
+
         Returns:
             z: [B, T, z_dim]
-            pred_states: list of K tensors, each [B, T-K, state_dim]
-            target_states: list of K tensors, each [B, T-K, state_dim]
+            pred_increments: list of K tensors, each [B, T-K, state_dim]
+            target_increments: list of K tensors, each [B, T-K, state_dim]
         """
         z = self.forward_sequence(x)  # [B, T, z_dim]
         B, T, _ = x.shape
@@ -308,7 +404,8 @@ class EncoderWithDynamicsHead(nn.Module):
 
         T_eff = T - K
         z_init = z[:, :T_eff]         # [B, T_eff, z_dim]
-        s_curr = s_true[:, :T_eff]    # [B, T_eff, state_dim]
+        s_start = s_true[:, :T_eff]   # [B, T_eff, state_dim]
+        s_curr = s_start
 
         preds: List[torch.Tensor] = []
         targets: List[torch.Tensor] = []
@@ -317,9 +414,12 @@ class EncoderWithDynamicsHead(nn.Module):
             a_k = a_true[:, k:k + T_eff]               # [B, T_eff, action_dim]
             target_k = s_true[:, k + 1:k + 1 + T_eff]  # [B, T_eff, state_dim]
             delta_k = self.dynamics_head(s_curr, a_k, z_init)
-            s_curr = s_curr + delta_k
-            preds.append(s_curr)
-            targets.append(target_k)
+            # Integrate one step (attitude COMPOSES, it cannot be added), then report the
+            # total increment from the window start so it is directly comparable to
+            # state_increment(s_start, truth) below - same definition on both sides.
+            s_curr = step_state(s_curr, delta_k)
+            preds.append(state_increment(s_start, s_curr))
+            targets.append(state_increment(s_start, target_k))
 
         return z, preds, targets
 

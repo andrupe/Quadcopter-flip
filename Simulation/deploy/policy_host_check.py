@@ -108,7 +108,8 @@ def torch_reference(frames: np.ndarray, model_path: str, encoder_path: str,
 def main() -> int:
     ap = argparse.ArgumentParser(description="C vs torch check of the deployed network")
     ap.add_argument("--frames", type=int, default=3000)
-    ap.add_argument("--model", default="latest")
+    default_model = "quad_flip_model.zip" if os.path.isfile(os.path.join(_PROJECT_ROOT, "quad_flip_model.zip")) else "latest"
+    ap.add_argument("--model", default=default_model)
     ap.add_argument("--encoder", default=os.path.join(_PROJECT_ROOT, "logs", "encoder_gru.pt"))
     ap.add_argument("--keep", action="store_true", help="keep the temp dir with the binaries")
     args = ap.parse_args()

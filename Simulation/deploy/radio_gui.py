@@ -103,6 +103,7 @@ class RadioPanel:
                              font=("Courier", 11))
         self.text.pack(fill="both", expand=True, padx=8, pady=4)
 
+        self.root.bind("<Key>", self.on_key)
         self.root.after(50, self.poll_socket)
         self.root.after(200, self.refresh)
 
@@ -209,6 +210,24 @@ class RadioPanel:
             self.conn.config(text=(msg[:80] if msg else f"connected on port {self.port}"),
                              fg="#0a6b0a")
         self.root.after(200, self.refresh)
+
+    def on_key(self, event) -> None:
+        k = event.char.lower() if event.char else ""
+        keysym = event.keysym.lower()
+        if k == "h":
+            self.send("mode:hover")
+        elif k == "d":
+            self.send("mode:stock")
+        elif k == "f":
+            self.send("mode:flip")
+        elif k == "x" or keysym == "escape":
+            self.send("kill")
+        elif k == ".":
+            self.send("hold")
+        elif keysym in ("up", "w"):
+            self.bump(+2)
+        elif keysym in ("down", "s"):
+            self.bump(-2)
 
     def on_close(self) -> None:
         try:

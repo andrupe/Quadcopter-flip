@@ -8,8 +8,17 @@ gymnasium
 stable-baselines3
 
 # Physics Simulation Backend
-mujoco>=3.0.0
+mujoco>=3.14.0
+mujoco-mjx>=3.14.0
 imageio[ffmpeg]
+
+# Vectorized JAX & MJX Simulation Acceleration
+# NOTE: the MJX port needs jax >= 0.4.30 for the constant-shape `lax.while_loop` resampler
+# in quad_mjx/sampler.py; the versions in use here are jax 0.10.2 / flax 0.12.8.
+jax>=0.4.30
+jaxlib>=0.4.30
+flax>=0.8.0
+optax>=0.2.0
 
 # Symbolic multibody dynamics (PyDy reference scripts, optional)
 # pydy

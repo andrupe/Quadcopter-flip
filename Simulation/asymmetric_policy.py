@@ -50,7 +50,7 @@ class AsymmetricMlpExtractor(nn.Module):
         device = get_device(device)
 
         if isinstance(net_arch, dict):
-            pi_layers_dims = net_arch.get("pi", [32])
+            pi_layers_dims = net_arch.get("pi", [32, 32])
             vf_layers_dims = net_arch.get("vf", [512, 256, 128])
         else:
             pi_layers_dims = vf_layers_dims = net_arch
@@ -115,7 +115,7 @@ class AsymmetricActorCriticPolicy(ActorCriticPolicy):
             actor_obs_dim = kwargs.pop("actor_obs_dim", ACTOR_TOTAL_DIM)
         self.actor_obs_dim = int(actor_obs_dim)
         if net_arch is None:
-            net_arch = kwargs.pop("net_arch", dict(pi=[32], vf=[512, 256, 128]))
+            net_arch = kwargs.pop("net_arch", dict(pi=[32, 32], vf=[512, 256, 128]))
 
         super().__init__(
             observation_space=observation_space,

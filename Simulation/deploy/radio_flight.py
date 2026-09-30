@@ -183,6 +183,15 @@ FW_LOG_VARS = [
     # the motors running - i.e. vibration / ESC electrical noise / a sagging 1S rail.
     "lighthouse.cycleRt", "lighthouse.frameRt",
     "lighthouse.preThRt", "lighthouse.postThRt", "lighthouse.disProb",
+    # *** THE FLIP'S OWN STATE. *** These four turn "the flip did not happen" from an
+    # INFERENCE into a MEASUREMENT. `policy.flip_phase` is the app's phase machine
+    # (0 idle / 1 adaptive climb / 2 rotation / 3 recovery), `policy.abort_reason` says WHY
+    # it gave up, `traj_flip.gyro_deg` is the integrated body angle of the rotation (the
+    # firmware's own flip progress, and 0 proves the body never rotated), and
+    # `traj_flip.z_shift` is the catch altitude offset. Without them a flip that launched and
+    # aborted in Phase 1 looks identical to one that never launched at all.
+    "policy.flip_phase", "policy.abort_reason",
+    "traj_flip.gyro_deg", "traj_flip.z_shift",
 ]
 
 # The baked manoeuvres, read from the SAME generated header the firmware was compiled with,
@@ -320,6 +329,17 @@ class RadioFlight:
         self.applied = (0.0, 0.0, 0.0, 0.0)      # what we last sent (for the HUD/log)
         self._thrust_sent = 0.0
         self._killed = False
+        # MOTORS-OFF LATCH AFTER AN APP SELF-DISARM (2026-09-25). While the app is disarmed its
+        # out-of-tree controller is a LIVE PASSTHROUGH to the stock PID on the PILOT's setpoint
+        # (controller_app.c: `controllerPid(control, setpoint, ...)`). That is correct when the
+        # PILOT hands the policy back - but wrong when the APP disarms ITSELF (failsafe
+        # complete, abort), because our own streamed thrust centre then flies the vehicle
+        # again. MEASURED (logs/radio_flight_log.csv, 18:38): the app disarmed at t=9.836 on
+        # the ground and the props sat at 50-65k with the airframe at 82 deg for the rest of
+        # the log - "it will not land". `_thrust_lockout` forces a REAL stop from the moment we
+        # see a disarm we did not ask for, until the pilot explicitly asks for thrust again.
+        self._thrust_lockout = False
+        self._disarm_commanded_at = 0.0          # set by disarm()/kill(); not a fault
         # The FIRMWARE's arming state - a different gate from our app's `armed`. Nothing
         # moves until this is true; see firmware_arm().
         self._motors_ok = False
@@ -387,8 +407,21 @@ class RadioFlight:
         # The firmware's supervisor decides whether motors may run at all, and it is NOT the
         # same gate as our app's `armed` param. Read it out loud: if it is not "Can be armed"
         # then arming will be refused and no amount of thrust will do anything.
+        _startup_bits = int(self.cf.supervisor.read_bitfield())
         print(f"  supervisor  : {self.supervisor_states()}", flush=True)
-        if "Is locked" in self.supervisor_state_names():
+        if not self.supervisor_read_is_trustworthy(_startup_bits):
+            print("  supervisor  : *** NO REPLY FROM THE SUPERVISOR PORT (0x000). A genuine "
+                  "reply can never be zero - `AUTO_ARMING` is 1 here, so bit 2 is always "
+                  "set. The arming flags below are cflib's fallback, not the drone. ***",
+                  flush=True)
+        elif "DECK FAULT" in self.supervisor_state_names(_startup_bits):
+            print("  supervisor  : *** DECK FAULT - a deck reported a hardware fault and "
+                  "this BLOCKS arming. For the Lighthouse deck: bitstream not booted, or "
+                  "no UART frame for 1500 ms. ***", flush=True)
+            print("  supervisor  : the console prints `FPGA not booted. Lighthouse disabled!` "
+                  "and the `LHFL:` bitstream CRC - at boot only. Check it there first.",
+                  flush=True)
+        elif "Is locked" in self.supervisor_state_names(_startup_bits):
             print("  supervisor  : *** LOCKED - POWER-CYCLE THE DRONE BEFORE GOING FURTHER. ***",
                   flush=True)
             print("  supervisor  : Locked has NO software exit (the transitionsLocked table in "
@@ -430,6 +463,50 @@ class RadioFlight:
                 print(f"  param       : {name} NOT SET ({exc}) - a param name needs its "
                       f"group, e.g. lighthouse.lh2maxRate or policy.shadow", flush=True)
             time.sleep(0.2)
+
+        # Parametric flip tuning state & initial sync over radio
+        self.flip_peak_dps = float(getattr(args, "flip_dps", 720.0))
+        self.flip_pop_pct = float(getattr(args, "flip_pop", 0.90))
+        self.flip_rate_frac = float(getattr(args, "flip_rate_frac", 0.30))
+        axis_raw = str(getattr(args, "flip_axis", "0")).lower()
+        self.flip_axis = 1 if axis_raw in ("1", "roll") else 0
+        self.flip_analytic = 0 if getattr(args, "flip_table", False) else 1
+        # The thrust the reference is PLANNED for (N). This is the altitude-excursion lever:
+        # the profile's pop acceleration is `u = pop_pct*max_thrust/mass - g`, and BOTH the
+        # climb time and the excursion scale as 1/u, so a stronger model means a shorter
+        # climb and a smaller throw. 0.60 N is the sim plant constant the policy trained
+        # against (see analytic_flip.h). Raised from the old hardcoded 0.46 after the 20 mm
+        # motor swap: the real vehicle now hovers at ~33% of the command range, which
+        # implies ~0.96 N by the sim's own rule (max_thrust = m*g/hover_fraction).
+        self.flip_max_thrust = float(getattr(args, "flip_max_thrust", 0.60))
+
+        flip_params = {
+            "traj_flip.peak_dps": f"{self.flip_peak_dps:.1f}",
+            "traj_flip.pop_pct": f"{self.flip_pop_pct:.3f}",
+            "traj_flip.rate_frac": f"{self.flip_rate_frac:.3f}",
+            "traj_flip.max_thrust": f"{self.flip_max_thrust:.3f}",
+            "traj_flip.axis": str(self.flip_axis),
+            "traj_flip.analytic": str(self.flip_analytic),
+        }
+        for pname, pval in flip_params.items():
+            try:
+                self.cf.param.set_value(pname, pval)
+                got = self._read_param(pname)
+                print(f"  param       : {pname} = {pval}"
+                      + (f"   (reads back {got})" if got is not None else ""), flush=True)
+            except Exception as exc:
+                print(f"  param       : {pname} not set ({exc})", flush=True)
+            time.sleep(0.05)
+
+    def set_flip_param(self, name: str, val: Any) -> None:
+        pname = f"traj_flip.{name}"
+        sval = str(val)
+        try:
+            self.cf.param.set_value(pname, sval)
+            print(f"  [TUNE] {pname} -> {sval}", flush=True)
+            self.messages.append(f"[TUNE] {pname} -> {sval}")
+        except Exception as exc:
+            print(f"  [TUNE] {pname} failed to set ({exc})", flush=True)
 
     # -- link helpers --------------------------------------------------------------------
     def _on_console(self, ch: str) -> None:
@@ -485,8 +562,29 @@ class RadioFlight:
             self.last_status = dict(armed=armed, mode=mode, shadow=shadow, abort=abort,
                                     manoeuvre=manoeuvre, z=z, tilt=tilt, thrust=thrust,
                                     p_err=p_err, vbat=vbat, act0=act0)
+        was_armed = self.armed
         self.armed = armed == 1
         self.manoeuvre = manoeuvre
+        if was_armed and not self.armed and (time.time() - self._disarm_commanded_at) > 1.5:
+            # The APP disarmed itself (failsafe complete, or an abort). We did not ask for
+            # this, and the disarmed passthrough would apply whatever we stream next - so stop
+            # and latch. Cleared by 'w' (an explicit climb) or by re-arming.
+            self._thrust_lockout = True
+            print("\n  !! the app DISARMED ITSELF - motors LOCKED OFF.\n     The stock PID has the "
+                  "authority now, so a streamed thrust centre would fly it again.\n     Press w "
+                  "to take over (the centre ramps from 0).\n", flush=True)
+            self.messages.append("APP SELF-DISARM: motors locked off (press w to take over)")
+        if abort != 0 and abort != getattr(self, "_last_abort_seen", 0):
+            self._last_abort_seen = abort
+            abort_names = {1: "tilt limit (>55 deg)", 2: "altitude limit (z < 0.04m or z > 3.5m)",
+                           3: "non-finite state estimate", 4: "estimator plausibility breach"}
+            reason = abort_names.get(abort, f"code {abort}")
+            msg = f"POLICY REFUSED / ABORTED: {reason}"
+            self.messages.append(msg)
+            print(f"\n  !! {msg}\n", flush=True)
+        elif abort == 0:
+            self._last_abort_seen = 0
+
         # `mode` is the app's own answer: 1 = MANOEUVRE (a relocated table), 0 = HOLD. Use
         # it, so the panel stays honest when a table ends on its own - the broadcast is
         # 10 Hz, so give a fresh launch a few ticks before believing a "not playing" byte.
@@ -575,27 +673,72 @@ class RadioFlight:
         self.cf.send_packet(pk)
 
     # -- firmware supervisor: the gate that actually decides whether motors may run ------
-    def supervisor_state_names(self) -> list:
-        """The firmware supervisor's active states, as words. Empty list if unreadable."""
+    # `Supervisor.STATES` in cflib 0.1.33 stops at bit 10, but the firmware's infoBitfield
+    # has a bit 11 that MATTERS: `supervisor.c::updateLogData()` sets `0x0800` for
+    # `SUPERVISOR_CB_DECK_FAULT` ("a deck has reported a hardware fault"), and
+    # `supervisor_state_machine.c` lists DECK_FAULT as a BLOCKER on the transition out of
+    # PreFlChecksNotPassed. So a deck fault is a first-class reason the drone will never
+    # report "Can be armed" - and the stock decode drops it on the floor, which makes the
+    # refusal look like an unnamed mystery.
+    SUPERVISOR_BIT_DECK_FAULT = 11
+
+    def supervisor_state_names(self, bits: Optional[int] = None) -> list:
+        """The supervisor's active states, as words, INCLUDING bit 11. [] if unreadable."""
         try:
-            bits = self.cf.supervisor.read_bitfield()
-            return list(self.cf.supervisor.decode_bitfield(bits))
+            if bits is None:
+                bits = int(self.cf.supervisor.read_bitfield())
+            names = list(self.cf.supervisor.decode_bitfield(bits))
         except Exception:
             return []
+        if bits & (1 << self.SUPERVISOR_BIT_DECK_FAULT):
+            names.append("DECK FAULT")
+        return names
+
+    @staticmethod
+    def supervisor_read_is_trustworthy(bits: int) -> bool:
+        """
+        Can `bits` be a real reading? No if it is exactly 0.
+
+        MEASURED, not assumed: `supervisor.c` does `#ifndef CONFIG_MOTORS_REQUIRE_ARMING ->
+        #define AUTO_ARMING 1`, this image has `# CONFIG_MOTORS_REQUIRE_ARMING is not set`,
+        and `updateLogData()` therefore ALWAYS ORs in `0x0004`. A zero cannot come from the
+        firmware: cflib returned it as its own fallback (a 0.2 s timeout in `_fetch_bitfield`,
+        or its "firmware older than CRTP v12" early return) and every flag derived from it
+        is meaningless rather than merely disappointing.
+        """
+        return bits != 0
 
     def supervisor_states(self) -> str:
         """The firmware's own view of itself, in words. Never raises."""
         try:
-            bits = self.cf.supervisor.read_bitfield()
-            names = list(self.cf.supervisor.decode_bitfield(bits))
+            bits = int(self.cf.supervisor.read_bitfield())
         except Exception as exc:
             return f"(unreadable: {exc})"
+        names = self.supervisor_state_names(bits)
+        if not self.supervisor_read_is_trustworthy(bits):
+            return f"0x{bits:03x} [NO REPLY - cflib fallback, NOT the drone's state]"
         return f"0x{bits:03x} " + (f"[{', '.join(names)}]" if names else "[nothing set]")
 
     def explain_arming_refusal(self) -> None:
         """Say WHICH condition is refusing the arm, and what clears it."""
-        names = self.supervisor_state_names()
+        bits = int(self.cf.supervisor.read_bitfield())
+        names = self.supervisor_state_names(bits)
         print(f"  supervisor  : {self.supervisor_states()}", flush=True)
+        protocol = None
+        try:
+            protocol = self.cf.platform.get_protocol_version()
+        except Exception:
+            pass
+        if not self.supervisor_read_is_trustworthy(bits):
+            print("  supervisor  : *** 0x000 CANNOT BE A REAL READING. `AUTO_ARMING` is 1 in "
+                  "this image (CONFIG_MOTORS_REQUIRE_ARMING is not set), so the firmware "
+                  "always sets bit 2 and a genuine reply is never zero. cflib returned its "
+                  "own fallback: either the 0.2 s reply timed out, or it decided the "
+                  "firmware predates CRTP v12 and refused to use the supervisor port. ***",
+                  flush=True)
+            print(f"  supervisor  : CRTP protocol version: {protocol} (needs >= 12 for the "
+                  f"supervisor port). Every 'armed=False can_fly=False' below is that same "
+                  f"fallback zero - do NOT read them as the drone's state.", flush=True)
         if "Is locked" in names:
             # Verified in firmware/src/modules/src/supervisor_state_machine.c: the
             # transitionsLocked table has a single entry and it points at Locked itself
@@ -610,6 +753,26 @@ class RadioFlight:
                 print(f"  supervisor  : supervisor.stop = {stop}  (1 = the emergency-stop "
                       f"PARAM is the cause; 0 = it came from a CRTP request or the "
                       f"emergency-stop watchdog expiring)", flush=True)
+        elif "DECK FAULT" in names:
+            print("  supervisor  : *** DECK FAULT - a deck reported a hardware fault. This "
+                  "BLOCKS the pre-flight checks, so the drone will never report 'Can be "
+                  "armed' and the motors will never run. ***", flush=True)
+            print("  supervisor  : it is bit 11 (0x800) of the infoBitfield, which cflib's "
+                  "own decode does not name. supervisor_state_machine.c lists DECK_FAULT "
+                  "as a blocker on PreFlChecksNotPassed -> PreFlChecksPassed. The source is "
+                  "deckSupervisorHasFault() -> any driver->status() != 0; for the "
+                  "Lighthouse deck that is lighthouseCoreDeckStatus(), which returns 1 when "
+                  "the deck never booted (bitstream not flashed) or when no UART frame has "
+                  "arrived for 1500 ms.", flush=True)
+            for name in ("deck.bcLighthouse4", "lighthouse.bsAvailable",
+                         "lighthouse.systemType"):
+                value = self._read_param(name)
+                if value is not None:
+                    print(f"  supervisor  : {name} = {value}", flush=True)
+            print("  supervisor  : FIRST move is the console: `FPGA not booted. Lighthouse "
+                  "disabled!` and the `LHFL:` bitstream-CRC lines are printed only there, "
+                  "and only at boot. Otherwise reflash the deck bitstream (warm boot) and "
+                  "power-cycle the drone.", flush=True)
         elif "Is tumbled" in names:
             print("  supervisor  : the drone reports TUMBLED - set it level and keep it still.",
                   flush=True)
@@ -619,9 +782,22 @@ class RadioFlight:
         elif "Can be armed" in names:
             print("  supervisor  : the drone SAYS it can be armed, so the request or the "
                   "read-back is not getting through - retry, and check the link.", flush=True)
-        else:
-            print("  supervisor  : the 'Can be armed' bit is not set and none of the known "
-                  "blockers is reported - a pre-flight check is failing.", flush=True)
+        elif self.supervisor_read_is_trustworthy(bits) and (bits & 0x0008):
+            # AUTO_ARMING is 1 here, and `supervisorUpdate()` calls supervisorRequestArming(true)
+            # on the same tick the state reaches PreFlChecksPassed - so `supervisorCanArm()`
+            # (state == PreFlChecksPassed) is true only transiently and bit 0 is essentially
+            # never observable. Judging "can I fly?" by bit 0 is therefore wrong on this
+            # firmware; bit 3 (Can fly) is the meaningful one.
+            print("  supervisor  : 'Can fly' IS set, so the drone is past the pre-flight checks "
+                  "and the motors are live. Do NOT judge this by 'Can be armed': AUTO_ARMING is "
+                  "1 in this image, so the firmware arms itself on the very tick it enters "
+                  "PreFlChecksPassed and bit 0 is essentially never observable.", flush=True)
+        elif self.supervisor_read_is_trustworthy(bits):
+            print("  supervisor  : neither 'Can fly' (bit 3) nor 'Can be armed' (bit 0) is set, "
+                  "and no named blocker is reported. The firmware is stuck before "
+                  "PreFlChecksPassed - and the only two blockers on that transition are "
+                  "'Is tumbled' and DECK FAULT, so if neither is visible, retry the read "
+                  "before concluding anything.", flush=True)
 
     def poll_supervisor(self) -> None:
         """Cache the firmware supervisor flags for the CSV. Non-fatal, ~1 Hz."""
@@ -778,23 +954,47 @@ class RadioFlight:
     def arm(self) -> None:
         if not self.args.arm_ok:
             self.messages.append("refusing to arm: pass --arm-ok (props off for the first run)")
+            print("  refusing to arm: pass --arm-ok", flush=True)
             return
-        # Firmware FIRST: with the supervisor unarmed the app's policy output is zeroed by
-        # stabilizer.c, so arming the app alone would look like it worked and do nothing.
-        if not self.firmware_arm(True):
-            self.messages.append("*** the FIRMWARE refused to arm - the policy cannot move the "
-                                 "motors until it does ***")
+
+        # Check altitude: policy safety envelope refuses z < 0.04m (ground level)
+        with self._lock:
+            z_curr = self.last_status.get("z")
+        if z_curr is not None and z_curr < 0.04:
+            msg = f"refused HOVER on the ground (z={z_curr:.2f}m < 0.04m envelope). Fly up in STOCK first, then press 'h'!"
+            self.messages.append(msg)
+            print(f"  {msg}", flush=True)
             return
-        self.send_cmd(CMD_ARM)
+
+        # Firmware FIRST: only arm supervisor if not already armed.
+        # If the pilot is already flying manually in STOCK mode, self._motors_ok is already True.
+        # Calling firmware_arm again blocks the main flight loop for 1.5s and can fail on radio timeouts!
+        is_already_armed = self._motors_ok or self.fw_sup.get("armed", False)
+        if not is_already_armed:
+            if not self.firmware_arm(True):
+                self.messages.append("*** the FIRMWARE refused to arm - the policy cannot move the "
+                                     "motors until it does ***")
+                return
+
+        # Send CMD_ARM in a burst of 3 packets so radio packet loss never drops the command
+        for _ in range(3):
+            self.send_cmd(CMD_ARM)
+            time.sleep(0.005)
         self.mode = MODE_HOVER
+        self._thrust_lockout = False      # an explicit re-arm supersedes a fault lockout
         self.messages.append("HOVER: armed - the policy holds the hover where it was when "
                              "you pressed it (appchannel 0x01)")
+        print("  -> HOVER command sent (policy arm)", flush=True)
 
     def disarm(self) -> None:
-        self.send_cmd(CMD_DISARM)
+        self._disarm_commanded_at = time.time()   # this one is ours, not a fault
+        for _ in range(3):
+            self.send_cmd(CMD_DISARM)
+            time.sleep(0.005)
         self.mode = self._stock_label()
         self.messages.append("STOCK: app disarmed - your sticks have it back (appchannel 0x02); "
                              "firmware still armed, 'x' to stop the motors")
+        print("  -> STOCK command sent (policy disarm)", flush=True)
 
     def flip(self) -> None:
         """Shorthand the pad button uses: launch the baked flip."""
@@ -815,7 +1015,9 @@ class RadioFlight:
             print(f"  {name}: the POLICY must be flying first - press 'h' "
                   f"(and start the session with --set policy.shadow=0)", flush=True)
             return
-        self.cf.appchannel.send_packet(bytes([CMD_PLAY, kind & 0xFF]))
+        for _ in range(3):
+            self.cf.appchannel.send_packet(bytes([CMD_PLAY, kind & 0xFF]))
+            time.sleep(0.005)
         self._play_at = time.time()
         self.mode = f"POLICY ({name})"
         print(f"  {name} launched (appchannel 0x05 {kind}) - relocated onto the current pose, "
@@ -826,13 +1028,16 @@ class RadioFlight:
         if not self.armed:
             print("  nothing to hold: the POLICY is not flying (press 'h')", flush=True)
             return
-        self.cf.appchannel.send_packet(bytes([CMD_PLAY, KIND_NONE]))
+        for _ in range(3):
+            self.cf.appchannel.send_packet(bytes([CMD_PLAY, KIND_NONE]))
+            time.sleep(0.005)
         self._play_at = time.time()
         self.mode = MODE_HOVER
         print("  manoeuvre stopped - holding here", flush=True)
 
     def kill(self) -> None:
         self._killed = True
+        self._disarm_commanded_at = time.time()   # this one is ours, not a fault
         self._send_stop()
         try:
             self.firmware_arm(False, settle=0.5)
@@ -859,6 +1064,13 @@ class RadioFlight:
         Printed straight to the terminal, not just queued in `self.messages`: those are only
         rendered by the PANEL, so with --no-gui a queued message would be invisible.
         """
+        if self._thrust_lockout:
+            if delta <= 0.0:
+                print("  motors are LOCKED OFF after an app self-disarm - press w to raise the "
+                      "thrust and take over", flush=True)
+                return
+            self._thrust_lockout = False
+            print("  thrust lockout released - the stock PID now has the sticks", flush=True)
         ceiling = float(self.args.max_thrust)
         new = float(np.clip(self.hover_pct + delta, 0.0, ceiling))
         if abs(new - self.hover_pct) < 1e-9:
@@ -934,6 +1146,28 @@ class RadioFlight:
                 self.play(match[0][0], match[0][1])
         elif k == ".":
             self.hold()
+        elif k == "[":
+            self.flip_peak_dps = max(400.0, self.flip_peak_dps - 20.0)
+            self.set_flip_param("peak_dps", f"{self.flip_peak_dps:.0f}")
+        elif k == "]":
+            self.flip_peak_dps = min(1100.0, self.flip_peak_dps + 20.0)
+            self.set_flip_param("peak_dps", f"{self.flip_peak_dps:.0f}")
+        elif k in ("-", "_"):
+            self.flip_pop_pct = max(0.70, round(self.flip_pop_pct - 0.02, 3))
+            self.set_flip_param("pop_pct", f"{self.flip_pop_pct:.2f}")
+        elif k in ("+", "="):
+            self.flip_pop_pct = min(0.95, round(self.flip_pop_pct + 0.02, 3))
+            self.set_flip_param("pop_pct", f"{self.flip_pop_pct:.2f}")
+        elif k == "r":
+            self.flip_axis = 0 if self.flip_axis == 1 else 1
+            axis_name = "ROLL (x-axis)" if self.flip_axis == 1 else "PITCH (y-axis)"
+            print(f"  [TUNE] Flip axis switched to: {axis_name}", flush=True)
+            self.set_flip_param("axis", self.flip_axis)
+        elif k == "t":
+            self.flip_analytic = 0 if self.flip_analytic == 1 else 1
+            mode_name = "ANALYTIC PARAMETRIC (100 Hz onboard)" if self.flip_analytic == 1 else "PREBAKED TABLE"
+            print(f"  [TUNE] Flip trajectory mode switched to: {mode_name}", flush=True)
+            self.set_flip_param("analytic", self.flip_analytic)
         elif k == " ":
             print(f"  thrust centre -> {self.args.hover:.0f}% (--hover)", flush=True)
             self.hover_pct = float(self.args.hover)
@@ -960,6 +1194,14 @@ class RadioFlight:
         self._thrust_sent = float(np.clip(thrust, self._thrust_sent - step, self._thrust_sent + step))
         self.applied = (roll, pitch, yaw, self._thrust_sent)
         if self.args.no_motors:
+            return
+        if self._thrust_lockout:
+            # A self-disarm latched motors-off (see __init__). Keep sending a REAL stop - the
+            # app is disarmed, so its stock passthrough would otherwise apply our thrust
+            # centre and the props would never stop.
+            self._raw_stop()
+            self._thrust_sent = 0.0
+            self.applied = (roll, pitch, yaw, 0.0)
             return
         if not self._motors_ok:
             # The firmware supervisor has not armed us, so stabilizer.c would zero this
@@ -1050,6 +1292,10 @@ class RadioFlight:
             "link": self.args.uri,
             "pad": self.pad_state.name if (self.pad_state is not None and self.pad_state.connected) else "none",
             "message": self.messages[-1] if self.messages else "",
+            "flip_dps": self.flip_peak_dps,
+            "flip_pop": self.flip_pop_pct,
+            "flip_axis": "roll" if self.flip_axis == 1 else "pitch",
+            "flip_analytic": bool(self.flip_analytic),
         }
 
     # -- main loop -----------------------------------------------------------------------
@@ -1070,6 +1316,10 @@ class RadioFlight:
             print("            h = HOVER: hand control to the POLICY (it holds position)")
             print("            d = back to STOCK (attitude only - it WILL drift)")
             print("            space = centre thrust   x = KILL (motors off)   q / ESC = quit")
+            print("  LIVE FLIP TUNING: [ / ] = peak dps -/+ 20 (400..1100 deg/s)")
+            print("                    - / + = pop thrust pct -/+ 2% (70..95%)")
+            print("                    r     = toggle flip axis (pitch <-> roll)")
+            print("                    t     = toggle trajectory (analytic <-> prebaked table)")
         elif not self.args.no_keys:
             print("  KEYBOARD: not available (stdin is not a terminal) - use the panel")
         if self.kinds:
@@ -1081,8 +1331,11 @@ class RadioFlight:
             print(f"  no generated header at {REF_HEADER} - run gen_references.py to bake tables")
         for m in self.messages:
             print(f"  {m}")
-        self.messages.clear()
-        self._log = open(os.path.join(_PROJECT_ROOT, "logs", "radio_flight_log.csv"), "w")
+        log_path = os.path.join(_PROJECT_ROOT, "logs", "radio_flight_log.csv")
+        if os.path.exists(log_path) and os.path.getsize(log_path) > 0:
+            base, ext = os.path.splitext(log_path)
+            os.replace(log_path, f"{base}.{time.strftime('%Y%m%d_%H%M%S')}.legacy{ext}")
+        self._log = open(log_path, "w")
         # `app_vbat` is the app's status-packet value, which is a PLACEHOLDER unless the app
         # resolved pm.vbat (see FW_LOG_VARS). `pm_vbat` is the firmware's own reading and is
         # the one to trust. The m*_rpm/m* columns are what prove whether motors turned.
@@ -1090,7 +1343,8 @@ class RadioFlight:
                         "app_vbat,fw_armed,can_fly,locked,sup_bits,"
                         "x,y,vx,vy,fw_roll,fw_pitch,m1,m2,m3,m4,pm_vbat,lh_status,lh_recv,"
                         "lh_sync,lh_active,lh_calud,"
-                        "cycle_rt,frame_rt,pre_th_rt,post_th_rt,dis_prob\n")
+                        "cycle_rt,frame_rt,pre_th_rt,post_th_rt,dis_prob,"
+                        "flip_phase,abort_reason,flip_gyro,flip_zshift\n")
         self.start_fw_log(period_ms=int(getattr(self.args, "log_period", 20)))
         self.poll_supervisor()
         t0 = time.time()
@@ -1149,7 +1403,11 @@ class RadioFlight:
                     f"{fw.get('lighthouse.frameRt', -1):.1f},"
                     f"{fw.get('lighthouse.preThRt', -1):.1f},"
                     f"{fw.get('lighthouse.postThRt', -1):.1f},"
-                    f"{fw.get('lighthouse.disProb', -1):.2f}\n")
+                    f"{fw.get('lighthouse.disProb', -1):.2f},"
+                    f"{fw.get('policy.flip_phase', -1):.0f},"
+                    f"{fw.get('policy.abort_reason', -1):.0f},"
+                    f"{fw.get('traj_flip.gyro_deg', -1):.1f},"
+                    f"{fw.get('traj_flip.z_shift', -1):.2f}\n")
                 self._log.flush()
                 rest = self.dt - (time.time() - tick)
                 if rest > 0:
@@ -1256,6 +1514,24 @@ def main() -> int:
     ap.add_argument("--key-thrust-step", type=float, default=2.0,
                     help="%% of thrust added/removed per climb/descend keypress (default 2; "
                          "finer is better for finding the lift-off point)")
+    # Live Parametric Flip tuning
+    ap.add_argument("--flip-dps", type=float, default=720.0,
+                    help="parametric flip: target peak body rate in deg/s (default 720, 400..1100)")
+    ap.add_argument("--flip-pop", type=float, default=0.90,
+                    help="parametric flip: climb/arrest thrust fraction of max thrust (default 0.90, 0.70..0.95)")
+    ap.add_argument("--flip-rate-frac", type=float, default=0.30,
+                    help="parametric flip: trapezoid ramp fraction of coast (default 0.30, 0.15..0.45)")
+    ap.add_argument("--flip-max-thrust", type=float, default=0.60,
+                    help="parametric flip: full-throttle thrust IN NEWTONS that the "
+                         "reference is planned for (default 0.60 = the sim plant the policy "
+                         "trained against). THE altitude-excursion lever: the pop's net "
+                         "acceleration is u = pop*max_thrust/mass - g, and both the climb "
+                         "time c0 = v0/u and the throw v0^2/(2u) + v0^2/(2g) SHRINK as u "
+                         "grows. Your vehicle measures ~0.96 N from a 33%% hover.")
+    ap.add_argument("--flip-axis", default="pitch",
+                    help="parametric flip: rotation axis ('pitch' / 0 or 'roll' / 1)")
+    ap.add_argument("--flip-table", action="store_true",
+                    help="use prebaked flip reference table instead of analytic generator")
     # The firmware log is the ONLY part of the link that can block, and it can only do so from
     # the worker task (WORKER_TASK_PRI = 1, the lowest in the system), so it cannot stall the
     # stabilizer, the Kalman or the lighthouse task. These two flags exist so the claim can be

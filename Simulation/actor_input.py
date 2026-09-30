@@ -57,7 +57,7 @@ Z_DIM: int = 16
 ACTOR_DIM_NO_ENCODER: int = ACTOR_TOTAL_DIM + REF_FF_DIM              # 32
 ACTOR_DIM_WITH_ENCODER: int = ACTOR_TOTAL_DIM + Z_DIM + REF_FF_DIM    # 48
 ENCODER_CHECKPOINT: str = os.path.join(_PROJECT_ROOT, "logs", "encoder_gru.pt")
-DEFAULT_NET_ARCH: Dict[str, list] = {"pi": [32], "vf": [512, 256, 128]}
+DEFAULT_NET_ARCH: Dict[str, list] = {"pi": [32, 32], "vf": [512, 256, 128]}
 
 
 def read_checkpoint_arch(model_path: str) -> Tuple[Optional[int], Optional[Dict[str, list]]]:

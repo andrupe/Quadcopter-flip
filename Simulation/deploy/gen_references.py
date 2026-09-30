@@ -71,6 +71,7 @@ for _p in [_PROJECT_ROOT, _SIM_DIR]:
 
 from live_target import ShiftedTrajectory, yaw_of  # noqa: E402
 from quad_flip_env import GRAVITY, QuadFlipEnv  # noqa: E402
+from trajectories import Flip, MAX_THRUST_TOTAL, Trajectory  # noqa: E402
 
 DEFAULT_OUT_DIR = os.path.join(_SIM_DIR, "deploy", "app_policy_controller", "src", "generated")
 DEFAULT_MANIFEST = os.path.join(_SIM_DIR, "deploy", "manifests", "reference_tables.json")
@@ -87,6 +88,39 @@ REF_CHECK_HOLD_ROWS = 8
 REF_CHECK_TOL = 1.0e-5     # C float32 sampler vs the float64 simulator reconstruction
 MAX_DURATION_S = 5.0       # prefer draws no longer than this (the flash cost is 84 B/row)
 SEED_SEARCH = 4000         # how far to walk seeds looking for a short, calm draw
+
+# THE ACTOR'S RATE AUTHORITY. The deployed action maps `a1,a2 -> +/- max_rate_xy` rad/s and
+# `a3 -> +/- max_rate_z` (quad_flip_env.QuadFlipEnv, mirrored in controller_app.c).
+# A baked reference whose peak body rate EXCEEDS this can NEVER be tracked: the action clamp
+# saturates, the policy's learned phase timing no longer applies, and the manoeuvre
+# degenerates into an uncontrolled tumble. Measured 2026-09-25 with a hand-built flip
+# (coast 0.35 s, rate_frac 0.20, max_rate 25) = 1285.6 deg/s against this 1146 deg/s
+# ceiling: the vehicle over-rotated (~2 turns instead of 1), drifted to 3.2 m/s and hit the
+# floor. `main()` pins these constants to the live env so they cannot silently drift.
+ACTOR_RATE_CEILING_RADS = 20.0     # roll/pitch
+ACTOR_YAW_CEILING_RADS = 4.0       # yaw
+
+# FLIP PEAK RATE (deg/s). `trajectories.Flip`'s peak body rate is fixed by the COAST alone:
+#
+#     omega_peak = 2*pi*rotations / (coast * (1 - rate_frac))
+#
+# so the flip is sped up by SHORTENING THE COAST - which also shortens the manoeuvre and
+# FLATTENS its altitude excursion, because a shorter coast needs a smaller ballistic entry
+# speed v0 = g*coast/2 and the excursion v0^2/2u + v0^2/2g falls with v0^2. Measured on the
+# generator's own draw (rate_frac 0.437, accel_frac 0.900):
+#
+#     target dps   coast    duration   excursion   table peak
+#         804      0.795 s    1.99 s     1.94 m      777 d/s   <- the sampler's own draw
+#         900      0.710      1.77       1.55        870
+#        1000      0.639      1.60       1.25        967
+#        1145      0.558      1.39       0.96       1107
+#
+# THE TRAINED BAND IS THE REFERENCE TO RESPECT: measured over 300 accepted sampler draws it
+# is 645-916 deg/s (median 813), so a target above ~916 is an EXTRAPOLATION for the policy
+# even though the hard limit - the actor's own rate authority - is not reached until
+# 1146 deg/s (ACTOR_RATE_CEILING_RADS, which check_table enforces). 1000 sits 9% above the
+# band and 13% below the ceiling. 0.0 keeps whatever the sampler drew.
+TARGET_FLIP_PEAK_DPS = 950.0
 
 # LAUNCH TRANSIENT BUDGET. Only the flip and the waypoint polynomial START at rest; the
 # periodic families (orbit, figure-8, lissajous, slalom) are sampled from the middle of
@@ -109,7 +143,8 @@ W0_MAX_RADS = 0.6
 KINDS = ("flip", "orbit", "figure8", "lissajous", "slalom", "waypoints")
 
 
-def draw(kind: str, seed0: int, max_tries: int = SEED_SEARCH) -> Tuple[int, Any, float, Any]:
+def draw(kind: str, seed0: int, max_tries: int = SEED_SEARCH,
+         flip_peak_dps: float = TARGET_FLIP_PEAK_DPS) -> Tuple[int, Any, float, Any]:
     """
     Pick the most launchable draw of `kind`.
 
@@ -135,14 +170,35 @@ def draw(kind: str, seed0: int, max_tries: int = SEED_SEARCH) -> Tuple[int, Any,
                 continue
             if abs(float(getattr(m, "rotations", 1.0)) - 1.0) > 1e-9:
                 continue
-            # FIRST match wins for the flip, deliberately: this table is the already
-            # verified article (+1.58 m pop, 778 deg/s peak) that the mission's flip
-            # acceptance criteria are written against, and a flip starts at rest anyway,
-            # so there is no launch transient to optimise away.
+            # FIRST match wins for the flip, deliberately: the SHAPE is the sampler's own
+            # (axis, yaw, rate_frac, accel_frac, and the alt/momentum profile those imply),
+            # so it is in-distribution by construction, and a flip starts at rest anyway so
+            # there is no launch transient to optimise away.
+            #
+            # The ONE thing overridden here is the COAST, and only when a peak rate is
+            # requested (see TARGET_FLIP_PEAK_DPS): omega_peak is a function of the coast
+            # alone, so deriving the coast from the target changes the rotation speed and
+            # nothing else about the manoeuvre. `accel_frac` is recovered from the draw's own
+            # saturated climb so the powered phases keep the sampler's authority.
+            # check_table() still refuses any result above the actor's rate authority, so
+            # this can never repeat the 2026-09-25 hand-built 1285 d/s flip.
+            if flip_peak_dps > 0.0:
+                accel_frac = float(m.thrust_climb) / MAX_THRUST_TOTAL
+                coast = (2.0 * math.pi * float(m.rotations)
+                         / (math.radians(flip_peak_dps) * (1.0 - float(m.rate_frac))))
+                m = Flip(p0=m.p0, axis=tuple(m.axis), rotations=float(m.rotations),
+                         coast=coast, yaw=float(m.yaw), mass=mass,
+                         max_rate=float(m.max_rate), rate_frac=float(m.rate_frac),
+                         accel_frac=accel_frac)
+                traj = Trajectory(m)
             return s, traj, mass, env
         r0 = traj.sample(0.0)
-        score = (float(np.linalg.norm(r0.v)) / V0_MAX_MPS
-                 + float(np.linalg.norm(r0.omega)) / W0_MAX_RADS
+        v0 = float(np.linalg.norm(r0.v))
+        w0 = float(np.linalg.norm(r0.omega))
+        if v0 > V0_MAX_MPS or w0 > W0_MAX_RADS:
+            continue
+        score = (v0 / V0_MAX_MPS
+                 + w0 / W0_MAX_RADS
                  + 0.1 * float(traj.duration) / MAX_DURATION_S)
         pool.append((score, s, traj))
         if len(pool) >= 400:
@@ -215,8 +271,41 @@ def check_table(traj, table: np.ndarray, dt: float = TABLE_DT) -> Dict[str, Any]
     # Launch transient vs the budget (see V0_MAX_MPS / W0_MAX_RADS): what a launch from a
     # hovering vehicle actually puts into the policy's errors at tau = 0.
     launch_ok = bool(start_v <= V0_MAX_MPS and start_w <= W0_MAX_RADS)
+    # invariant 3: every rate in the TABLE must be inside the actor's rate authority, or
+    # the reference is STRUCTURALLY UNTRACKABLE - the action clamp saturates and the
+    # manoeuvre becomes an uncontrolled tumble (see ACTOR_RATE_CEILING_RADS). Roll/pitch
+    # and yaw have different ceilings, and the check is on the baked float32 table,
+    # because that is what the firmware indexes.
+    peak_w_xy = float(np.max(np.abs(table[:, 15:17])))
+    peak_w_z = float(np.max(np.abs(table[:, 17])))
+    trackable = bool(peak_w_xy <= ACTOR_RATE_CEILING_RADS + 1e-6
+                     and peak_w_z <= ACTOR_YAW_CEILING_RADS + 1e-6)
+
+    ok = bool(worst <= CHECK_TOL and launch_ok and end_v < 1e-6 and end_w < 1e-6
+              and trackable)
+    if ok:
+        fail_reason = ""
+    elif not launch_ok:
+        fail_reason = (f"launch transient v0 {start_v:.3f} m/s / w0 {start_w:.3f} rad/s "
+                       f"over budget")
+    elif end_v >= 1e-6 or end_w >= 1e-6:
+        fail_reason = f"does not end in a hover (v {end_v:.2e}, w {end_w:.2e})"
+    elif not trackable:
+        fail_reason = (f"peak rate {math.degrees(max(peak_w_xy, peak_w_z)):.0f} deg/s "
+                       f"exceeds the actor authority "
+                       f"({math.degrees(ACTOR_RATE_CEILING_RADS):.0f} deg/s roll/pitch, "
+                       f"{math.degrees(ACTOR_YAW_CEILING_RADS):.0f} deg/s yaw) - "
+                       f"untrackable by construction")
+    else:
+        fail_reason = f"relocation err {worst:.3e} > tol {CHECK_TOL:g}"
     return {
-        "ok": bool(worst <= CHECK_TOL and launch_ok and end_v < 1e-6 and end_w < 1e-6),
+        "ok": ok,
+        "fail_reason": fail_reason,
+        "trackable": trackable,
+        "peak_omega_xy_rads": peak_w_xy,
+        "peak_omega_z_rads": peak_w_z,
+        "rate_ceiling_rads": ACTOR_RATE_CEILING_RADS,
+        "yaw_rate_ceiling_rads": ACTOR_YAW_CEILING_RADS,
         "tol": CHECK_TOL,
         "launch_ok": launch_ok,
         "v0_budget_mps": V0_MAX_MPS,
@@ -369,6 +458,19 @@ def emit_c(out_dir: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
         off += int(len(e["table"]))
     rows = np.concatenate([e["table"] for e in entries], axis=0)
 
+    flip_rot_start_row = 0
+    flip_catch_start_row = 0
+    for e in entries:
+        if e["kind"] == "flip":
+            for i, row in enumerate(e["table"]):
+                if abs(row[16]) > 1e-3 or row[20] < 0.0:
+                    flip_rot_start_row = i
+                    break
+            for i in range(flip_rot_start_row, len(e["table"])):
+                if abs(e["table"][i, 16]) < 1e-3 and e["table"][i, 20] > 0.0:
+                    flip_catch_start_row = i
+                    break
+
     enum = ",\n    ".join(f"REF_KIND_{k.upper()} = {i}" for i, k in enumerate(names))
     hdr = f"""// GENERATED by Simulation/deploy/gen_references.py - DO NOT EDIT BY HAND.
 //
@@ -402,6 +504,8 @@ def emit_c(out_dir: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
 #define REF_DT {_fmt(TABLE_DT)}
 #define REF_ROW_FLOATS {int(rows.shape[1])}u    // floats per row: p|v|R|omega|a
 #define REF_A_OFFSET 18u                   // first float of the acceleration block
+#define REF_FLIP_ROT_START_ROW {flip_rot_start_row}u
+#define REF_FLIP_CATCH_START_ROW {flip_catch_start_row}u
 
 typedef enum {{
     {enum},
@@ -451,6 +555,9 @@ extern const float    REF_ROWS[REF_ROWS_TOTAL][REF_ROW_FLOATS];
 def main() -> int:
     ap = argparse.ArgumentParser(description="Bake the trained manoeuvres into 100 Hz C tables")
     ap.add_argument("--seed", type=int, default=0, help="first seed to try (default 0)")
+    ap.add_argument("--flip-peak-dps", type=float, default=TARGET_FLIP_PEAK_DPS,
+                    help="peak flip body rate in deg/s; the coast is derived from it. "
+                         "0 = keep the sampler's own draw (default %(default)s)")
     ap.add_argument("--kinds", nargs="*", default=list(KINDS),
                     help=f"families to bake (default: {' '.join(KINDS)})")
     ap.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
@@ -461,12 +568,25 @@ def main() -> int:
                          "sampler against ShiftedTrajectory (on by default; needs host clang)")
     args = ap.parse_args()
 
+    # check_table's trackability invariant uses module constants; pin them to the live env
+    # here so a change to the action scaling can never silently invalidate the guard.
+    _probe = QuadFlipEnv(telemetry=False)
+    if (abs(float(_probe.max_rate_xy) - ACTOR_RATE_CEILING_RADS) > 1e-9
+            or abs(float(_probe.max_rate_z) - ACTOR_YAW_CEILING_RADS) > 1e-9):
+        print(f"FATAL  : rate ceilings {ACTOR_RATE_CEILING_RADS} rad/s xy / "
+              f"{ACTOR_YAW_CEILING_RADS} rad/s z disagree with the env "
+              f"({float(_probe.max_rate_xy)} / {float(_probe.max_rate_z)}) - update both")
+        return 5
+
     entries: List[Dict[str, Any]] = []
     failed: List[str] = []
+    if args.flip_peak_dps > 0.0:
+        print(f"flip target: {args.flip_peak_dps:.0f} deg/s peak (sampler band 645-916 dps, "
+              f"actor authority {math.degrees(ACTOR_RATE_CEILING_RADS):.0f} dps)")
     print(f"{'kind':<10} {'seed':>5}  {'rows':>5}  {'dur':>6}  {'shift err':>10}  "
-          f"{'v0':>7}  {'w0':>7}  {'z range (m)':>16}  {'peak rate':>9}")
+          f"{'v0':>7}  {'w0':>7}  {'z range (m)':>16}  {'peak rate':>9}  {'rate':>5}")
     for kind in args.kinds:
-        seed, traj, mass, _env = draw(kind, args.seed)
+        seed, traj, mass, _env = draw(kind, args.seed, flip_peak_dps=args.flip_peak_dps)
         _times, table = build_table(traj)
         check = check_table(traj, table)
         entries.append(dict(kind=kind, seed=seed, traj=traj, table=table, check=check,
@@ -475,16 +595,17 @@ def main() -> int:
               f"{check['max_shift_err']:>10.3g}  {check['start_v_norm']:>7.3f}  "
               f"{check['start_w_norm']:>7.3f}  "
               f"{check['z_rel_min']:+.2f} .. {check['z_rel_max']:+.2f}  "
-              f"{check['peak_omega_dps']:>7.0f} d/s")
+              f"{check['peak_omega_dps']:>7.0f} d/s  "
+              f"{'ok' if check['trackable'] else 'OVER':>5}")
         if not check["ok"]:
-            failed.append(kind)
+            failed.append(f"{kind} ({check['fail_reason']})")
 
     total_rows = sum(len(e["table"]) for e in entries)
     print(f"\ntotal   : {total_rows} rows -> {total_rows * 21 * 4 / 1024:.0f} KiB of weights "
           f"({total_rows * 21 * 4} bytes), {len(entries)} kinds")
     if failed:
-        print(f"check   : FAIL for {', '.join(failed)} - not emitting a table that steps "
-              f"at its ends into the policy's errors")
+        print("check   : FAIL for " + "; ".join(failed)
+              + " - not emitting a table the policy cannot fly")
         return 3
     print("check   : PASS for every kind (invariants + relocation vs ShiftedTrajectory)")
 
@@ -514,6 +635,7 @@ def main() -> int:
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "table_dt": TABLE_DT,
         "max_duration_s": MAX_DURATION_S,
+        "flip_target_peak_dps": float(args.flip_peak_dps),
         "kinds": out["kinds"],
         "rows_per_kind": out["rows_per_kind"],
         "rows_total": out["rows"],

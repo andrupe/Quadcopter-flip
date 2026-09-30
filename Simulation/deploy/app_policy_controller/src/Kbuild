@@ -1,5 +1,7 @@
 obj-y += controller_app.o
+obj-y += policy_guard.o
 obj-y += reference.o
+obj-y += analytic_flip.o
 obj-y += generated/
 
 # --- backend selection -----------------------------------------------------------------

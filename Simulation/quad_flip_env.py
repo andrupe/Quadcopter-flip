@@ -49,7 +49,7 @@ RANDOM_INITIAL_STATE: bool = True    # Randomize spawn position, attitude tilt, 
 MOTOR_TAU: float = 0.025             # 1st-order motor time constant (25ms for Crazyflie coreless DC)
 MOTOR_TAU_RANGE: tuple = (0.020, 0.035) # Motor tau randomization range
 RANDOM_BATTERY: bool = True          # Randomize battery voltage sag / thrust scaling
-OBS_LATENCY_MAX_STEPS: int = 2       # Max observation delay in steps
+OBS_LATENCY_MAX_STEPS: int = 3       # was 2; T1-A widened the rate-domain DR (one more step)
 PITCH_DIRECTION: float = 1.0         # +1.0 for front-flip, -1.0 for back-flip
 FLIP_THRESHOLD: float = 2.0 * np.pi  # Rotation angle required for a full 360° pitch flip
 # ======================================================================================
@@ -182,14 +182,27 @@ COM_OFFSET_MAX_Z: float = 0.0030       # ±3.0 mm vertical Center of Mass offset
 PAYLOAD_MASS_MAX: float = 0.0050       # +0 to 5.0g calibrated payload (covers 33g-38g total mass)
 ARM_LENGTH_JITTER_MAX: float = 0.0015  # ±1.5 mm independent rotor arm length variation
 MOTOR_MISMATCH_MAX: float = 0.08       # Up to 8% independent motor efficiency degradation
-DYNAMIC_SAG_COEF_MAX: float = 0.07     # Up to 7% 1S LiPo dynamic voltage sag
+DYNAMIC_SAG_COEF_MAX: float = 0.25     # Up to 25% 1S LiPo dynamic voltage sag (covers real ~23% thrust drop)
+BATTERY_THRUST_SCALE_RANGE: tuple = (0.70, 1.05)   # 1 - dr*0.30 .. 1 + dr*0.05 (covers 0.437 N authority)
+THRUST_NL_MAX: float = 0.10             # thrust-curve nonlinearity
+RATE_PID_NOISE_MAX: float = 0.04        # inner loop rate PID gyro noise
+CAGE_CEILING_Z: float = 2.0             # hard 2.0 m cage height
+CAGE_FLOOR_Z: float = 0.05
+SPAWN_Z_RANGE: tuple = (0.80, 1.20)     # DR-able spawn altitude fitting inside cage
 MOTOR_TAU_DOWN_FACTOR: float = 0.50    # tau_down slower than tau_up
-GYRO_BIAS_MAX: float = 0.035          # ±0.035 rad/s (~2.0 deg/s) static gyro bias
+# T1-A (2026-09-23): the RATE-DOMAIN DR was widened. The measured dr 0 -> 1 cost is entirely
+# SMOOTHNESS (rate 0.66 -> 0.45, action 0.46 -> 0.23, w_err 1.41 -> 3.12 rad/s, position
+# flat): the policy stops filtering and starts reacting to rate noise. The response is to
+# train it against more of that noise, not to loosen a tolerance.
+# TENSION TO MEASURE, NOT ASSUME: a wider envelope RAISES the dr=1 cost, which is the very
+# thing ACTION_MAX_DELTA removes. The retrain has to show the net is negative; if dr=1 gets
+# worse, revert these three before changing anything else.
+GYRO_BIAS_MAX: float = 0.055          # was 0.035 (~2.0 deg/s) -> ~3.2 deg/s static bias
 
 # Sensor Observation Noise (1-sigma bounds)
 OBS_NOISE_POS_RANGE: tuple = (0.005, 0.015)       # ±5mm to ±15mm
 OBS_NOISE_VEL_RANGE: tuple = (0.020, 0.060)       # ±2cm/s to ±6cm/s
-OBS_NOISE_OMEGA_RANGE: tuple = (0.030, 0.150)     # ±1.7°/s to ±8.6°/s
+OBS_NOISE_OMEGA_RANGE: tuple = (0.030, 0.250)     # was (0.030, 0.150): ceiling +67%
 OBS_NOISE_ATT_DEG_RANGE: tuple = (0.5, 2.0)       # ±0.5° to ±2.0°
 
 # Encoder-only auxiliary observation noise (1-sigma). Specific force is the dominant
@@ -423,6 +436,25 @@ INIT_RATE_RANGE: tuple = (0.15, 1.50)    # rad/s per axis
 # Smoothness and Deadband Parameters
 TOL_ACTION_SMOOTH: float = 0.33      # 1st-order action rate norm tolerance (~1,300 RPM / step)
 ACTION_EMA_ALPHA: float = 0.8        # single EMA constant: no flip/hover phase distinction any more
+# T1-A: bound the PER-STEP change of the raw action BEFORE the EMA (0.0 disables).
+# WHY: the whole measured dr 0 -> 1 cost is smoothness, not tracking. Capping the command's
+# rate removes the chattering WITHOUT touching a single reward weight, so
+# REWARD_CEILING_PER_STEP stays 7.3 and every recorded percentage stays comparable.
+#
+# THE VALUE IS MEASURED, NOT CHOSEN. `scratch/check_env_tracking.py` section B runs a FIXED
+# textbook controller, so it cannot "learn around" the limit - it is the honest probe for how
+# much of the reference the limit makes unattainable. Scripted flip score, 6-seed mean:
+#   off 87% | 1.0 85% | 0.5 81% | 0.35 78% | 0.25 75%
+# 0.25 was the first draft and is REJECTED: 75% sits 5 points above the test floor, and the
+# repo's own rule is that if a hand-written controller cannot fly the reference, no amount of
+# PPO will fix it. 0.5 is the knee - it still bounds the slew (a full-range swing takes 4
+# steps = 40 ms, vs the motor's own 25 ms tau) while costing 6 points instead of 12.
+# A policy trained WITH the limit can lead a stepped reference in a way a fixed law cannot, so
+# the retrain may justify tightening it again - hence the override.
+# MIRRORED IN THE FIRMWARE (controller_app.c::synth_setpoint) via POLICY_ACTION_MAX_DELTA,
+# which export_policy.py emits straight from here. A one-sided change silently changes the
+# deployed control law, so both sides and the export must move together.
+ACTION_MAX_DELTA: float = float(os.environ.get("QUAD_ACTION_MAX_DELTA", 0.5))
 TERMINATION_PENALTY: float = 30.0    # reward subtracted on a crash / divergence / breach
 # ======================================================================================
 
@@ -1231,6 +1263,9 @@ class QuadFlipEnv(gym.Env):
         # it, so only the refusal to rotate is penalised.
         if FLIP_PROGRESS and ref.kind == "flip":
             att_err = max(att_err, self.flip_progress_err)
+            # T1-C: Flip altitude objective. Penalise falling below reference with 0.15m buffer.
+            alt_drop = max(0.0, (ref.p[2] - 0.15) - pos[2])
+            p_err = max(p_err, 3.0 * alt_drop)
 
         r_pos = _tracking_kernel(p_err, tol["pos"])
         r_vel = _tracking_kernel(v_err, tol["vel"])
@@ -1350,11 +1385,6 @@ class QuadFlipEnv(gym.Env):
         self.t = 0.0
         self.steps = 0
         self.rate_pid.reset()
-        # "Prior action" fiction at t=0: assume the vehicle was holding hover trim
-        # before the episode began. This makes the environment's first frame identical
-        # to the cold-start padding used when sampling pretraining windows.
-        self.prev_action = self.hover_trim_action.copy()
-        self.prev_prev_action = self.hover_trim_action.copy()
         self.accumulated_pitch = 0.0
         self.accumulated_roll = 0.0
         self.total_pitch_rotated = 0.0
@@ -1381,8 +1411,7 @@ class QuadFlipEnv(gym.Env):
             self.wind.reseed()
 
         if self.random_battery and dr > 0.0:
-            batt_lo = 1.0 - dr * 0.15
-            batt_hi = 1.0 + dr * 0.10
+            batt_lo, batt_hi = BATTERY_THRUST_SCALE_RANGE
             thrust_scale = float(self.np_random.uniform(batt_lo, batt_hi))
         else:
             thrust_scale = 1.0
@@ -1425,6 +1454,9 @@ class QuadFlipEnv(gym.Env):
                 -dr * GYRO_BIAS_MAX, dr * GYRO_BIAS_MAX, size=3
             ).astype(np.float32)
 
+            thrust_nl = float(self.np_random.uniform(-dr * THRUST_NL_MAX, dr * THRUST_NL_MAX))
+            rate_pid_noise = float(dr * RATE_PID_NOISE_MAX)
+
             self.quad.apply_hardware_distortions(
                 mass=total_mass,
                 com_offset=com_offset,
@@ -1434,6 +1466,8 @@ class QuadFlipEnv(gym.Env):
                 tau_up=tau_up,
                 tau_down=tau_down,
                 dynamic_sag_coef=dynamic_sag_coef,
+                thrust_nl=thrust_nl,
+                rate_pid_noise=rate_pid_noise,
             )
 
             self.active_disturbances = {
@@ -1449,9 +1483,12 @@ class QuadFlipEnv(gym.Env):
                 "dynamic_sag_coef": dynamic_sag_coef,
                 "gyro_bias_rads": self.gyro_bias.tolist(),
                 "thrust_scale": float(thrust_scale),
+                "thrust_nl": thrust_nl,
+                "rate_pid_noise": rate_pid_noise,
                 "latency_steps": int(self.obs_latency),
             }
         else:
+            total_mass = self.quad.base_mass
             self.quad.motor_tau = MOTOR_TAU
             self.gyro_bias = np.zeros(3, dtype=np.float32)
             self.quad.apply_hardware_distortions()
@@ -1468,8 +1505,16 @@ class QuadFlipEnv(gym.Env):
                 "dynamic_sag_coef": 0.0,
                 "gyro_bias_rads": [0.0, 0.0, 0.0],
                 "thrust_scale": float(thrust_scale),
+                "thrust_nl": 0.0,
+                "rate_pid_noise": 0.0,
                 "latency_steps": int(self.obs_latency),
             }
+
+        # Randomized hover trim derived from authority and mass (Section 1.3)
+        hover_a0 = float(2.0 * total_mass * self.quad.params["g"] / (self.quad.params["maxThr"] * thrust_scale) - 1.0)
+        self.hover_trim_action = np.array([hover_a0, 0.0, 0.0, 0.0], dtype=np.float32)
+        self.prev_action = self.hover_trim_action.copy()
+        self.prev_prev_action = self.hover_trim_action.copy()
 
         # --- reference trajectory -----------------------------------------------------
         # Sampled BEFORE the spawn is chosen, because the spawn is derived from it: the
@@ -1613,6 +1658,13 @@ class QuadFlipEnv(gym.Env):
         # Actuator-command smoothing. A single constant replaces the old flip/hover phase
         # switch: under tracking there is no phase to switch on, and the reference already
         # supplies the smoothness the policy is graded against.
+        #
+        # T1-A: bound the per-step move of the RAW action first (see ACTION_MAX_DELTA). It is
+        # measured against the POST-EMA applied action, because that is what actually reached
+        # the mixer last step - so the bound is on the real command's slew rate.
+        if ACTION_MAX_DELTA > 0.0:
+            slew = action - self.prev_action
+            action = self.prev_action + np.clip(slew, -ACTION_MAX_DELTA, ACTION_MAX_DELTA)
         action = ACTION_EMA_ALPHA * action + (1.0 - ACTION_EMA_ALPHA) * self.prev_action
 
         # Action execution mapping

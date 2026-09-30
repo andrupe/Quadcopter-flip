@@ -1,13 +1,13 @@
 {
-  "generated": "2026-09-23T10:34:15+00:00",
+  "generated": "2026-09-29T00:54:50+00:00",
   "model": {
     "path": "quad_flip_model.zip",
-    "sha256": "2742ee506836c512695da444d3ad667798b831c3ab8b102a76beb0d8745e74f8",
+    "sha256": "8f81ace9ed87e42b27ee2cbe4cd62ebe9601a9387fd7cd1d156ce40a4f3d5735",
     "actor_dim": 48,
     "net_arch": {
       "pi": [
-        128,
-        128
+        32,
+        32
       ],
       "vf": [
         512,
@@ -18,7 +18,7 @@
   },
   "encoder": {
     "path": "logs/encoder_gru.pt",
-    "sha256": "fab168c5f8d871c55d3c9bf2d2b6233947de048f11e01238017be7bd4dfd1052",
+    "sha256": "52d0d15ed9b6f8276738b83955099b2d3612e5a41ff671d1c12e9a715c5fd452",
     "f_in": 33,
     "hidden": 48,
     "z_dim": 16,
@@ -41,6 +41,7 @@
   "env_constants": {
     "sim_dt": 0.01,
     "action_ema_alpha": 0.8,
+    "action_max_delta": 0.5,
     "actor_total_dim": 29,
     "encoder_aux_dim": 4,
     "max_rate_xy": 20.0,
@@ -53,18 +54,18 @@
     "_model_name": "quad_flip_model.zip",
     "_encoder_name": "encoder_gru.pt"
   },
-  "weights_sha256": "1549104d690605d33235975d011025a08537d6541d97e2856a0cccd89f53947c",
+  "weights_sha256": "773111f46bf803090f9f0ec7d7ecf58773c516e4087726c4ff771fececb30641",
   "verify": {
     "ok": true,
     "frames": 3000,
     "source": "shard_w00_0000.npz:frames",
     "z_tol": 2e-05,
     "action_tol": 1e-05,
-    "max_z_err": 3.8743019104003906e-07,
-    "max_z_err_step": 648,
-    "max_action_err": 5.364418029785156e-07,
-    "max_action_err_step": 331,
-    "max_action_err_torch_z": 4.76837158203125e-07,
+    "max_z_err": 5.811452865600586e-07,
+    "max_z_err_step": 477,
+    "max_action_err": 5.811452865600586e-07,
+    "max_action_err_step": 2343,
+    "max_action_err_torch_z": 2.384185791015625e-07,
     "dist": "DiagGaussianDistribution",
     "squash_output": false
   }

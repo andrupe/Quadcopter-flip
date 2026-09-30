@@ -126,9 +126,9 @@ class LighthouseConfig:
     # Consecutive rejections before the gate stands down and accepts the next fix
     # REGARDLESS of thresholds. A glitch filter that can veto forever is a liability: if
     # the fix keeps disagreeing with us, the dead-reckoned estimate is the thing that is
-    # wrong. 50 steps = 0.5 s, far longer than any glitch and short enough that a blind
+    # wrong. 15 steps = 0.15 s, far longer than any glitch and short enough that a blind
     # estimator recovers inside one manoeuvre.
-    max_reject_streak: int = 50
+    max_reject_streak: int = 15
     # `max_fix_range` (m from the episode's anchor pose). This is the ONLY guard here that
     # can resist a PERSISTENT lie: the measured runaway accumulated ~0.02-0.04 m per step,
     # which no per-step threshold (and no streak breaker) can see, but it left the flight
@@ -398,9 +398,10 @@ class LighthouseModel:
         if jump > self.cfg.max_fix_jump:
             return False, f"jump {jump:.2f} m > {self.cfg.max_fix_jump:.2f} m"
 
+        max_dv = self.cfg.max_fix_dv + GRAVITY * self.outage_t
         dv = float(np.linalg.norm(v_raw - self.v_est))
-        if dv > self.cfg.max_fix_dv:
-            return False, f"velocity step {dv:.2f} m/s > {self.cfg.max_fix_dv:.2f} m/s"
+        if dv > max_dv:
+            return False, f"velocity step {dv:.2f} m/s > {max_dv:.2f} m/s"
 
         if self.cfg.max_fix_range > 0.0:
             span = float(np.linalg.norm(p_raw - self._anchor))

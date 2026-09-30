@@ -286,16 +286,17 @@ def evaluate(
         model_path = os.path.join(_PROJECT_ROOT, f"{model_name}.zip")
 
     if model_name.lower() in ("latest", "auto") or not os.path.isfile(model_path):
+        candidates = []
+        root_zip = os.path.join(_PROJECT_ROOT, "quad_flip_model.zip")
+        if os.path.isfile(root_zip):
+            candidates.append(root_zip)
         logs_dir = os.path.join(_PROJECT_ROOT, "logs")
         if os.path.isdir(logs_dir):
-            zips = [os.path.join(logs_dir, f) for f in os.listdir(logs_dir) if f.endswith(".zip")]
-            if zips:
-                import re
-                def _step_key(p: str):
-                    m = re.search(r"(\d+)_steps", os.path.basename(p))
-                    return int(m.group(1)) if m else os.path.getmtime(p)
-                zips.sort(key=_step_key, reverse=True)
-                model_path = zips[0]
+            candidates.extend([os.path.join(logs_dir, f) for f in os.listdir(logs_dir) if f.endswith(".zip")])
+        if candidates:
+            # Sort by modification time so the most recently trained/exported model is loaded
+            candidates.sort(key=os.path.getmtime, reverse=True)
+            model_path = candidates[0]
 
     if not os.path.isfile(model_path):
         print(f"\n[Error] Model file not found at: {model_path}")
@@ -624,8 +625,22 @@ def evaluate(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Evaluate & visualize quadcopter policy in MuJoCo 3D viewer")
+    parser.add_argument("--model", default=MODEL_NAME, help="Model name or path (default: latest / quad_flip_model.zip)")
+    parser.add_argument("--maneuver", default=MANEUVER,
+                        choices=[None, "hover", "takeoff", "waypoints", "figure8", "orbit", "lissajous", "slalom", "v8", "flip", "chain"],
+                        help="Maneuver family to fly (default: random mixture)")
+    parser.add_argument("--episodes", type=int, default=NUM_EPISODES, help="Number of episodes (default: 1)")
+    parser.add_argument("--speed", type=float, default=PLAYBACK_SPEED, help="Playback speed multiplier (e.g. 1.0 real-time, 0.5 slow-mo)")
+    parser.add_argument("--dr", type=float, default=DR_LEVEL, help="Domain randomization level 0.0 to 1.0 (default: 1.0)")
+    parser.add_argument("--no-viewer", action="store_true", help="Run headless without 3D window")
+    parser.add_argument("--no-plots", action="store_true", help="Skip matplotlib telemetry plots")
+    parser.add_argument("--no-loop", action="store_true", help="Run once without looping continuously")
+
     # macOS GUI trampoline: launch_passive requires mjpython on macOS for interactive windowing
-    if sys.platform == "darwin" and SHOW_VIEWER:
+    if sys.platform == "darwin" and "--no-viewer" not in sys.argv and SHOW_VIEWER:
         is_mjpython = hasattr(mujoco.viewer, "_MJPYTHON") and mujoco.viewer._MJPYTHON is not None
         if not is_mjpython and os.environ.get("_MJP_TRAMPOLINED") != "1":
             import shutil
@@ -636,4 +651,14 @@ if __name__ == "__main__":
                 os.environ["_MJP_TRAMPOLINED"] = "1"
                 os.execv(mjpython_path, [mjpython_path] + sys.argv)
 
-    evaluate()
+    args = parser.parse_args()
+    evaluate(
+        model_name=args.model,
+        maneuver=args.maneuver,
+        num_episodes=args.episodes,
+        playback_speed=args.speed,
+        dr_level=args.dr,
+        show_viewer=not args.no_viewer,
+        show_plots=not args.no_plots,
+        loop=not args.no_loop,
+    )

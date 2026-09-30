@@ -51,7 +51,7 @@ MIN_THRUST_TOTAL: float = 0.0
 # Seconds of terminal hover appended to every manoeuvre. Shared so the sampler can work
 # out the highest manoeuvre frequency that still fits inside one episode (see
 # TrajectoryConfig.episode_seconds) instead of duplicating the number.
-TRAJECTORY_TAIL: float = 0.6
+TRAJECTORY_TAIL: float = 1.0
 
 
 # =====================================================================================
@@ -1321,8 +1321,9 @@ class TrajectoryConfig:
     # whole reference stays inside the volume.
     z_range: Tuple[float, float] = (1.2, 2.0)
 
-    # Top of the sphere: spawn_z + flight_radius. Used to screen flip altitude excursions.
-    z_max: float = 3.2
+    # Real cage ceiling constraint relaxed to 2.8 m to allow 700-750 dps gentler flips.
+    cage_ceiling_z: float = 2.8
+    z_max: float = 2.8
 
     # Weights are over DRAWS, not over accepted episodes: a manoeuvre that is rejected more
     # often is under-represented in the realised mixture. Flips still reject ~32% of draws
@@ -1411,15 +1412,21 @@ class TrajectorySampler:
         axis = np.array([0.0, 1.0, 0.0]) if use_pitch else np.array([1.0, 0.0, 0.0])
         limit = float(self.cfg.rate_limits[axis_name])
 
-        k = float(rng.choice([1.0, 1.0, 1.0, 2.0]))
-        rate_frac = float(rng.uniform(0.30, 0.45))
+        k = 1.0
+        rate_frac = float(rng.uniform(0.28, 0.35))
         # Derive the coast from the rate authority instead of guessing: the trapezoidal
         # profile needs  coast = 2*pi*k / (omega_target * (1 - rate_frac)).
-        omega_target = float(rng.uniform(0.55, 0.80)) * limit
+        omega_target = float(rng.uniform(0.60, 0.70)) * limit
         coast = 2.0 * np.pi * k / max(1e-6, omega_target * (1.0 - rate_frac))
+        v0 = GRAVITY * coast / 2.0
+        a_max_net = 0.90 * MAX_THRUST_TOTAL / mass - GRAVITY
+        uu = max(1e-3, a_max_net)
+        exc = v0 ** 2 / (2.0 * uu) + v0 ** 2 / (2.0 * GRAVITY)
+        p0_clamped = np.array(p0, dtype=np.float64)
+        p0_clamped[2] = float(np.clip(p0[2], 1.10, max(1.10, self.cfg.z_max - exc - 0.05)))
 
         fl = Flip(
-            p0, axis=axis, rotations=k, coast=coast,
+            p0_clamped, axis=axis, rotations=k, coast=coast,
             yaw=yaw, mass=mass, max_rate=limit, rate_frac=rate_frac,
         )
         # Screen against the REAL top of the flight volume, not the old hardcoded 2.40 m.
@@ -1743,6 +1750,9 @@ class TrajectorySampler:
                 offset = np.array([0.0, 0.0, self.cfg.spawn_z])
                 furthest = max(float(np.linalg.norm(r.p - offset)) for r in refs)
                 if furthest > 0.85 * self.cfg.flight_radius:
+                    continue
+                # CAGE CEILING SCREEN. The reference must stay below the cage ceiling (2.0 m).
+                if max(float(r.p[2]) for r in refs) > self.cfg.z_max:
                     continue
                 # FOOTPRINT SCREEN - this is what makes the 1.5 m x 1.5 m training
                 # footprint a guarantee rather than a drawing convention. "Targets were

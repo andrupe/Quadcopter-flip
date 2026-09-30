@@ -70,11 +70,14 @@ ABORT_NAMES = {0: "none", 1: "tilt limit", 2: "z outside the flight envelope",
 
 # The four motions, what to do, and which gyro axis/telltale is checked.
 # (label, instruction, axis index, expected sign, what it proves)
+# Note: On Crazyflie hardware, BMI088 raw gyro.y measures negative during nose-down pitch.
+# In controller_app.c, SIGN_GYRO_PITCH_TO_SIM is (+1.0f) because the sim and inner-loop conventions
+# both require this negative raw sign.
 MOTIONS: Tuple[Tuple[str, str, int, float, str], ...] = (
     ("roll right", "ROLL RIGHT: bank the right side down ~45 deg, hold, then level",
      0, +1.0, "SIGN_GYRO_ROLL_TO_SIM"),
     ("nose down", "PITCH NOSE DOWN: dip the nose ~45 deg, hold, then level",
-     1, +1.0, "SIGN_GYRO_PITCH_TO_SIM"),
+     1, -1.0, "SIGN_GYRO_PITCH_TO_SIM"),
     ("yaw left", "YAW LEFT: rotate the whole vehicle counter-clockwise seen from ABOVE, "
                  "then back", 2, +1.0, "SIGN_GYRO_YAW_TO_SIM"),
     ("lift", "LIFT: raise it ~0.5 m and lower it again (checks stateEstimate.z)", -1, +1.0,

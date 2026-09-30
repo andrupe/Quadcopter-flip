@@ -351,7 +351,12 @@ elif not episodes:
     info("no corpus shards - skipping the numeric comparison")
 else:
     from encoder.history_encoder import EncoderWithHead, load_encoder_checkpoint
-    from encoder.train_encoder import r2_per_group
+    from encoder.train_encoder import (
+        GATE_MIN_CLEAN_R2,
+        error_stats,
+        r2_per_group,
+        robustness_ratio,
+    )
 
     enc, norm, ckpt = load_encoder_checkpoint(CKPT)
     try:
@@ -411,15 +416,18 @@ else:
     check("clean inference stays finite", bool(np.all(np.isfinite(P_clean))))
     check("corrupted inference stays finite", bool(np.all(np.isfinite(P_cor))))
 
-    gaps = [(k, r2_clean[k], r2_cor[k]) for k in r2_clean if r2_clean[k] > 0.15]
-    gaps.sort(key=lambda r: -(1.0 - r[2] / max(1e-9, r[1])))
-    info("worst relative R^2 loss under corruption (this checkpoint was trained CLEAN):")
-    for name, c, k in gaps[:6]:
-        info(f"    {name:>20}  clean {c:+.3f} -> corrupted {k:+.3f}"
-             f"   ({1.0 - k / max(1e-9, c):+.0%})")
-    if gaps:
-        worst = 1.0 - gaps[0][2] / max(1e-9, gaps[0][1])
-        info(f"  worst = {worst:.0%} on {gaps[0][0]} (target: within the --require-robust budget)")
+    st_clean = error_stats(P_clean, Y_clean, gdecl)
+    st_cor = error_stats(P_cor, Y_cor, gdecl)
+    names = [k for k in st_clean if st_clean[k]["r2"] > GATE_MIN_CLEAN_R2]
+    names.sort(key=lambda k: -robustness_ratio(st_clean[k], st_cor[k]))
+    info("normalized corrupted/clean error ratio under corruption (checkpoint trained CLEAN):")
+    for name in names[:6]:
+        rm_c, rm_k = st_clean[name]["rmse"], st_cor[name]["rmse"]
+        info(f"    {name:>20}  clean rmse {rm_c:.5f} -> corrupted {rm_k:.5f}"
+             f"   ({robustness_ratio(st_clean[name], st_cor[name]):.2f}x normalized)")
+    if names:
+        worst = robustness_ratio(st_clean[names[0]], st_cor[names[0]])
+        info(f"  worst = {worst:.2f}x on {names[0]} (target: within the --robust-ratio-max budget)")
 
 print()
 print("=" * 78)

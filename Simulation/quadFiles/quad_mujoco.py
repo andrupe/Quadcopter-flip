@@ -164,6 +164,11 @@ class QuadcopterMuJoCo:
         self.tau_up: float = float(motor_tau)
         self.tau_down: float = float(motor_tau)
         self.dynamic_sag_coef: float = 0.0
+        self.v_pol: float = 0.0
+        self.soc: float = 1.0
+        self.tau_rec: float = 0.40
+        self.thrust_nl: float = 0.0
+        self.rate_pid_noise: float = 0.0
 
         self.t: float = float(Ti)
         self.wMotor: np.ndarray = np.ones(4) * w_hover
@@ -192,11 +197,15 @@ class QuadcopterMuJoCo:
         tau_up: Optional[float] = None,
         tau_down: Optional[float] = None,
         dynamic_sag_coef: float = 0.0,
+        thrust_nl: float = 0.0,
+        rate_pid_noise: float = 0.0,
     ):
         """
         Apply physically realistic hardware distortions and domain randomizations
         directly into the in-memory MuJoCo model and actuator dynamics.
         """
+        self.thrust_nl = float(thrust_nl)
+        self.rate_pid_noise = float(rate_pid_noise)
         # 1. Mass & Inertia
         if mass is not None:
             self.model.body_mass[self.body_id] = float(mass)
@@ -263,6 +272,8 @@ class QuadcopterMuJoCo:
         self.tor = self.kTo_effective * (self.wMotor ** 2)
         # Battery state implied by the reset-time thrust scaling (V/V_nom = sqrt(scale)).
         self.dynamic_sag = 1.0
+        self.v_pol = 0.0
+        self.soc = 1.0
         self.v_batt_norm = float(np.sqrt(max(float(thrust_scale), 0.0)))
         self.v_batt = float(self.params["V_nom"]) * self.v_batt_norm
 
@@ -381,9 +392,14 @@ class QuadcopterMuJoCo:
                 curr_omega = self.data.qvel[3:6].copy()
                 if gyro_bias is not None:
                     curr_omega += gyro_bias
+                if self.rate_pid_noise > 0.0:
+                    curr_omega += np.random.normal(0.0, self.rate_pid_noise, size=3)
                 moments = rate_pid.update(omega_des, curr_omega, sub_dt)
                 w_motor_target = mixerFM(self, throttle, moments)
                 w_motor_target = np.clip(w_motor_target, self.params["minWmotor"], self.params["maxWmotor"])
+                # 16-bit integer PWM motor command quantization (0 to 65535)
+                w_ratio = np.clip(w_motor_target / self.params["maxWmotor"], 0.0, 1.0)
+                w_motor_target = (np.round(w_ratio * 65535.0) / 65535.0) * self.params["maxWmotor"]
                 self.last_motor_cmd = w_motor_target.copy()
 
             # 1. Evolve directional 1st-order motor dynamics low-pass filter at physical timestep
@@ -395,16 +411,21 @@ class QuadcopterMuJoCo:
                 else:
                     self.wMotor[i] = w_motor_target[i]
 
-            # 2. Dynamic battery voltage sag during high-throttle bursts
+            # 2. Dynamic battery voltage sag: SoC, internal resistance, polarization state
             if self.dynamic_sag_coef > 0.0:
                 burst_ratio = float(np.mean((self.wMotor / self.params["maxWmotor"]) ** 2))
-                dynamic_sag = max(0.0, 1.0 - self.dynamic_sag_coef * burst_ratio)
+                alpha_pol = float(sub_dt / (self.tau_rec + sub_dt))
+                self.v_pol += alpha_pol * (burst_ratio - self.v_pol)
+                self.soc = max(0.2, self.soc - 0.001 * burst_ratio * sub_dt)
+                v_drop = self.dynamic_sag_coef * (0.6 * burst_ratio + 0.4 * self.v_pol)
+                dynamic_sag = max(0.0, self.soc * (1.0 - v_drop))
             else:
                 dynamic_sag = 1.0
 
-            # 3. Aerodynamic rotor thrust & reactive torque
-            thrusts = (self.kTh_effective * dynamic_sag) * self.motor_efficiencies * (self.wMotor ** 2)
-            torques = (self.kTo_effective * dynamic_sag) * self.motor_efficiencies * (self.wMotor ** 2)
+            # 3. Aerodynamic rotor thrust & reactive torque with nonlinearity
+            nl = 1.0 + self.thrust_nl * (self.wMotor / self.params["maxWmotor"] - 0.5)
+            thrusts = (self.kTh_effective * dynamic_sag) * self.motor_efficiencies * nl * (self.wMotor ** 2)
+            torques = (self.kTo_effective * dynamic_sag) * self.motor_efficiencies * nl * (self.wMotor ** 2)
 
             # 4. Direct assignment to MuJoCo control array
             self.data.ctrl[:] = thrusts

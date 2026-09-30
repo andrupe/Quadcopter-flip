@@ -1381,9 +1381,9 @@ def train(
             policy_kwargs=dict(
                 actor_obs_dim=actor_obs_dim,
                 activation_fn=nn.Tanh,
-                # Actor = ONE hidden layer of 32 (pi=[32]); keep in step with
+                # Actor = TWO hidden layers of 32 (pi=[32, 32]); keep in step with
                 # AsymmetricActorCriticPolicy's default and actor_input.DEFAULT_NET_ARCH.
-                net_arch=dict(pi=[32], vf=[512, 256, 128]),
+                net_arch=dict(pi=[32, 32], vf=[512, 256, 128]),
                 log_std_init=-0.5,
             ),
             verbose=1,
